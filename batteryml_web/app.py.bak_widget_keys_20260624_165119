@@ -1,0 +1,744 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List
+
+import pandas as pd
+import streamlit as st
+import yaml
+
+from agent.llm_client import LLMClient
+from agent.result_agent import explain_results
+from agent.schema_agent import suggest_schema_mapping
+from agent.troubleshoot_agent import diagnose_failure, run_validator_after_fix
+from core.batteryml_runner import run_batteryml, run_dry_run
+from core.config_builder import build_quickstart_config, build_task_config, save_config_yaml
+from core.config_validator import validate_config
+from core.dataset_tools import inspect_tabular_file
+from core.gpu_checker import get_gpu_readiness_report, validate_device_choice, list_available_configs, get_gpu_demo_configs
+from core.report_builder import generate_html_report
+from core.results_reader import discover_metrics_artifacts, discover_prediction_artifacts, list_figures, list_workspace_files, read_log, read_metrics, read_predictions
+from core.schema_validator import OPTIONAL_FIELDS, REQUIRED_FIELDS, validate_schema_mapping
+from core.state import ensure_project_state, get_project_root, save_project_state, set_project_mode
+
+APP_TITLE = "LLM-guided BatteryML Protocol Platform"
+DEFAULT_BASE_DIR = Path("runs") / "web_projects"
+QUICKSTART_CONFIG = Path("configs/baselines/sklearn/xgb/matr_1.yaml")
+SUPPORTED_DATASETS = ["MATR"]
+SUPPORTED_TASKS = ["RUL", "SOH"]
+SUPPORTED_MODELS = ["XGBoostRULPredictor", "DummyRULPredictor"]
+SUPPORTED_SPLITS = ["PRIMARY"]
+
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.title(APP_TITLE)
+st.caption("LLM assistant is optional. Without an LLM endpoint, the platform still runs the deterministic BatteryML workflow.")
+st.caption("Local-first BatteryML workspace for teaching, demos, and reproducible runs.")
+
+
+def _ensure_project(project_name: str, base_dir: str, mode: str) -> Path:
+    project_root = get_project_root(project_name, Path(base_dir))
+    state = ensure_project_state(project_root=project_root, project_name=project_name, mode=mode)
+    set_project_mode(project_root, mode)
+    st.session_state["project_root"] = str(project_root)
+    st.session_state["project_state"] = state
+    return project_root
+
+
+def _load_state(project_root: Path) -> Dict[str, Any]:
+    state_path = project_root / "project_state.json"
+    if state_path.exists():
+        return json.loads(state_path.read_text(encoding="utf-8"))
+    return {}
+
+
+def _path_block(label: str, path: str | Path | None) -> None:
+    value = str(path) if path else "Not available"
+    st.markdown(f"**{label}**  \n`{value}`")
+
+
+def _status_badge(status: str) -> str:
+    mapping = {
+        "success": "success",
+        "running": "warning",
+        "failed": "error",
+        "initialized": "secondary",
+        "unknown": "secondary",
+    }
+    return mapping.get(status, "secondary")
+
+
+def _open_command(path: Path) -> str:
+    return f"open {path}"
+
+
+def _copyable_path(path: Path) -> None:
+    st.code(str(path), language="text")
+    st.caption(f"open folder command: `{_open_command(path)}`")
+
+
+def _dataset_status(dataset: str) -> Dict[str, Any]:
+    raw_path = Path("data/raw") / dataset
+    processed_path = Path("data/processed") / dataset
+    config_path = Path("configs/baselines/sklearn/xgb") / f"{dataset.lower()}_1.yaml"
+    return {
+        "Dataset": dataset,
+        "Raw path": str(raw_path),
+        "Raw exists": raw_path.exists(),
+        "Processed path": str(processed_path),
+        "Processed exists": processed_path.exists(),
+        "Ready for training": raw_path.exists() and processed_path.exists() and config_path.exists(),
+        "Action": "Run preprocessing" if not processed_path.exists() else "Ready",
+        "config_path": config_path,
+    }
+
+
+def _run_process(command: List[str], cwd: Path) -> Dict[str, Any]:
+    started = time.perf_counter()
+    proc = subprocess.run(command, cwd=str(cwd), capture_output=True, text=True)
+    elapsed = time.perf_counter() - started
+    return {
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "elapsed_seconds": elapsed,
+    }
+
+
+def _load_yaml(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def _config_details(config_path: Path) -> Dict[str, Any]:
+    cfg = _load_yaml(config_path)
+    return {
+        "Dataset": cfg.get("dataset") or cfg.get("train_test_split", {}).get("cell_data_path", "MATR"),
+        "Train/test splitter": cfg.get("train_test_split", {}).get("name") if isinstance(cfg.get("train_test_split"), dict) else cfg.get("train_test_split"),
+        "Label annotator": cfg.get("label", {}).get("name") if isinstance(cfg.get("label"), dict) else cfg.get("label"),
+        "Feature extractor": cfg.get("feature", {}).get("name") if isinstance(cfg.get("feature"), dict) else cfg.get("feature"),
+        "Model class": cfg.get("model", {}).get("name") if isinstance(cfg.get("model"), dict) else cfg.get("model"),
+        "Task": cfg.get("task") or ("RUL" if "RUL" in str(cfg.get("label", {})) else "SOH"),
+        "Seed": cfg.get("seed", 0),
+        "Device": cfg.get("device", "cpu"),
+    }
+
+
+def _extract_log_excerpts(log_text: str) -> Dict[str, str]:
+    excerpts = {}
+    for key, pattern in {"feature": r"(?im)^.*feature.*$", "model": r"(?im)^.*model.*$", "training": r"(?im)^.*training.*$"}.items():
+        lines = re.findall(pattern, log_text)
+        if lines:
+            excerpts[key] = "\n".join(lines[:5])
+    return excerpts
+
+
+with st.sidebar:
+    st.header("Project")
+    project_name = st.text_input("Project name", value="my_batterymL_project")
+    base_dir = st.text_input("Projects base directory", value=str(DEFAULT_BASE_DIR))
+    create_btn = st.button("Create / Load project", use_container_width=True)
+
+    st.divider()
+    st.header("LLM assistant")
+    llm_base_url = st.text_input("Base URL", value=st.session_state.get("llm_base_url", ""), key="llm_base_url")
+    llm_api_key = st.text_input("API key", value=st.session_state.get("llm_api_key", ""), type="password", key="llm_api_key")
+    llm_model = st.text_input("Model", value=st.session_state.get("llm_model", ""), key="llm_model")
+    llm_client = LLMClient(base_url=llm_base_url or None, api_key=llm_api_key or None, model=llm_model or None)
+    st.caption("LLM assistant is optional. Without an LLM endpoint, the platform still runs the deterministic BatteryML workflow.")
+    st.write(f"LLM assistant status: {'Connected' if llm_client.is_configured() else 'Not connected'}")
+    if st.button("Test connection", use_container_width=True):
+        if llm_client.is_configured():
+            st.success("LLM assistant is connected.")
+        else:
+            st.warning("LLM assistant is not connected.")
+
+if create_btn:
+    project_root = _ensure_project(project_name, base_dir, "deterministic")
+    st.success(f"Project ready: {project_root}")
+
+if "project_root" not in st.session_state:
+    st.info("Choose a project name and click 'Create / Load project' to initialize a local workspace.")
+    st.stop()
+
+current_root = Path(st.session_state["project_root"])
+st.session_state["project_state"] = _load_state(current_root)
+state = st.session_state.get("project_state", {})
+
+status = state.get("run_status", state.get("status", "unknown"))
+summary_cols = st.columns(4)
+summary_cols[0].metric("Project", state.get("project_name", project_name))
+summary_cols[1].metric("LLM assistant", "Connected" if llm_client.is_configured() else "Not connected")
+summary_cols[2].metric("Status", status)
+summary_cols[3].metric("Workspace", str(current_root))
+
+st.markdown(f"**Status:** `{status}`")
+
+project_tabs = st.tabs(["Protocol Overview", "Dataset Preparation", "Schema Mapping", "Task & Model Configuration", "Preflight Validation", "BatteryML Execution", "Results & Report", "Troubleshooting"])
+
+with project_tabs[0]:
+    st.subheader("Protocol overview")
+    st.markdown("1. Step 1. Dataset preparation\n2. Step 2. Schema mapping\n3. Step 3. Task and model configuration\n4. Step 4. Preflight validation\n5. Step 5. BatteryML execution\n6. Step 6. Results and report\n7. Step 7. Troubleshooting")
+    quickstart_card = st.container(border=True)
+    with quickstart_card:
+        st.markdown("### Load built-in MATR demo")
+        st.caption("This is a one-click autofill helper, not a workflow mode.")
+        if st.button("Load built-in MATR demo", use_container_width=True):
+            st.session_state["demo_dataset"] = "MATR"
+            st.session_state["demo_task"] = "RUL"
+            st.session_state["demo_model"] = "XGBoostRULPredictor"
+            st.session_state["demo_config_path"] = str(QUICKSTART_CONFIG)
+            st.session_state["demo_device"] = "cpu"
+            st.success("Built-in MATR demo values loaded.")
+        st.write("Dataset: MATR")
+        st.write("Task: RUL")
+        st.write("Model: XGBoostRULPredictor")
+        st.write("Config: configs/baselines/sklearn/xgb/matr_1.yaml")
+        st.write("Device: cpu")
+
+with project_tabs[1]:
+    st.subheader("Dataset Preparation")
+    st.caption("Check whether raw data is ready and preprocess it into processed files before training.")
+    st.subheader("Dataset Preparation")
+    st.caption("Check whether raw data is ready and preprocess it into processed files before training.")
+
+    datasets = ["MATR", "HUST", "CALCE", "RWTH"]
+    status_rows = []
+    for ds in datasets:
+        item = _dataset_status(ds)
+        status_rows.append({
+            "Dataset": item["Dataset"],
+            "Raw path": item["Raw path"],
+            "Raw exists": item["Raw exists"],
+            "Processed path": item["Processed path"],
+            "Processed exists": item["Processed exists"],
+            "Ready for training": item["Ready for training"],
+            "Action": item["Action"],
+        })
+    st.dataframe(pd.DataFrame(status_rows), use_container_width=True)
+
+    st.markdown("#### Preparation flow")
+    prep_cols = st.columns(5)
+    prep_cols[0].write("Raw cycling files")
+    prep_cols[1].write("→ BatteryML preprocessing")
+    prep_cols[2].write("→ BatteryData / processed files")
+    prep_cols[3].write("→ Feature extraction")
+    prep_cols[4].write("→ Model training")
+
+    matr = _dataset_status("MATR")
+    st.markdown("#### MATR paths")
+    pcols = st.columns(2)
+    with pcols[0]:
+        st.write("Raw")
+        _copyable_path(Path(matr["Raw path"]))
+        st.write("Processed")
+        _copyable_path(Path(matr["Processed path"]))
+    with pcols[1]:
+        st.write("Config")
+        _copyable_path(Path(matr["config_path"]))
+
+    if st.button("Run preprocessing for MATR"):
+        if not Path(matr["Raw path"]).exists():
+            st.error("Raw data missing. Please place MATR raw data under data/raw/MATR.")
+        else:
+            preprocess_cmd = [sys.executable, "batteryml_web/core/run_batteryml_cli.py", "preprocess", "MATR", "data/raw/MATR", "data/processed/MATR"]
+            result = _run_process(preprocess_cmd, cwd=Path("."))
+            preprocess_log = current_root / "preprocess_log.txt"
+            preprocess_log.write_text("COMMAND:\n" + " ".join(preprocess_cmd) + "\n\nSTDOUT:\n" + result["stdout"] + "\n\nSTDERR:\n" + result["stderr"], encoding="utf-8")
+            st.write(f"preprocess status: {'success' if result['returncode'] == 0 else 'failed'}")
+            st.write(f"elapsed time: {result['elapsed_seconds']:.2f}s")
+            st.write(f"preprocess_log.txt: `{preprocess_log}`")
+            st.text_area("preprocess_log.txt", value=preprocess_log.read_text(encoding="utf-8"), height=220)
+            if Path(matr["Processed path"]).exists():
+                processed_files = [p for p in Path(matr["Processed path"]).rglob("*") if p.is_file()]
+                st.success(f"Processed files count: {len(processed_files)}")
+            else:
+                st.error("Processed dataset missing. Please run preprocessing first.")
+
+    st.divider()
+    st.subheader("Dataset inspection and schema mapping")
+    uploaded = st.file_uploader("Upload raw CSV/XLSX", type=["csv", "xlsx", "xls"], key="custom_dataset_upload_raw_csv_xlsx")
+    inspect_result = None
+    source_path = None
+    if uploaded is not None:
+        raw_dir = current_root / "raw_inputs"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        source_path = raw_dir / uploaded.name
+        source_path.write_bytes(uploaded.getbuffer())
+        inspect_result = inspect_tabular_file(source_path)
+        st.success(f"Uploaded file saved to `{source_path}`")
+    elif (current_root / "raw_inputs").exists():
+        st.caption("No new upload. Existing raw inputs will be used if present.")
+
+    if inspect_result:
+        st.dataframe(pd.DataFrame(inspect_result["preview"]))
+        left, right = st.columns(2)
+        with left:
+            st.json({"columns": inspect_result["columns"], "dtypes": inspect_result["dtypes"]})
+        with right:
+            st.json({"missing_values": inspect_result["missing_values"]})
+
+        helper_cols = st.columns(3)
+        base_url = helper_cols[0].text_input("LLM base URL for mapping", value=st.session_state.get("llm_base_url", ""), key="map_base_url")
+        api_key = helper_cols[1].text_input("LLM API key for mapping", value=st.session_state.get("llm_api_key", ""), type="password", key="map_api_key")
+        model_name = helper_cols[2].text_input("LLM model for mapping", value=st.session_state.get("llm_model", ""), key="map_model")
+        if st.button("Use LLM to suggest mapping"):
+            client = LLMClient(base_url=base_url or None, api_key=api_key or None, model=model_name or None)
+            if not client.is_configured():
+                st.warning("No API key or endpoint configured. Manual mapping remains available.")
+            else:
+                suggestion = suggest_schema_mapping(inspect_result, llm_client=client)
+                st.session_state["llm_suggested_mapping"] = suggestion.get("mapping", {})
+                st.session_state["llm_suggestion_raw"] = suggestion
+                st.success("LLM suggestion ready for review.")
+                st.json(suggestion)
+
+        suggested_mapping = st.session_state.get("llm_suggested_mapping", {})
+        available_columns = ["<unmapped>"] + inspect_result["columns"]
+        mapping = {}
+        cols = st.columns(2)
+        for i, field in enumerate(REQUIRED_FIELDS + OPTIONAL_FIELDS):
+            default_value = suggested_mapping.get(field, "<unmapped>") if suggested_mapping else "<unmapped>"
+            if default_value not in available_columns:
+                default_value = "<unmapped>"
+            with cols[i % 2]:
+                mapping[field] = st.selectbox(f"Map `{field}` to column", available_columns, index=available_columns.index(default_value), key=f"mapping_{field}")
+
+        if st.button("Validate schema mapping"):
+            cleaned_mapping = {k: v for k, v in mapping.items() if v != "<unmapped>"}
+            report = validate_schema_mapping(cleaned_mapping)
+            mapping_path = current_root / "schema_mapping.json"
+            report_path = current_root / "schema_validation_report.json"
+            mapping_path.write_text(json.dumps(cleaned_mapping, indent=2, ensure_ascii=False), encoding="utf-8")
+            report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+            st.success(f"Schema mapping saved to `{mapping_path}`")
+            st.json(report)
+    else:
+        st.caption("Upload a dataset to inspect columns and create a validated schema mapping.")
+
+with project_tabs[2]:
+    st.subheader("Schema Mapping")
+    st.caption("Inspect columns and map them to BatteryML schema fields.")
+    uploaded = st.file_uploader("Upload raw CSV/XLSX", type=["csv", "xlsx", "xls"])
+    inspect_result = None
+    source_path = None
+    if uploaded is not None:
+        raw_dir = current_root / "raw_inputs"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        source_path = raw_dir / uploaded.name
+        source_path.write_bytes(uploaded.getbuffer())
+        inspect_result = inspect_tabular_file(source_path)
+        st.success(f"Uploaded file saved to `{source_path}`")
+    elif (current_root / "raw_inputs").exists():
+        st.caption("No new upload. Existing raw inputs will be used if present.")
+
+    if inspect_result:
+        st.dataframe(pd.DataFrame(inspect_result["preview"]))
+        left, right = st.columns(2)
+        with left:
+            st.json({"columns": inspect_result["columns"], "dtypes": inspect_result["dtypes"]})
+        with right:
+            st.json({"missing_values": inspect_result["missing_values"]})
+
+        helper_cols = st.columns(3)
+        base_url = helper_cols[0].text_input("LLM base URL for mapping", value=st.session_state.get("llm_base_url", ""), key="map_base_url")
+        api_key = helper_cols[1].text_input("LLM API key for mapping", value=st.session_state.get("llm_api_key", ""), type="password", key="map_api_key")
+        model_name = helper_cols[2].text_input("LLM model for mapping", value=st.session_state.get("llm_model", ""), key="map_model")
+        if st.button("Use LLM to suggest mapping"):
+            client = LLMClient(base_url=base_url or None, api_key=api_key or None, model=model_name or None)
+            if not client.is_configured():
+                st.warning("No API key or endpoint configured. Manual mapping remains available.")
+            else:
+                suggestion = suggest_schema_mapping(inspect_result, llm_client=client)
+                st.session_state["llm_suggested_mapping"] = suggestion.get("mapping", {})
+                st.session_state["llm_suggestion_raw"] = suggestion
+                st.success("LLM suggestion ready for review.")
+                st.json(suggestion)
+
+        suggested_mapping = st.session_state.get("llm_suggested_mapping", {})
+        available_columns = ["<unmapped>"] + inspect_result["columns"]
+        mapping = {}
+        cols = st.columns(2)
+        for i, field in enumerate(REQUIRED_FIELDS + OPTIONAL_FIELDS):
+            default_value = suggested_mapping.get(field, "<unmapped>") if suggested_mapping else "<unmapped>"
+            if default_value not in available_columns:
+                default_value = "<unmapped>"
+            with cols[i % 2]:
+                mapping[field] = st.selectbox(f"Map `{field}` to column", available_columns, index=available_columns.index(default_value), key=f"mapping_{field}")
+
+        if st.button("Validate schema mapping"):
+            cleaned_mapping = {k: v for k, v in mapping.items() if v != "<unmapped>"}
+            report = validate_schema_mapping(cleaned_mapping)
+            mapping_path = current_root / "schema_mapping.json"
+            report_path = current_root / "schema_validation_report.json"
+            mapping_path.write_text(json.dumps(cleaned_mapping, indent=2, ensure_ascii=False), encoding="utf-8")
+            report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+            st.success(f"Schema mapping saved to `{mapping_path}`")
+            st.json(report)
+    else:
+        st.caption("Upload a dataset to inspect columns and create a validated schema mapping.")
+
+with project_tabs[3]:
+    st.subheader("Task & Model Configuration")
+    st.caption("Choose the task, model, config, and execution device.")
+
+    # GPU Readiness Panel
+    st.markdown("#### GPU Environment Readiness")
+    gpu_check_cols = st.columns(2)
+
+    with gpu_check_cols[0]:
+        if st.button("Check GPU environment", use_container_width=True, type="secondary"):
+            with st.spinner("Checking GPU environment..."):
+                st.session_state["gpu_readiness_report"] = get_gpu_readiness_report()
+
+    # Display GPU readiness status
+    if "gpu_readiness_report" in st.session_state:
+        report = st.session_state["gpu_readiness_report"]
+
+        # Show status indicators
+        status_cols = st.columns(4)
+
+        # nvidia-smi status
+        nvidia_ok = report["nvidia_smi"]["available"]
+        status_cols[0].metric(
+            "nvidia-smi",
+            "Available" if nvidia_ok else "Not found",
+            delta="OK" if nvidia_ok else "Missing"
+        )
+
+        # torch.cuda status
+        torch_ok = report["torch_cuda"]["cuda_available"]
+        torch_installed = report["torch_cuda"]["torch_installed"]
+        if not torch_installed:
+            torch_status = "Not installed"
+            torch_delta = "Install torch"
+        elif torch_ok:
+            torch_status = f"Available ({report['torch_cuda']['device_count']} device(s))"
+            torch_delta = "OK"
+        else:
+            torch_status = "Not available"
+            torch_delta = "Check CUDA"
+        status_cols[1].metric(
+            "torch.cuda",
+            torch_status,
+            delta=torch_delta
+        )
+
+        # GPU name
+        if report["torch_cuda"]["device_names"]:
+            gpu_name = report["torch_cuda"]["device_names"][0]
+        else:
+            gpu_name = "N/A"
+        status_cols[2].metric(
+            "GPU Name",
+            gpu_name
+        )
+
+        # XGBoost GPU status
+        xgb_ok = report["xgboost_gpu"]["test_passed"]
+        xgb_installed = report["xgboost_gpu"]["xgboost_installed"]
+        if not xgb_installed:
+            xgb_status = "Not installed"
+            xgb_delta = "Install xgboost"
+        elif xgb_ok:
+            xgb_status = "GPU OK"
+            xgb_delta = "Passed"
+        else:
+            xgb_status = "CPU only"
+            xgb_delta = "No GPU"
+        status_cols[3].metric(
+            "XGBoost GPU test",
+            xgb_status,
+            delta=xgb_delta
+        )
+
+        # Show detailed info in expander
+        with st.expander("View GPU check details"):
+            st.json(report)
+
+        # Overall status
+        if report["overall_ready"]:
+            st.success("GPU environment is ready for CUDA training!")
+        else:
+            st.warning("GPU environment not fully ready. See recommendations below.")
+            for rec in report["recommendations"]:
+                st.markdown(f"- {rec}")
+
+    st.divider()
+
+    demo_dataset = st.session_state.get("demo_dataset", "MATR")
+    demo_task = st.session_state.get("demo_task", "RUL")
+    demo_model = st.session_state.get("demo_model", "XGBoostRULPredictor")
+    demo_config_path = Path(st.session_state.get("demo_config_path", str(QUICKSTART_CONFIG)))
+    demo_device = st.session_state.get("demo_device", "cpu")
+    c1, c2, c3 = st.columns(3)
+    dataset = c1.selectbox("Dataset", options=SUPPORTED_DATASETS, index=SUPPORTED_DATASETS.index(demo_dataset) if demo_dataset in SUPPORTED_DATASETS else 0)
+    task = c2.selectbox("Task", options=SUPPORTED_TASKS, index=SUPPORTED_TASKS.index(demo_task) if demo_task in SUPPORTED_TASKS else 0)
+    model = c3.selectbox("Model", options=SUPPORTED_MODELS, index=SUPPORTED_MODELS.index(demo_model) if demo_model in SUPPORTED_MODELS else 0)
+
+    # Device selection with Auto option
+    device = st.radio(
+        "Device",
+        options=["cpu", "cuda", "auto"],
+        index=0 if demo_device == "cpu" else (1 if demo_device == "cuda" else 2),
+        horizontal=True,
+        help="cpu: Force CPU execution. cuda: Force GPU execution (will fail if unavailable). auto: Use GPU if available, otherwise CPU."
+    )
+
+    # Store device in session state
+    st.session_state["selected_device"] = device
+
+    # Validate device choice
+    if device in ["cuda", "auto"]:
+        validation = validate_device_choice(device)
+        if not validation["can_run"] and device == "cuda":
+            st.error(f"GPU unavailable: {validation.get('error', 'Unknown error')}")
+            st.markdown("**Troubleshooting steps:**")
+            st.markdown("- Check if `nvidia-smi` returns GPU info")
+            st.markdown("- Verify NVIDIA drivers are installed")
+            st.markdown("- Ensure PyTorch is installed with CUDA support: `pip install torch --index-url https://download.pytorch.org/whl/cu118`")
+            st.markdown("- If using Docker, ensure GPU mapping: `docker run --gpus all ...`")
+        elif device == "auto" and validation["will_use"] == "cpu":
+            st.info("Auto mode: GPU not available, will use CPU.")
+        elif validation["can_run"] and validation["will_use"] == "cuda":
+            st.success(f"GPU ready: {validation['gpu_report']['torch_cuda']['device_names'][0] if validation['gpu_report']['torch_cuda']['device_names'] else 'CUDA device'}")
+
+    config_path = st.text_input("Config path", value=str(demo_config_path))
+    if st.button("Reset to built-in MATR demo"):
+        st.session_state["demo_dataset"] = "MATR"
+        st.session_state["demo_task"] = "RUL"
+        st.session_state["demo_model"] = "XGBoostRULPredictor"
+        st.session_state["demo_config_path"] = str(QUICKSTART_CONFIG)
+        st.session_state["demo_device"] = "cpu"
+        st.rerun()
+
+    # GPU Demo Card
+    st.divider()
+    st.markdown("#### Demo: MATR GPU Example")
+    gpu_demo_container = st.container(border=True)
+    with gpu_demo_container:
+        st.markdown("**Dataset:** MATR")
+        st.markdown("**Device:** CUDA")
+
+        # Get available GPU-native configs
+        gpu_configs = get_gpu_demo_configs()
+
+        if gpu_configs:
+            config_options = [f"{c['name']} ({c['model']})" for c in gpu_configs]
+            selected_gpu_config = st.selectbox(
+                "Select a GPU-native deep learning config",
+                options=config_options,
+                help="These configs use deep learning models that benefit from GPU acceleration"
+            )
+            if st.button("Load GPU Demo Config"):
+                selected_idx = config_options.index(selected_gpu_config)
+                selected_config = gpu_configs[selected_idx]
+                st.session_state["demo_dataset"] = "MATR"
+                st.session_state["demo_task"] = "RUL"
+                st.session_state["demo_model"] = selected_config["model"]
+                st.session_state["demo_config_path"] = selected_config["path"]
+                st.session_state["demo_device"] = "cuda"
+                st.success(f"Loaded GPU config: {selected_config['path']}")
+                st.rerun()
+        else:
+            st.info("No GPU-native deep learning config selected yet.")
+            st.caption("Available configs are currently XGBoost-based. To run GPU demo, add a deep learning config (CNN, LSTM, Transformer, MLP) for MATR dataset.")
+
+            # Show all available configs for reference
+            all_configs = list_available_configs()
+            with st.expander("View all available configs"):
+                for c in all_configs[:10]:  # Show first 10
+                    st.markdown(f"- `{c['path']}` → Model: {c['model']} {'(GPU-native)' if c['is_gpu_native'] else '(CPU)'}")
+
+with project_tabs[4]:
+    st.subheader("Preflight Validation")
+    metrics = read_metrics(current_root)
+    preds = read_predictions(current_root)
+    log_text = read_log(current_root)
+    figures = list_figures(current_root)
+    st.write("Validate configuration, dataset readiness, and execution inputs before running BatteryML.")
+    preflight_ok = all([Path(config_path).exists(), Path("data/raw/MATR").exists(), Path("data/processed/MATR").exists()])
+    st.write(f"Preflight status: {'Ready' if preflight_ok else 'Needs attention'}")
+    st.json(_config_details(Path(config_path)))
+
+with project_tabs[5]:
+    st.subheader("BatteryML Execution")
+
+    # Get the actual device to use (handle "auto")
+    effective_device = device
+    if device == "auto":
+        validation = validate_device_choice("auto")
+        effective_device = validation["will_use"]
+        if effective_device == "cuda":
+            st.success("Auto mode detected GPU, will use CUDA.")
+        else:
+            st.info("Auto mode: No GPU detected, will use CPU.")
+    elif device == "cuda":
+        # Validate GPU is actually available
+        validation = validate_device_choice("cuda")
+        if not validation["can_run"]:
+            st.error("Cannot run with CUDA: GPU environment check failed.")
+            st.error(f"Error: {validation.get('error', 'Unknown error')}")
+            st.markdown("**Please either:**")
+            st.markdown("- Switch device to 'CPU' or 'Auto'")
+            st.markdown("- Or click 'Check GPU environment' above to diagnose")
+            st.stop()
+
+    workspace = current_root / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    output_path = current_root
+    training_log_path = output_path / "training_log.txt"
+
+    # Build command with effective device
+    current_command = [
+        sys.executable,
+        "batteryml_web/core/run_batteryml_cli.py",
+        "run",
+        str(config_path),
+        "--workspace",
+        str(workspace),
+        "--train",
+        "--eval",
+        "--device",
+        effective_device,
+        "--seed",
+        "0"
+    ]
+    st.code(" ".join(current_command), language="bash")
+
+    # Show device info
+    device_info = st.container()
+    if effective_device == "cuda":
+        device_info.success(f"Running with GPU (CUDA)")
+    else:
+        device_info.info(f"Running with CPU")
+
+    run_btn = st.button("Run BatteryML", type="primary", use_container_width=True)
+    if run_btn:
+        with st.spinner(f"Running BatteryML with device={effective_device}..."):
+            result = run_batteryml(
+                config_path=Path(config_path),
+                output_dir=workspace,
+                extra_args=["--train", "--eval", "--device", effective_device, "--seed", "0"],
+                cli_args=["run"]
+            )
+        st.json(result)
+        if result.get("success"):
+            st.success("Training completed successfully!")
+        else:
+            st.error("Training failed. Check logs below for details.")
+
+with project_tabs[6]:
+    st.subheader("Results & Report")
+    tabs = st.tabs(["Overview", "Metrics", "Predictions", "Logs", "Plots", "Report"])
+    with tabs[0]:
+        st.write(f"Run status: `{state.get('run_status', 'unknown')}`")
+        _path_block("Raw data path", (current_root / "raw_inputs") if (current_root / "raw_inputs").exists() else None)
+        _path_block("Processed data path", Path("data/processed/MATR"))
+        _path_block("Config path", state.get("config_path"))
+        _path_block("Workspace path", current_root)
+        _path_block("Output folder", current_root)
+    with tabs[1]:
+        if metrics.get("metrics"):
+            st.dataframe(pd.DataFrame(metrics["metrics"]))
+        else:
+            st.info("No metrics found yet.")
+    with tabs[2]:
+        if preds.get("predictions"):
+            st.json(preds["predictions"])
+        else:
+            st.info("No predictions found yet.")
+    with tabs[3]:
+        st.text_area("Training log", value=log_text or "No log available yet.", height=320)
+    with tabs[4]:
+        if figures:
+            for fig in figures:
+                st.write(fig)
+        else:
+            st.info("No figures found yet.")
+    with tabs[5]:
+        report_html = generate_html_report(current_root)
+        report_path = current_root / "report.html"
+        report_path.write_text(report_html, encoding="utf-8")
+        st.download_button("Download report.html", data=report_html, file_name="report.html", mime="text/html")
+        st.caption(f"Report saved to `{report_path}`")
+
+with project_tabs[3]:
+    st.subheader("LLM Helpers")
+    st.caption("LLM is optional. Actions here only explain, suggest, or diagnose. They do not auto-edit raw data.")
+    helper_cols = st.columns(3)
+    explain_btn = helper_cols[0].button("Use LLM to summarize results", use_container_width=True)
+    if explain_btn:
+        client = LLMClient(base_url=st.session_state.get("llm_base_url") or None, api_key=st.session_state.get("llm_api_key") or None, model=st.session_state.get("llm_model") or None)
+        if not client.is_configured():
+            st.warning("LLM is not configured. You can still read metrics and logs manually.")
+        else:
+            explanation = explain_results(metrics, log_text, llm_client=client)
+            exp_path = current_root / "agent_result_explanation.json"
+            exp_path.write_text(json.dumps(explanation, indent=2, ensure_ascii=False), encoding="utf-8")
+            st.success(f"Saved explanation to `{exp_path}`")
+            st.json(explanation)
+
+    st.divider()
+    st.write("All LLM suggestions should be reviewed by the user and validated before use.")
+    st.button("Use LLM to explain columns", disabled=True)
+    st.button("Use LLM to suggest mapping", disabled=True)
+    st.button("Use LLM to explain error", disabled=True)
+    st.button("Use LLM to summarize results", disabled=True)
+
+with project_tabs[4]:
+    st.subheader("Troubleshooting")
+    failed_runs = []
+    if state.get("run_status") == "failed":
+        failed_runs.append(current_root)
+    selected_failed_run = st.selectbox("Select failed run", options=failed_runs or [current_root])
+    failed_log = read_log(selected_failed_run)
+    st.text_area("Failed run log", value=failed_log or "No failed log available.", height=220)
+
+    tcols = st.columns(3)
+    t_base_url = tcols[0].text_input("Troubleshoot LLM base URL", value=st.session_state.get("llm_base_url", ""), key="ts_llm_base_url")
+    t_api_key = tcols[1].text_input("Troubleshoot LLM API key", value=st.session_state.get("llm_api_key", ""), type="password", key="ts_llm_api_key")
+    t_model = tcols[2].text_input("Troubleshoot LLM model", value=st.session_state.get("llm_model", ""), key="ts_llm_model")
+
+    if st.button("Use LLM to explain error"):
+        client = LLMClient(base_url=t_base_url or None, api_key=t_api_key or None, model=t_model or None)
+        if not client.is_configured():
+            st.warning("LLM is not configured.")
+        else:
+            diagnosis = diagnose_failure(failed_log, config_path=selected_failed_run / "generated_config.yaml", schema_mapping_path=selected_failed_run / "schema_mapping.json", llm_client=client)
+            diag_path = selected_failed_run / "error_diagnosis.json"
+            fix_path = selected_failed_run / "agent_fix_suggestion.md"
+            diag_path.write_text(json.dumps(diagnosis, indent=2, ensure_ascii=False), encoding="utf-8")
+            fix_path.write_text(
+                f"# Fix suggestion\n\nCategory: {diagnosis.get('failure_category')}\n\nCause: {diagnosis.get('likely_cause')}\n\nSuggested fix: {diagnosis.get('suggested_fix')}\n\nValidator: {diagnosis.get('validator_to_rerun')}\n",
+                encoding="utf-8",
+            )
+            st.session_state["latest_diagnosis"] = diagnosis
+            st.json(diagnosis)
+
+    diagnosis = st.session_state.get("latest_diagnosis")
+    if diagnosis:
+        st.info("No automatic fix will be applied. Confirm before validation.")
+        st.write(diagnosis.get("suggested_fix"))
+        confirm_fix = st.checkbox("I confirm the suggested fix has been applied manually")
+        if st.button("Validate after fix") and confirm_fix:
+            validation = run_validator_after_fix(diagnosis.get("failure_category", "Other"), current_root / "generated_config.yaml", current_root / "schema_mapping.json")
+            validation_path = current_root / "validation_after_fix.json"
+            validation_path.write_text(json.dumps(validation, indent=2, ensure_ascii=False), encoding="utf-8")
+            st.json(validation)
+            if validation.get("valid"):
+                if st.button("Rerun affected step"):
+                    rerun = run_batteryml(config_path=current_root / "generated_config.yaml", output_dir=current_root)
+                    rerun_path = current_root / "rerun_log.txt"
+                    rerun_path.write_text(rerun["stdout"] + "\n" + rerun["stderr"], encoding="utf-8")
+                    st.success(f"Rerun log saved to `{rerun_path}`")
+                    st.code(rerun["stdout"] + "\n" + rerun["stderr"])
