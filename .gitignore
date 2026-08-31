@@ -33,3 +33,4 @@ share/python-wheels/
 MANIFEST
 runs/
 .DS_Store
+logs/
