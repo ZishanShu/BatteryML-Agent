@@ -58,6 +58,7 @@ from pathlib import Path
 #: imported as models.
 EXTENSION_MODULES: tuple[str, ...] = (
     "extra_trees",
+    "knn",
 )
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
