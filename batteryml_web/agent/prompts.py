@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from core.schema_validator import OPTIONAL_FIELDS, REQUIRED_FIELDS
+from ..core.schema_validator import OPTIONAL_FIELDS, REQUIRED_FIELDS
 
 
 def _join_list(items: List[str]) -> str:
