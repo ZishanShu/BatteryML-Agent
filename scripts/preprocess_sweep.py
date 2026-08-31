@@ -52,7 +52,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.verify.common import known_datasets  # noqa: E402
+from scripts.verify.common import known_datasets, relative_to_repo  # noqa: E402
 
 WRAPPER = Path("batteryml_web") / "core" / "run_batteryml_cli.py"
 RAW_ROOT = Path("data") / "raw"
@@ -109,6 +109,63 @@ def _dir_file_count_and_bytes(path: Path, pattern: str = "*") -> tuple[int, int]
 
 def _mib(num_bytes: int) -> float:
     return round(num_bytes / (1024 * 1024), 3)
+
+
+ARCHIVE_SUFFIXES = {".zip", ".gz", ".tar", ".tgz", ".bz2", ".xz", ".7z", ".rar"}
+
+
+def _diagnose_no_output(raw_dir: Path) -> str:
+    """Why a preprocessor that exited 0 might have written nothing.
+
+    BatteryML's preprocessors locate cells with a **non-recursive**
+    ``Path.glob(...)`` over the raw directory — ``'*timeseries*'`` for SNL, OX
+    and HNEI, ``'*.zip'`` for CALCE and RWTH, ``'*.pkl'`` for HUST. When
+    nothing matches, the cell set is empty, the loop body never runs, and
+    ``BasePreprocessor.__call__`` prints "Successfully processed 0 batteries"
+    and exits 0. This inspects the raw directory for the two usual causes so
+    the reader does not have to.
+    """
+    if not raw_dir.is_dir():
+        return ""
+
+    try:
+        entries = list(raw_dir.iterdir())
+    except OSError as exc:
+        return f" Could not inspect {relative_to_repo(raw_dir)}: {type(exc).__name__}: {exc}."
+
+    top_files = [p for p in entries if p.is_file()]
+    top_dirs = [p for p in entries if p.is_dir()]
+    nested_files = sum(1 for p in raw_dir.rglob("*") if p.is_file()) - len(top_files)
+    archives = [p.name for p in raw_dir.rglob("*") if p.suffix.lower() in ARCHIVE_SUFFIXES]
+
+    hints: list[str] = []
+    if nested_files and not top_files:
+        hints.append(
+            f"every one of the {nested_files} raw file(s) is inside a subdirectory "
+            f"({', '.join(sorted(p.name for p in top_dirs)[:5])}), and the preprocessors "
+            f"glob only the top level of {relative_to_repo(raw_dir)} — move the files up, "
+            f"or point --only at the subdirectory's contents"
+        )
+    elif nested_files:
+        hints.append(
+            f"{len(top_files)} file(s) at the top level and {nested_files} deeper in "
+            f"subdirectories; the preprocessors glob only the top level"
+        )
+    if archives:
+        hints.append(
+            f"{len(archives)} archive(s) present (e.g. {archives[0]}) — CALCE and RWTH "
+            f"expect .zip, the others expect extracted files"
+        )
+    if not top_files and not nested_files:
+        hints.append(f"{relative_to_repo(raw_dir)} contains no files at all")
+
+    if not hints:
+        return (
+            f" {len(top_files)} raw file(s) are present at the top level of "
+            f"{relative_to_repo(raw_dir)} but none matched the preprocessor's glob; "
+            f"check the filenames against batteryml/preprocess/preprocess_<DATASET>.py."
+        )
+    return " Likely cause: " + "; ".join(hints) + "."
 
 
 def preprocess_command(dataset: str) -> list[str]:
@@ -243,7 +300,8 @@ def preprocess_one(
         outcome = OUTCOME_FAILED
         note = (
             f"the command exited 0 but wrote no {PROCESSED_GLOB} file to "
-            f"{(PROCESSED_ROOT / dataset).as_posix()}; see {row['log_path']}"
+            f"{(PROCESSED_ROOT / dataset).as_posix()}; see {row['log_path']}."
+            + _diagnose_no_output(raw_dir)
         )
 
     removed = False
