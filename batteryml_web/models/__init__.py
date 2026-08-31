@@ -56,7 +56,9 @@ from pathlib import Path
 #: rather than auto-discovered so that what gets registered is declared in one
 #: readable place. Files whose name starts with "_" are helpers and are never
 #: imported as models.
-EXTENSION_MODULES: tuple[str, ...] = ()
+EXTENSION_MODULES: tuple[str, ...] = (
+    "extra_trees",
+)
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
 

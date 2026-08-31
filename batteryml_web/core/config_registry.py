@@ -25,6 +25,7 @@ MODEL_DISPLAY_NAMES = {
     "linear regression": "Linear Regression",
     "svm": "SVM — Support Vector Regression",
     "elastic net": "Elastic Net Regression",
+    "extra trees": "Extra Trees",
     "dummy": "Dummy Baseline",
     "discharge model": "Discharge Feature Model",
     "full model": "Full Feature Model",
@@ -47,6 +48,7 @@ MODEL_KEY_ALIASES = {
     "linear regression": "linear_regression",
     "svm": "svm",
     "elastic net": "elastic_net",
+    "extra trees": "extra_trees",
     "dummy": "dummy",
     "discharge model": "discharge_model",
     "full model": "full_model",
@@ -72,6 +74,7 @@ MODEL_CLASS_KEYS = {
     "linearregressionrulpredictor": "linear regression",
     "svmrulpredictor": "svm",
     "elasticnetrulpredictor": "elastic net",
+    "extratreesrulpredictor": "extra trees",
     "dummyrulpredictor": "dummy",
 }
 
