@@ -1,5 +1,6 @@
 model:
     name: 'HuberRULPredictor'
+    max_iter: 10000
 train_test_split:
     name: 'MATRCLOTestTrainTestSplitter'
     cell_data_path: 'data/processed/MATR'

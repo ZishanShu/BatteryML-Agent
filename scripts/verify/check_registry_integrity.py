@@ -37,6 +37,7 @@ from .common import (
     FAIL,
     PASS,
     CheckResult,
+    load_live_registries,
     registered_names_from_source,
     relative_to_repo,
     repo_root,
@@ -193,40 +194,16 @@ def _tasks_from_configs(root: Path) -> dict[str, set[str]]:
 
 
 def _live_registries() -> tuple[dict[str, dict[str, str]] | None, str]:
-    """The live builders registries, or None with the reason it could not be read."""
-    builders, reason = try_import("batteryml.builders")
-    if builders is None:
-        return None, f"import failed: {reason}"
-    # batteryml.builders defines the registries but the classes register
-    # themselves on import of batteryml itself.
-    _, package_reason = try_import("batteryml")
-    # Extension models register only once their modules are imported, which is
-    # what the CLI wrapper does before every run. Do the same here so the live
-    # view matches what a real invocation sees.
-    extensions, extension_reason = try_import("batteryml_web.models")
-    if extensions is not None:
-        try:
-            extensions.register_extension_models()
-        except Exception as exc:  # noqa: BLE001 - surfaced below, never hidden
-            extension_reason = f"{type(exc).__name__}: {exc}"
-    live: dict[str, dict[str, str]] = {}
-    for attribute in REGISTRY_ATTRS:
-        registry = getattr(builders, attribute, None)
-        mapping = getattr(registry, "class_mapping", None)
-        if not isinstance(mapping, dict):
-            return None, f"batteryml.builders.{attribute} has no class_mapping"
-        live[attribute] = {
-            name: f"{getattr(cls, '__module__', '?')}.{getattr(cls, '__name__', '?')}"
-            for name, cls in mapping.items()
-        }
-    notes = []
-    if package_reason:
-        notes.append(f"importing batteryml raised {package_reason}")
-    if extension_reason:
-        notes.append(f"loading batteryml_web.models raised {extension_reason}")
-    if notes:
-        return live, "live registries (partial: " + "; ".join(notes) + ")"
-    return live, "live batteryml.builders registries (extension models loaded)"
+    """The live builders registries, or None with the reason they cannot be read.
+
+    Delegates to common.load_live_registries, which imports every registering
+    module -- batteryml, batteryml.preprocess and batteryml_web.models -- before
+    reading any class_mapping. Reading it without importing batteryml.preprocess
+    first made this check order-dependent: PREPROCESSORS was empty unless
+    DATA-01 had already imported that module as a side effect, and every
+    advertised input_type was then reported unresolved.
+    """
+    return load_live_registries(REGISTRY_ATTRS)
 
 
 def check(output_dir: Path | None = None) -> CheckResult:

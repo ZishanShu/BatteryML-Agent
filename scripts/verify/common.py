@@ -204,6 +204,79 @@ def try_import(module_name: str) -> tuple[Any | None, str | None]:
         return None, f"{type(exc).__name__}: {exc}"
 
 
+def load_live_registries(
+    attributes: Iterable[str],
+) -> tuple[dict[str, dict[str, str]] | None, str]:
+    """Read the live ``batteryml.builders`` registries, with everything registered.
+
+    Registration is an import side effect, so a registry is only as complete as
+    the set of modules imported before it is read. Two of those imports are not
+    implied by the obvious one and were each the cause of a wrong result:
+
+    * ``batteryml/__init__.py`` does **not** import ``.preprocess``
+      (it imports .data, .models, .feature, .label, .train_test_split), so
+      ``PREPROCESSORS`` stays empty after ``import batteryml``. REG-01 read it
+      before anything else had imported that module and reported all 16
+      advertised ``input_type``\\s as unresolved — but only when DATA-01 had not
+      run first and imported it as a side effect. An order-dependent result is
+      exactly the hidden state CLAUDE.md §6 forbids.
+    * extension models register only when ``batteryml_web.models`` imports
+      them, which is what the CLI wrapper does before every run. Without it,
+      CFG-01 reported the five extension models as unregistered and failed
+      their 40 configs.
+
+    Every registering module is therefore imported here, explicitly, before any
+    ``class_mapping`` is read, so the result does not depend on what ran first.
+
+    Args:
+        attributes: registry attribute names on ``batteryml.builders``,
+            e.g. ``{"MODELS", "PREPROCESSORS"}``.
+
+    Returns:
+        ``(registries, source)`` where ``registries`` maps each attribute to
+        ``{registered name: "module.ClassName"}``; or ``(None, reason)`` when
+        the registries cannot be read at all.
+    """
+    builders, reason = try_import("batteryml.builders")
+    if builders is None:
+        return None, f"import failed: {reason}"
+
+    notes: list[str] = []
+    for module_name in ("batteryml", "batteryml.preprocess"):
+        _, import_reason = try_import(module_name)
+        if import_reason:
+            notes.append(f"importing {module_name} raised {import_reason}")
+
+    extensions, extension_reason = try_import("batteryml_web.models")
+    if extensions is None:
+        notes.append(f"importing batteryml_web.models raised {extension_reason}")
+    else:
+        try:
+            extensions.register_extension_models()
+        except Exception as exc:  # noqa: BLE001 - surfaced in the source note
+            notes.append(
+                f"registering extension models raised {type(exc).__name__}: {exc}"
+            )
+
+    live: dict[str, dict[str, str]] = {}
+    for attribute in sorted(set(attributes)):
+        registry = getattr(builders, attribute, None)
+        mapping = getattr(registry, "class_mapping", None)
+        if not isinstance(mapping, dict):
+            return None, (
+                f"batteryml.builders.{attribute} has no class_mapping; the registry "
+                "API has changed and these checks need updating."
+            )
+        live[attribute] = {
+            name: f"{getattr(cls, '__module__', '?')}.{getattr(cls, '__name__', '?')}"
+            for name, cls in mapping.items()
+        }
+
+    if notes:
+        return live, "live registries (partial: " + "; ".join(notes) + ")"
+    return live, "live batteryml.builders registries (core + preprocess + extensions)"
+
+
 def registration_source_roots() -> list[Path]:
     """Directories scanned for ``@REGISTRY.register()`` declarations.
 

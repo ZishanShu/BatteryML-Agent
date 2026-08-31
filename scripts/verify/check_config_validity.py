@@ -30,11 +30,11 @@ from .common import (
     FAIL,
     PASS,
     CheckResult,
+    load_live_registries,
     registered_names_from_source,
     relative_to_repo,
     repo_root,
     run_check,
-    try_import,
     write_json,
 )
 
@@ -66,26 +66,14 @@ def _load_registries() -> tuple[dict[str, dict[str, str]], str]:
     ``@REGISTRY.register()`` decorators out of the source when ``batteryml``
     cannot be imported, so the check still works without torch installed.
     """
-    module, reason = try_import("batteryml")
-    if module is not None:
-        builders, builders_reason = try_import("batteryml.builders")
-        if builders is not None:
-            live: dict[str, dict[str, str]] = {}
-            for attribute in set(SECTION_REGISTRY.values()):
-                registry = getattr(builders, attribute, None)
-                mapping = getattr(registry, "class_mapping", None)
-                if not isinstance(mapping, dict):
-                    break
-                live[attribute] = {
-                    name: getattr(cls, "__module__", "?") for name, cls in mapping.items()
-                }
-            else:
-                return live, "live batteryml.builders registries"
-        reason = builders_reason or reason
+    attributes = set(SECTION_REGISTRY.values())
+    live, source = load_live_registries(attributes)
+    if live is not None:
+        return live, source
 
     return (
-        {attribute: registered_names_from_source(attribute) for attribute in set(SECTION_REGISTRY.values())},
-        f"source scan of @REGISTRY.register() decorators (import failed: {reason})",
+        {attribute: registered_names_from_source(attribute) for attribute in attributes},
+        f"source scan of @REGISTRY.register() decorators ({source})",
     )
 
 
