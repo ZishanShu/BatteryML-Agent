@@ -30,7 +30,11 @@ setup(
     long_description_content_type="text/markdown",
     author="Microsoft Corporation",
     url="https://github.com/microsoft/BatteryML",
-    packages=find_packages(exclude=['scripts']),
+    # scripts/ is a regular package (it has an __init__.py) so that the repo's
+    # own scripts.verify always wins over any installed distribution that also
+    # provides a top-level "scripts" package. It is repository tooling, not
+    # part of the library, so exclude it and everything under it.
+    packages=find_packages(exclude=['scripts', 'scripts.*']),
     install_requires=required_packages,
     # [ASSUMED] Derived from the syntax the codebase uses, not observed on the
     # server. Confirm from ENV-01's environment_check.json and tighten if the

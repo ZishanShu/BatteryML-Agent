@@ -139,9 +139,38 @@ def register_extension_models() -> list[str]:
             importlib.import_module(qualified)
         except Exception as exc:  # noqa: BLE001 - re-raised with context, never hidden
             raise ExtensionRegistrationError(
-                f"Could not import extension model module {qualified}: "
-                f"{type(exc).__name__}: {exc}. Fix that module, or remove "
-                f"'{module_name}' from EXTENSION_MODULES in {__name__}."
+                _import_failure_message(qualified, module_name, exc)
             ) from exc
         imported.append(qualified)
     return imported
+
+
+def _import_failure_message(qualified: str, module_name: str, exc: BaseException) -> str:
+    """Explain an extension import failure without misdirecting the reader.
+
+    A missing third-party package is an environment problem, not a defect in
+    the extension module, and telling someone to "fix that module" when
+    scikit-learn is simply not installed sends them to the wrong file. The two
+    cases get different advice.
+    """
+    missing = getattr(exc, "name", None)
+    if isinstance(exc, ModuleNotFoundError) and missing and not missing.startswith(__name__):
+        return (
+            # The exception class and its text are kept verbatim: CLI-01
+            # recognizes a dependency failure by them, and reports SKIP rather
+            # than a contract violation when the wrapper cannot start.
+            f"Extension model module {qualified} needs a package that is not installed "
+            f"({type(exc).__name__}: {exc}). "
+            f"This is an environment problem, not a defect in that module: "
+            f"install the dependencies with `pip install -r requirements.txt` (note the "
+            f"install name can differ from the import name, e.g. `import sklearn` comes "
+            f"from `scikit-learn` and `import yaml` from `pyyaml`), or run "
+            f"`python -m scripts.verify.check_environment` to see everything that is "
+            f"missing. BatteryML core needs {missing!r} too where it is a core "
+            f"dependency, so the run would not have started either way."
+        )
+    return (
+        f"Could not import extension model module {qualified}: "
+        f"{type(exc).__name__}: {exc}. Fix that module, or remove "
+        f"'{module_name}' from EXTENSION_MODULES in {__name__}."
+    )

@@ -22,35 +22,35 @@ running somewhere the data is expected to be present.
 from __future__ import annotations
 
 import argparse
+import importlib
 import platform
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
 
-from . import (
-    check_cli_contract,
-    check_config_validity,
-    check_dataset_status,
-    check_environment,
-    check_registry_integrity,
-    check_split_requirements,
-    check_validator_contract,
-)
 from .common import FAIL, PASS, SKIP, CheckResult, relative_to_repo, repo_root, run_check, write_json, write_text
 
+# (check id, name, module in this package, whether check() takes output_dir).
+#
+# Module names, not imported modules: a check whose own imports fail must not
+# take the whole harness down with it. Three checks import pyyaml, and a broken
+# environment is exactly when the harness is most needed — importing them here
+# meant `--only ENV-01` died with ModuleNotFoundError instead of reporting the
+# missing package. Each module is imported when it is about to run, and an
+# import failure becomes a SKIP for that check alone.
+#
 # Ordered so that the cheapest and most foundational checks report first: a
 # broken environment explains most of what follows.
-CHECKS: tuple[tuple[str, str, Any, bool], ...] = (
-    (check_environment.CHECK_ID, check_environment.CHECK_NAME, check_environment.check, True),
-    (check_cli_contract.CHECK_ID, check_cli_contract.CHECK_NAME, check_cli_contract.check, False),
-    (check_dataset_status.CHECK_ID, check_dataset_status.CHECK_NAME, check_dataset_status.check, True),
-    (check_config_validity.CHECK_ID, check_config_validity.CHECK_NAME, check_config_validity.check, True),
+CHECKS: tuple[tuple[str, str, str, bool], ...] = (
+    ("ENV-01", "environment", "check_environment", True),
+    ("CLI-01", "cli_contract", "check_cli_contract", False),
+    ("DATA-01", "dataset_status", "check_dataset_status", True),
+    ("CFG-01", "config_validity", "check_config_validity", True),
     # After CFG-01: that establishes the configs are sound, this establishes the
     # execution gate agrees with them.
-    (check_validator_contract.CHECK_ID, check_validator_contract.CHECK_NAME, check_validator_contract.check, True),
-    (check_split_requirements.CHECK_ID, check_split_requirements.CHECK_NAME, check_split_requirements.check, True),
-    (check_registry_integrity.CHECK_ID, check_registry_integrity.CHECK_NAME, check_registry_integrity.check, True),
+    ("VAL-01", "validator_contract", "check_validator_contract", True),
+    ("SPLIT-01", "split_requirements", "check_split_requirements", True),
+    ("REG-01", "registry_integrity", "check_registry_integrity", True),
 )
 
 DEFAULT_OUTPUT_DIR = Path("runs") / "verify"
@@ -58,9 +58,43 @@ DEFAULT_OUTPUT_DIR = Path("runs") / "verify"
 _STATUS_ORDER = {FAIL: 0, SKIP: 1, PASS: 2}
 
 
+def _load_check(check_id: str, name: str, module_name: str) -> tuple[object | None, CheckResult | None]:
+    """Import one check module, or return the SKIP result explaining why not.
+
+    A check module that cannot be imported has observed nothing, so it skips
+    rather than fails; ENV-01 is the check that reports the missing package
+    loudly, and it has no third-party imports of its own precisely so that it
+    still runs here.
+    """
+    try:
+        return importlib.import_module(f".{module_name}", __package__), None
+    except Exception as exc:  # noqa: BLE001 - reported as a result, never hidden
+        missing = getattr(exc, "name", None)
+        detail = (
+            f"needs the package {missing!r}, which is not installed"
+            if isinstance(exc, ModuleNotFoundError) and missing
+            else f"raised {type(exc).__name__}: {exc}"
+        )
+        return None, CheckResult(
+            check_id,
+            name,
+            SKIP,
+            f"scripts/verify/{module_name}.py could not be imported: it {detail}. "
+            "Install the dependencies with `pip install -r requirements.txt` and re-run; "
+            "ENV-01 reports exactly which are missing. If the package is present, this "
+            "is a defect in the check module — see evidence.traceback.",
+            {
+                "module": f"scripts.verify.{module_name}",
+                "exception_type": type(exc).__name__,
+                "exception": str(exc),
+                "missing_module": missing,
+            },
+        )
+
+
 def _selected(
     filters: list[str],
-) -> tuple[list[tuple[str, str, Callable[..., CheckResult], bool]], list[str]]:
+) -> tuple[list[tuple[str, str, str, bool]], list[str]]:
     """Apply ``--only`` filters by check id or name (case-insensitive)."""
     if not filters:
         return list(CHECKS), []
@@ -154,8 +188,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.list:
-        for check_id, name, _, _ in CHECKS:
-            print(f"{check_id}  {name}")
+        for check_id, name, module_name, _ in CHECKS:
+            print(f"{check_id}  {name}  (scripts/verify/{module_name}.py)")
         return 0
 
     output_dir = Path(args.output_dir) if args.output_dir else repo_root() / DEFAULT_OUTPUT_DIR
@@ -169,9 +203,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     results: list[CheckResult] = []
-    for check_id, name, function, takes_output_dir in selected:
-        kwargs = {"output_dir": output_dir} if takes_output_dir else {}
-        result = run_check(check_id, name, function, **kwargs)
+    for check_id, name, module_name, takes_output_dir in selected:
+        module, skip_result = _load_check(check_id, name, module_name)
+        if module is None:
+            result = skip_result
+        else:
+            kwargs = {"output_dir": output_dir} if takes_output_dir else {}
+            result = run_check(check_id, name, module.check, **kwargs)
         results.append(result)
         if not args.quiet:
             print(f"[{result.status:<4}] {result.check_id} {result.name}: {result.message}")
