@@ -103,6 +103,20 @@ def _load_registries() -> tuple[Dict[str, frozenset], str | None]:
     return registries, None
 
 
+def registry_status() -> tuple[Dict[str, frozenset], str | None]:
+    """Public view of the registries this validator resolves names against.
+
+    Exposed so a caller can tell "the registries are unavailable" from "this
+    config is wrong" before interpreting a rejection. ``VAL-01``
+    (``scripts/verify/check_validator_contract.py``) uses it to report a skip
+    rather than refusing every config for the same reason.
+
+    Returns:
+        ``(registries, None)`` when readable, else ``({}, reason)``.
+    """
+    return _load_registries()
+
+
 def _as_path(value: Any) -> Path | None:
     if value is None:
         return None
