@@ -59,6 +59,7 @@ from pathlib import Path
 EXTENSION_MODULES: tuple[str, ...] = (
     "extra_trees",
     "knn",
+    "lasso",
 )
 
 _PACKAGE_DIR = Path(__file__).resolve().parent
