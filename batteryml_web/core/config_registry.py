@@ -23,6 +23,8 @@ MODEL_DISPLAY_NAMES = {
     "pcr": "PCR — Principal Component Regression",
     "ridge": "Ridge Regression",
     "linear regression": "Linear Regression",
+    "svm": "SVM — Support Vector Regression",
+    "elastic net": "Elastic Net Regression",
     "dummy": "Dummy Baseline",
     "discharge model": "Discharge Feature Model",
     "full model": "Full Feature Model",
@@ -43,6 +45,8 @@ MODEL_KEY_ALIASES = {
     "pcr": "pcr",
     "ridge": "ridge",
     "linear regression": "linear_regression",
+    "svm": "svm",
+    "elastic net": "elastic_net",
     "dummy": "dummy",
     "discharge model": "discharge_model",
     "full model": "full_model",
@@ -66,6 +70,8 @@ MODEL_CLASS_KEYS = {
     "pcrrulpredictor": "pcr",
     "ridgerulpredictor": "ridge",
     "linearregressionrulpredictor": "linear regression",
+    "svmrulpredictor": "svm",
+    "elasticnetrulpredictor": "elastic net",
     "dummyrulpredictor": "dummy",
 }
 
