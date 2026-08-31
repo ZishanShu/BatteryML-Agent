@@ -30,4 +30,6 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-MANIFESTruns/
+MANIFEST
+runs/
+.DS_Store
