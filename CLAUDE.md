@@ -219,12 +219,21 @@ Changes reach the server through GitHub, so:
 
 ## 11. Project facts
 
-- Repo: `<<< GITHUB URL >>>`
+- Repo: https://github.com/ZishanShu/BatteryML-Agent.git
 - Default demo configuration: dataset **MATR**, task **RUL**, model **XGBoost**,
   device **cpu**, seed **0**.
 - Target manuscript: Nature Protocols (2–4 h from setup to first prediction).
 - Server `data/raw/` contains: `CALCE, HNEI, HUST, MATR, RWTH, SNL, UL_PUR`.
-  Processed data status: `<<< FILL IN — which of these have data/processed/ built >>>`
-- Verified-working path on the server so far: `<<< FILL IN, e.g. MATR preprocess OK;
-  MATR + XGBoost train/eval OK >>>`
-- Current top-3 priorities: `<<< update weekly >>>`
+  Processed data status (observed on server filesystem `[STATIC]`): `MATR` has
+  `data/processed/MATR/` populated (180 items); `HUST` populated (77 items);
+  `CALCE/HNEI/SNL/UL_PUR/RWTH` dirs exist but are empty — preprocessing still needed.
+- Verified-working path on the server so far: `[ASSUMED]` MATR preprocess output
+  present; MATR + XGBoost train/eval NOT yet confirmed by the user this session.
+- Current top-3 priorities:
+  1. Complete the Nature Protocols protocol so **Route A (LLM-guided), Route B
+     (quick-start, offline, no API key), and Route C (extension)** all work end-to-end.
+  2. Confirm and lock the MATR + XGBoost demo (preprocess → train → eval) as the
+     reproducible Route B baseline.
+  3. `docs/SPEC.md` does not exist yet in this repo (no `docs/` dir) — it is cited
+     throughout CLAUDE.md as the single source of truth for spec IDs. Decide whether
+     to restore it or rework the spec-ID workflow before deep platform work.
