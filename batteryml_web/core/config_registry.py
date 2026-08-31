@@ -26,6 +26,7 @@ MODEL_DISPLAY_NAMES = {
     "svm": "SVM — Support Vector Regression",
     "elastic net": "Elastic Net Regression",
     "extra trees": "Extra Trees",
+    "knn": "KNN — k-Nearest Neighbors Regression",
     "dummy": "Dummy Baseline",
     "discharge model": "Discharge Feature Model",
     "full model": "Full Feature Model",
@@ -49,6 +50,7 @@ MODEL_KEY_ALIASES = {
     "svm": "svm",
     "elastic net": "elastic_net",
     "extra trees": "extra_trees",
+    "knn": "knn",
     "dummy": "dummy",
     "discharge model": "discharge_model",
     "full model": "full_model",
@@ -75,6 +77,7 @@ MODEL_CLASS_KEYS = {
     "svmrulpredictor": "svm",
     "elasticnetrulpredictor": "elastic net",
     "extratreesrulpredictor": "extra trees",
+    "knnrulpredictor": "knn",
     "dummyrulpredictor": "dummy",
 }
 
