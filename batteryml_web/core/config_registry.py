@@ -29,6 +29,7 @@ MODEL_DISPLAY_NAMES = {
     "knn": "KNN — k-Nearest Neighbors Regression",
     "lasso": "Lasso Regression",
     "huber": "Huber Regression",
+    "kernel ridge": "Kernel Ridge Regression",
     "dummy": "Dummy Baseline",
     "discharge model": "Discharge Feature Model",
     "full model": "Full Feature Model",
@@ -55,6 +56,7 @@ MODEL_KEY_ALIASES = {
     "knn": "knn",
     "lasso": "lasso",
     "huber": "huber",
+    "kernel ridge": "kernel_ridge",
     "dummy": "dummy",
     "discharge model": "discharge_model",
     "full model": "full_model",
@@ -84,6 +86,7 @@ MODEL_CLASS_KEYS = {
     "knnrulpredictor": "knn",
     "lassorulpredictor": "lasso",
     "huberrulpredictor": "huber",
+    "kernelridgerulpredictor": "kernel ridge",
     "dummyrulpredictor": "dummy",
 }
 
