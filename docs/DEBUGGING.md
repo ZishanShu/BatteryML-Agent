@@ -269,3 +269,52 @@ for w in r['warnings']: print('  warn :', w)"
 
 Every check writes structured evidence to `runs/verify/`; when a message is not
 enough, the JSON has the detail behind it.
+
+---
+
+## 7. "I re-preprocessed the data but the numbers did not change"
+
+`build_dataset` caches the assembled dataset to
+`cache/battery_cache_<hash>.pkl`, and the hash is computed **from config fields
+only** — `train_test_split`, `feature`, `label`, `feature_transformation`,
+`label_transformation` (`batteryml/pipeline.py:186`, hashed at `:191-193`). `[STATIC]`
+
+The contents of `data/processed/` are **not** part of that hash. So
+re-running preprocessing does not invalidate the cache: a subsequent run
+silently loads the old dataset and reports metrics computed from data that is
+no longer on disk. The only visible sign is a line in the log:
+
+```
+Load datasets from cache cache/battery_cache_0ff5ff401e0feff22f54360eae76bc3f.pkl.
+```
+
+Excluding `model` from the hash is deliberate and correct — every model on a
+given split then shares one assembled dataset, which is why a second model on
+`matr_1` starts instantly. The missing piece is a fingerprint of the data
+itself.
+
+**After any preprocessing run, clear the cache before trusting a number:**
+
+```bash
+rm -rf cache/
+```
+
+Two things follow from this that are worth deciding rather than living with:
+
+* `CLAUDE.md` §8 requires `run_metadata.json` to record a **dataset
+  fingerprint**. Nothing computes one yet. The same fingerprint would fix this
+  cache, so the two should be designed together.
+* Until then, a reported metric is only trustworthy if `cache/` was empty when
+  the run started, or if the log line above is absent.
+
+To see what a cache entry corresponds to:
+
+```bash
+ls -la cache/
+python -c "
+import pickle, sys
+d = pickle.load(open(sys.argv[1], 'rb'))
+print('train cells:', len(d['raw_data']['train_cells']))
+print('test cells :', len(d['raw_data']['test_cells']))
+print('first train:', d['raw_data']['train_cells'][0])" cache/battery_cache_<hash>.pkl
+```

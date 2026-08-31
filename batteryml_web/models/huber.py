@@ -15,13 +15,17 @@ Two properties worth knowing before reading its numbers:
 
 * ``HuberRegressor`` applies an L2 penalty of its own (``alpha=0.0001`` by
   default), so it is not an unpenalized fit.
-* It solves iteratively with ``max_iter=100`` by default and can emit
-  ``ConvergenceWarning`` without failing. A warning is not an error, but a run
-  that produces one has not converged and its coefficients should not be read
-  as final. Raise ``max_iter`` in the config if that happens; it is forwarded
-  verbatim.
+* It solves iteratively, and at the sklearn default of ``max_iter=100`` it does
+  **not** converge on this data. Observed on the server, MATR primary split:
+  ``ConvergenceWarning: lbfgs failed to converge after 100 iteration(s)
+  (status=1)``. A warning is not an error, but a run that produces one has not
+  converged and its coefficients are not a result. The configs therefore
+  declare ``max_iter: 10000`` — the one hyperparameter this model needs in
+  order to produce anything readable at all.
 
-No hyperparameters are declared, so those defaults apply.
+Whether 10000 is sufficient is not yet confirmed; if the warning persists the
+problem is conditioning rather than the iteration budget, and raising it
+further will not help.
 """
 
 from __future__ import annotations
