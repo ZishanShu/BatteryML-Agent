@@ -28,6 +28,7 @@ MODEL_DISPLAY_NAMES = {
     "extra trees": "Extra Trees",
     "knn": "KNN — k-Nearest Neighbors Regression",
     "lasso": "Lasso Regression",
+    "huber": "Huber Regression",
     "dummy": "Dummy Baseline",
     "discharge model": "Discharge Feature Model",
     "full model": "Full Feature Model",
@@ -53,6 +54,7 @@ MODEL_KEY_ALIASES = {
     "extra trees": "extra_trees",
     "knn": "knn",
     "lasso": "lasso",
+    "huber": "huber",
     "dummy": "dummy",
     "discharge model": "discharge_model",
     "full model": "full_model",
@@ -81,6 +83,7 @@ MODEL_CLASS_KEYS = {
     "extratreesrulpredictor": "extra trees",
     "knnrulpredictor": "knn",
     "lassorulpredictor": "lasso",
+    "huberrulpredictor": "huber",
     "dummyrulpredictor": "dummy",
 }
 

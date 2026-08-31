@@ -58,6 +58,7 @@ from pathlib import Path
 #: imported as models.
 EXTENSION_MODULES: tuple[str, ...] = (
     "extra_trees",
+    "huber",
     "knn",
     "lasso",
 )
