@@ -204,12 +204,29 @@ def try_import(module_name: str) -> tuple[Any | None, str | None]:
         return None, f"{type(exc).__name__}: {exc}"
 
 
+def registration_source_roots() -> list[Path]:
+    """Directories scanned for ``@REGISTRY.register()`` declarations.
+
+    Both upstream core and the extension point are scanned. A model under
+    ``batteryml_web/models/`` reaches the same registry as a core one — the
+    CLI wrapper imports the package before handing over to ``bin/batteryml.py``
+    (``batteryml_web/models/__init__.py``) — so a check that looked only at
+    ``batteryml/`` would report an extension model as unregistered.
+
+    Only ``batteryml_web/models/`` is scanned, not ``batteryml_web/`` at large:
+    nothing else in the web layer registers into BatteryML.
+    """
+    root = repo_root()
+    return [root / "batteryml", root / "batteryml_web" / "models"]
+
+
 def registered_names_from_source(registry_attr: str) -> dict[str, str]:
     """Find every class registered with ``@<registry_attr>.register()`` by parsing source.
 
     This is the dependency-free fallback for the live registries in
-    ``batteryml.builders``: it reads ``batteryml/**/*.py`` with ``ast`` and
-    never imports anything, so it works without torch installed.
+    ``batteryml.builders``: it reads the source under
+    :func:`registration_source_roots` with ``ast`` and never imports anything,
+    so it works without torch installed.
 
     Args:
         registry_attr: the registry object name as written in the decorator,
@@ -221,10 +238,16 @@ def registered_names_from_source(registry_attr: str) -> dict[str, str]:
     Raises:
         ValueError: if two classes register the same name, which the live
             Registry would also reject (batteryml/utils/registry.py:38-40).
+            Collisions between a core model and an extension model are caught
+            here too, since both roots feed one mapping.
     """
     found: dict[str, str] = {}
-    root = repo_root()
-    for source_path in sorted((root / "batteryml").rglob("*.py")):
+    source_paths: list[Path] = []
+    for source_root in registration_source_roots():
+        if source_root.is_dir():
+            source_paths.extend(source_root.rglob("*.py"))
+
+    for source_path in sorted(source_paths):
         # registry.py's docstring contains an example @MODELS.register() that
         # is not a real registration.
         if source_path.name == "registry.py":

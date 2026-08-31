@@ -38,6 +38,7 @@ from .common import (
     PASS,
     CheckResult,
     registered_names_from_source,
+    relative_to_repo,
     repo_root,
     run_check,
     supported_sources,
@@ -65,28 +66,48 @@ DEVICES_NN = ["cpu", "cuda"]
 DEVICES_SKLEARN = ["cpu"]
 
 
-def _model_bases() -> dict[str, list[str]]:
-    """Model class name -> its base class names, parsed from source (no import)."""
-    bases: dict[str, list[str]] = {}
-    models_dir = repo_root() / "batteryml" / "models"
-    if not models_dir.is_dir():
-        return bases
-    for source_path in sorted(models_dir.rglob("*.py")):
-        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ClassDef):
-                continue
-            names = []
-            for base in node.bases:
-                if isinstance(base, ast.Name):
-                    names.append(base.id)
-                elif isinstance(base, ast.Attribute):
-                    names.append(base.attr)
-            bases[node.name] = names
+def _model_source_roots() -> list[Path]:
+    """Directories that may define a model class.
+
+    ``batteryml_web/models/`` is included because an extension model registered
+    there reaches the same MODELS registry (see
+    ``batteryml_web/models/__init__.py``). Scanning only ``batteryml/models/``
+    would leave every extension model's base chain unresolvable, which this
+    check reports as a failure.
+    """
+    root = repo_root()
+    return [root / "batteryml" / "models", root / "batteryml_web" / "models"]
+
+
+def _model_bases() -> dict[str, dict[str, Any]]:
+    """Model class name -> ``{"bases": [...], "defined_in": "path:line"}``.
+
+    Parsed from source with ``ast``; nothing is imported, so this works
+    without torch installed.
+    """
+    bases: dict[str, dict[str, Any]] = {}
+    for models_dir in _model_source_roots():
+        if not models_dir.is_dir():
+            continue
+        for source_path in sorted(models_dir.rglob("*.py")):
+            tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                names = []
+                for base in node.bases:
+                    if isinstance(base, ast.Name):
+                        names.append(base.id)
+                    elif isinstance(base, ast.Attribute):
+                        names.append(base.attr)
+                bases[node.name] = {
+                    "bases": names,
+                    "defined_in": f"{relative_to_repo(source_path)}:{node.lineno}",
+                }
     return bases
 
 
-def _resolve_device_support(model: str, bases: dict[str, list[str]]) -> tuple[list[str], str]:
+def _resolve_device_support(model: str, bases: dict[str, dict[str, Any]]) -> tuple[list[str], str]:
     """Derive device support by walking the class's base chain."""
     seen: set[str] = set()
     queue = [model]
@@ -99,8 +120,48 @@ def _resolve_device_support(model: str, bases: dict[str, list[str]]) -> tuple[li
             return DEVICES_NN, f"derived: {model} inherits {current}"
         if current in SKLEARN_BASES:
             return DEVICES_SKLEARN, f"derived: {model} inherits {current}"
-        queue.extend(bases.get(current, []))
+        entry = bases.get(current)
+        if entry:
+            queue.extend(entry["bases"])
     return [], "not derivable: neither NNModel nor SklearnModel in the base chain"
+
+
+def _origin(defined_in: str | None) -> str:
+    """Whether a model class lives in upstream core or in the extension point."""
+    if not defined_in:
+        return "unknown"
+    if defined_in.startswith("batteryml_web/models/"):
+        return "extension"
+    if defined_in.startswith("batteryml/"):
+        return "upstream"
+    return "unknown"
+
+
+def _extension_state() -> dict[str, Any]:
+    """What the extension package declares, and whether it is self-consistent.
+
+    ``batteryml_web.models`` is deliberately import-light (importlib and
+    pathlib only), so it can be read here without torch installed.
+    """
+    state: dict[str, Any] = {
+        "importable": False,
+        "declared_modules": [],
+        "unlisted_modules": [],
+        "missing_modules": [],
+        "error": None,
+    }
+    package, reason = try_import("batteryml_web.models")
+    if package is None:
+        state["error"] = reason
+        return state
+    state["importable"] = True
+    state["declared_modules"] = list(getattr(package, "EXTENSION_MODULES", ()))
+    try:
+        state["unlisted_modules"] = list(package.unlisted_modules())
+        state["missing_modules"] = list(package.missing_modules())
+    except Exception as exc:  # noqa: BLE001 - reported, never hidden
+        state["error"] = f"{type(exc).__name__}: {exc}"
+    return state
 
 
 def _tasks_from_configs(root: Path) -> dict[str, set[str]]:
@@ -139,6 +200,15 @@ def _live_registries() -> tuple[dict[str, dict[str, str]] | None, str]:
     # batteryml.builders defines the registries but the classes register
     # themselves on import of batteryml itself.
     _, package_reason = try_import("batteryml")
+    # Extension models register only once their modules are imported, which is
+    # what the CLI wrapper does before every run. Do the same here so the live
+    # view matches what a real invocation sees.
+    extensions, extension_reason = try_import("batteryml_web.models")
+    if extensions is not None:
+        try:
+            extensions.register_extension_models()
+        except Exception as exc:  # noqa: BLE001 - surfaced below, never hidden
+            extension_reason = f"{type(exc).__name__}: {exc}"
     live: dict[str, dict[str, str]] = {}
     for attribute in REGISTRY_ATTRS:
         registry = getattr(builders, attribute, None)
@@ -149,9 +219,14 @@ def _live_registries() -> tuple[dict[str, dict[str, str]] | None, str]:
             name: f"{getattr(cls, '__module__', '?')}.{getattr(cls, '__name__', '?')}"
             for name, cls in mapping.items()
         }
+    notes = []
     if package_reason:
-        return live, f"live registries (partial: importing batteryml raised {package_reason})"
-    return live, "live batteryml.builders registries"
+        notes.append(f"importing batteryml raised {package_reason}")
+    if extension_reason:
+        notes.append(f"loading batteryml_web.models raised {extension_reason}")
+    if notes:
+        return live, "live registries (partial: " + "; ".join(notes) + ")"
+    return live, "live batteryml.builders registries (extension models loaded)"
 
 
 def check(output_dir: Path | None = None) -> CheckResult:
@@ -160,6 +235,35 @@ def check(output_dir: Path | None = None) -> CheckResult:
     output_dir = Path(output_dir) if output_dir else root / "runs" / "verify"
 
     errors: list[str] = []
+
+    # The extension point must be self-consistent before anything else is
+    # trusted: an unlisted module file is a model that will never register.
+    extension = _extension_state()
+    if not extension["importable"]:
+        errors.append(
+            f"batteryml_web.models is not importable ({extension['error']}). "
+            "The CLI wrapper imports it before every run, so this breaks every "
+            "invocation, not just extension models."
+        )
+    else:
+        if extension["unlisted_modules"]:
+            errors.append(
+                f"{len(extension['unlisted_modules'])} module file(s) in "
+                f"batteryml_web/models/ are not listed in EXTENSION_MODULES: "
+                f"{', '.join(extension['unlisted_modules'])}. An unlisted module is "
+                f"never imported, so its @MODELS.register() never fires. Add the "
+                f"name(s) to EXTENSION_MODULES, or prefix the file with '_' if it is "
+                f"a helper rather than a model."
+            )
+        if extension["missing_modules"]:
+            errors.append(
+                f"EXTENSION_MODULES lists {len(extension['missing_modules'])} module(s) "
+                f"with no file in batteryml_web/models/: "
+                f"{', '.join(extension['missing_modules'])}. Create the file(s) or "
+                f"remove the name(s)."
+            )
+        if extension["error"]:
+            errors.append(f"batteryml_web.models is inconsistent: {extension['error']}")
 
     live, live_reason = _live_registries()
     # registered_names_from_source raises ValueError on a duplicate registration,
@@ -217,9 +321,12 @@ def check(output_dir: Path | None = None) -> CheckResult:
             else None
         )
         tasks = sorted(config_tasks.get(name, set()) | ({suffix_task} if suffix_task else set()))
+        defined_in = (bases.get(name) or {}).get("defined_in")
         models.append(
             {
                 "model": name,
+                "origin": _origin(defined_in),
+                "defined_in": defined_in,
                 "declares_tasks": False,
                 "declares_devices": False,
                 "derived_tasks": tasks,
@@ -242,6 +349,7 @@ def check(output_dir: Path | None = None) -> CheckResult:
         "registered_counts": {attr: len(mapping) for attr, mapping in sorted(registries.items())},
         "advertised_input_types": advertised,
         "unresolved_input_types": unresolved_sources,
+        "extension_point": extension,
         "models": models,
         "duplicate_error": duplicate_error,
     }
@@ -256,10 +364,13 @@ def check(output_dir: Path | None = None) -> CheckResult:
         f"declaration table in batteryml_web/ — a design decision, not a harness fix."
     )
 
+    extension_models = [entry["model"] for entry in models if entry["origin"] == "extension"]
     evidence = {
         "registry_source": registry_source,
         "registered_counts": payload["registered_counts"],
         "unresolved_input_types": unresolved_sources,
+        "extension_point": extension,
+        "extension_models": extension_models,
         "models_without_declared_tasks_or_devices": undeclared,
         "derived_model_support": models,
         "observations": [observation],
@@ -280,11 +391,18 @@ def check(output_dir: Path | None = None) -> CheckResult:
     counts = ", ".join(
         f"{attr.lower()}={len(mapping)}" for attr, mapping in sorted(registries.items())
     )
+    extension_note = (
+        f"{len(extension_models)} extension model(s) from batteryml_web/models/: "
+        f"{', '.join(extension_models)}"
+        if extension_models
+        else "extension point declares no models"
+    )
     return CheckResult(
         CHECK_ID,
         CHECK_NAME,
         PASS,
         f"All registered names resolve and are unique ({counts}) [{registry_source}]. "
+        f"{extension_note}. "
         "Observation: no model declares tasks or devices; both are derived.",
         evidence,
         artifacts,
