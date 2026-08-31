@@ -1,14 +1,47 @@
-pandas
-addict
-fire
+# BatteryML runtime dependencies.
+#
+# Python: >= 3.9 (enforced by python_requires in setup.py). [ASSUMED] — derived
+#   from the syntax the codebase uses, not observed on the server. Confirm the
+#   interpreter the server actually runs from ENV-01's environment_check.json
+#   (`python.version`) and tighten this if it is higher.
+#
+# Lines marked "PIN:" are unpinned on purpose: the package is genuinely
+# imported, but this file cannot state a version that was not observed. Fill
+# each from ENV-01's environment_check.json (`packages[<name>].installed`)
+# after running:
+#
+#     python -m scripts.verify.run_all --only ENV-01
+#
+# Guessing a version number here would be worse than leaving it open.
+
+# --- core numerics ---
 numpy>=1.24,<2.0.0
-tqdm
 scipy
-scikit-learn
-pyyaml
+pandas
 numba
-matplotlib
-h5py
-openpyxl
-requests
+
+# --- machine learning ---
+torch          # PIN: fill from environment_check.json -> packages[torch].installed
+scikit-learn
 xgboost
+
+# --- configuration and I/O ---
+addict
+pyyaml
+h5py
+openpyxl       # not imported directly; pandas needs it to read the .xlsx files
+               # accepted by batteryml_web/core/dataset_inspector.py
+requests
+tqdm
+
+# --- visualization ---
+matplotlib
+
+# --- web layer ---
+streamlit      # PIN: fill from environment_check.json -> packages[streamlit].installed
+
+# --- declared but no import found anywhere in the repository ---
+# `fire` is not imported by any module (checked across every .py in the repo).
+# Left in place rather than removed, because this environment cannot confirm
+# nothing on the server depends on it. Remove it once you have checked.
+fire

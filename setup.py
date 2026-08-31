@@ -3,8 +3,24 @@
 
 from setuptools import setup, find_packages
 
-with open("requirements.txt") as f:
-    required_packages = f.read().splitlines()
+
+def read_requirements(path="requirements.txt"):
+    """Requirement lines from `path`, without comments or blanks.
+
+    requirements.txt carries explanatory comments and inline "PIN:" markers
+    for the versions this repository cannot state without observing the
+    server, so the raw file cannot be handed to install_requires unfiltered.
+    """
+    requirements = []
+    with open(path, encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.split("#", 1)[0].strip()
+            if line:
+                requirements.append(line)
+    return requirements
+
+
+required_packages = read_requirements()
 
 setup(
     name="BatteryML",
@@ -16,6 +32,10 @@ setup(
     url="https://github.com/microsoft/BatteryML",
     packages=find_packages(exclude=['scripts']),
     install_requires=required_packages,
+    # [ASSUMED] Derived from the syntax the codebase uses, not observed on the
+    # server. Confirm from ENV-01's environment_check.json and tighten if the
+    # server runs something higher.
+    python_requires=">=3.9",
     # Addressing the Windows usage issue
     # See https://github.com/microsoft/BatteryML/issues/21
     entry_points={
