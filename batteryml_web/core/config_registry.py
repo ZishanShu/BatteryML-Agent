@@ -27,6 +27,7 @@ MODEL_DISPLAY_NAMES = {
     "elastic net": "Elastic Net Regression",
     "extra trees": "Extra Trees",
     "knn": "KNN — k-Nearest Neighbors Regression",
+    "lasso": "Lasso Regression",
     "dummy": "Dummy Baseline",
     "discharge model": "Discharge Feature Model",
     "full model": "Full Feature Model",
@@ -51,6 +52,7 @@ MODEL_KEY_ALIASES = {
     "elastic net": "elastic_net",
     "extra trees": "extra_trees",
     "knn": "knn",
+    "lasso": "lasso",
     "dummy": "dummy",
     "discharge model": "discharge_model",
     "full model": "full_model",
@@ -78,6 +80,7 @@ MODEL_CLASS_KEYS = {
     "elasticnetrulpredictor": "elastic net",
     "extratreesrulpredictor": "extra trees",
     "knnrulpredictor": "knn",
+    "lassorulpredictor": "lasso",
     "dummyrulpredictor": "dummy",
 }
 
