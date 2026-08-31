@@ -1,11 +1,15 @@
 # Licensed under the MIT License.
 # Copyright (c) Microsoft Corporation.
 
+import logging
+
 import torch
 import torch.nn as nn
 
 from batteryml.builders import MODELS
 from batteryml.models.nn_model import NNModel
+
+logger = logging.getLogger(__name__)
 
 
 @MODELS.register()
@@ -32,7 +36,8 @@ class TransformerRULPredictor(NNModel):
                 feature: torch.Tensor,
                 label: torch.Tensor,
                 return_loss: bool = False):
-        print(feature.shape)
+        logger.debug('TransformerRULPredictor input shape: %s',
+                     tuple(feature.shape))
         if feature.ndim == 4:
             B, C, N, L = feature.shape
             feature = feature.transpose(1, 2).contiguous().view(B, N, -1)
