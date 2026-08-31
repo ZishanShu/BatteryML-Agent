@@ -59,6 +59,7 @@ from pathlib import Path
 EXTENSION_MODULES: tuple[str, ...] = (
     "extra_trees",
     "huber",
+    "kernel_ridge",
     "knn",
     "lasso",
 )
