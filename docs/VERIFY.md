@@ -59,7 +59,7 @@ preprocessing).
 | `DATA-01` | `dataset_status` | Per dataset: raw present, file count and size; processed present and non-empty; processed older than raw. | `dataset_status.csv`, `dataset_status.json` |
 | `CFG-01` | `config_validity` | Every config under `configs/` parses, declares `model` / `train_test_split` / `feature` / `label` each with a `name`, and names only registered implementations. Declared `cell_data_path`s are checked for existence. | `config_validity.json` |
 | `SPLIT-01` | `split_requirements` | For each of the eight presets, which processed datasets it requires and which are missing — derived from two independent sources and cross-checked. | `split_requirements.json` |
-| `REG-01` | `registry_integrity` | Every registered name resolves and is unique; every `input_type` the CLI advertises has a preprocessor; per-model task and device support. | `registry_integrity.json` |
+| `REG-01` | `registry_integrity` | Every registered name resolves and is unique; the `batteryml_web/models/` extension point is self-consistent; every `input_type` the CLI advertises has a preprocessor; per-model origin, task and device support. | `registry_integrity.json` |
 
 `run_all` additionally writes `verification_report.json` (the full structured
 result of every check) and `verification_summary.txt` (the same, readable top to
@@ -102,9 +102,16 @@ falls back to reading the source with `ast`:
 
 | Wanted | Preferred source | Fallback |
 | --- | --- | --- |
-| Registered class names | `batteryml.builders.<REGISTRY>.class_mapping` | `@REGISTRY.register()` decorators parsed from `batteryml/**/*.py` |
+| Registered class names | `batteryml.builders.<REGISTRY>.class_mapping`, after importing `batteryml` **and** `batteryml_web.models` | `@REGISTRY.register()` decorators parsed from the roots in `common.registration_source_roots()` |
+| Model base chains (device support) | — | class definitions parsed from `batteryml/models/` and `batteryml_web/models/` |
 | Advertised `input_type`s | `batteryml.preprocess.SUPPORTED_SOURCES` | `ast.literal_eval` of the same assignment in `batteryml/preprocess/__init__.py` |
 | Split dataset requirements | — | cell-ID literals parsed out of the splitter classes, plus `cell_data_path` from the configs |
+
+Both scan roots matter. A model registered through the extension point
+(`batteryml_web/models/`, see `docs/EXTENDING_MODELS.md`) reaches the same
+`MODELS` registry as a core one, so a check that looked only at `batteryml/`
+would report it as unregistered — `CFG-01` would then fail every one of its
+configs with a false `is not registered in MODELS`.
 
 Every result records which source it used, in `evidence.registry_source` /
 `evidence.dataset_source`, so a report is never ambiguous about what it read.
