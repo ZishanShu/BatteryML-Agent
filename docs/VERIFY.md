@@ -10,6 +10,9 @@ server — starts from a known-good baseline.
 anything under `data/`. Nothing they report is a claim about pipeline behaviour
 on real data.
 
+For diagnosing an import or environment failure rather than running the
+checks, see `docs/DEBUGGING.md`.
+
 ## Running
 
 ```bash
