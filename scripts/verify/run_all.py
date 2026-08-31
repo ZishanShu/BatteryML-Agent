@@ -35,6 +35,7 @@ from . import (
     check_environment,
     check_registry_integrity,
     check_split_requirements,
+    check_validator_contract,
 )
 from .common import FAIL, PASS, SKIP, CheckResult, relative_to_repo, repo_root, run_check, write_json, write_text
 
@@ -45,6 +46,9 @@ CHECKS: tuple[tuple[str, str, Any, bool], ...] = (
     (check_cli_contract.CHECK_ID, check_cli_contract.CHECK_NAME, check_cli_contract.check, False),
     (check_dataset_status.CHECK_ID, check_dataset_status.CHECK_NAME, check_dataset_status.check, True),
     (check_config_validity.CHECK_ID, check_config_validity.CHECK_NAME, check_config_validity.check, True),
+    # After CFG-01: that establishes the configs are sound, this establishes the
+    # execution gate agrees with them.
+    (check_validator_contract.CHECK_ID, check_validator_contract.CHECK_NAME, check_validator_contract.check, True),
     (check_split_requirements.CHECK_ID, check_split_requirements.CHECK_NAME, check_split_requirements.check, True),
     (check_registry_integrity.CHECK_ID, check_registry_integrity.CHECK_NAME, check_registry_integrity.check, True),
 )

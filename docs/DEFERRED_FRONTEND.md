@@ -151,3 +151,72 @@ Change lines 7-8 to `from ..core.config_validator import ...` /
 against `run_llm_prompt(prompt, *, base_url, api_key, model, system_prompt,
 timeout)` exactly as `agent/schema_agent.py` now does. `diagnose_failure` and
 `run_validator_after_fix` otherwise look structurally sound `[STATIC]`.
+
+---
+
+## DF-04 — the execution gate is not wired into any execution path
+
+| Field | Value |
+| --- | --- |
+| File | `batteryml_web/app.py` (frozen) |
+| Lines | 698 and 1176 — the two places that launch BatteryML |
+| Found while | Fixing `config_validator` (item ①). |
+| Basis | `[VERIFIED]` — grepped `validate_config` and `config_validator` across every `.py` and `.md` in the repository; the only importer is `batteryml_web/agent/troubleshoot_agent.py:7`, which is itself broken (DF-03) and imported by nothing. |
+
+### Symptom
+
+`CLAUDE.md` §3 assigns validators the "permission to execute anything", and the
+agent output path is fixed as `suggest → user review → validator → execute`.
+No execution path in the platform calls the validator:
+
+```python
+# app.py:698 — preprocess, launched directly
+result = run_command_with_progress(command=[sys.executable,
+    "batteryml_web/core/run_batteryml_cli.py", "preprocess", ds, ...])
+
+# app.py:1176 — train/eval, launched directly
+command = [sys.executable, "batteryml_web/core/run_batteryml_cli.py", "run",
+           str(config_path) if config_path else "<missing-config>", ...]
+```
+
+Neither is preceded by a `validate_config` call. The `validator` step of the
+documented path is absent, so a config that the gate would refuse is executed
+anyway, and the user meets the failure as a traceback from the pipeline.
+
+Line 1176 is the sharper case: it substitutes the literal string
+`"<missing-config>"` when `config_path` is falsy and launches anyway. That
+reaches `Pipeline` as a path, and `YamlHandler.__init__`
+(`batteryml/utils/config.py:60-61`) raises
+`FileNotFoundError: The file <missing-config> does not exist.`
+
+### Why it was not fixed now
+
+`app.py` is frozen. This is an integration gap, not a defect in the validator
+itself — the validator is now correct (it accepts 130 of 130 configs) but
+unreachable.
+
+### Change needed later
+
+Call the gate immediately before each launch, and do not launch on a refusal:
+
+```python
+from batteryml_web.core.config_validator import load_and_validate_config_file
+
+report = load_and_validate_config_file(
+    config_path,
+    task=st.session_state.get("selected_task"),
+    output_dir=workspace_dir,
+)
+if not report["valid"]:
+    for message in report["errors"]:
+        st.error(message)
+    st.stop()
+for message in report["warnings"]:
+    st.warning(message)
+```
+
+`require_data` should stay at its default `True` here: the point of validating
+before a run is to catch a missing or empty `data/processed/<DATASET>` with an
+actionable message instead of an `AssertionError` from
+`BaseTrainTestSplitter`. The `"<missing-config>"` placeholder at `:1176` should
+be replaced by refusing to launch at all when no config is selected.

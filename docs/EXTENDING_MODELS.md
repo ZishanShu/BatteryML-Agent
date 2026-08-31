@@ -177,32 +177,34 @@ where.
 
 ---
 
+## The execution gate needs no edit
+
+`batteryml_web/core/config_validator.py` used to whitelist two model names and
+one splitter name, so it accepted **4 of 130** configs and would have refused
+every new model. It now resolves each declared name against the live
+`batteryml.builders` registries, populating them the way a run does — importing
+`batteryml`, then calling `register_extension_models()`. **A model added
+through the four steps above is accepted by the gate automatically.**
+
+`VAL-01` (`python -m scripts.verify.run_all --only VAL-01`) runs the real
+validator over every config and reports what it would refuse, so a drift
+between the gate and the registries is caught rather than discovered at run
+time.
+
+Two things to know about it:
+
+* It resolves names **live**, so it needs `batteryml` importable. That is not a
+  limitation: it runs immediately before a run, and if the import fails the run
+  cannot happen either. The failure is reported with the import error, never
+  passed over silently.
+* A declared `cell_data_path` that is missing or holds no `*.pkl` is an
+  **error**, because the run provably cannot succeed. Pass `require_data=False`
+  to check a config's structure before preprocessing; the same findings come
+  back as warnings.
+
+---
+
 ## Known blockers
-
-### `config_validator.py`'s whitelist rejects nearly everything
-
-`batteryml_web/core/config_validator.py:10-17`:
-
-```python
-SUPPORTED_MODELS = {"XGBoostRULPredictor", "DummyRULPredictor"}
-SUPPORTED_SPLITS = {"MATRPrimaryTestTrainTestSplitter"}
-```
-
-Anything else becomes a hard `errors` entry and `valid: False`
-(`:40-46`). This does not only block new models — **ridge, gpr, pcr, plsr, rf,
-svm, elastic_net, cnn, lstm, mlp, transformer and all seven non-`matr_1` split
-presets are currently judged invalid by it.**
-
-This is unresolved and needs a decision, since `CLAUDE.md` §3 makes validators
-the gate on execution. Two options:
-
-1. expand both sets to the full lists — has to be edited every time a model is
-   added;
-2. validate against the live `MODELS` / `TRAIN_TEST_SPLITTERS` registries
-   instead — self-maintaining, and the same source of truth `CFG-01` uses.
-
-Option 2 is the better shape. Until one is chosen, an extension model will pass
-`CFG-01` and run from the CLI but fail `validate_config()`.
 
 ### A third pattern table in `catalog.py`
 

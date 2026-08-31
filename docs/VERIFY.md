@@ -58,6 +58,7 @@ preprocessing).
 | `CLI-01` | `cli_contract` | That `run_batteryml_cli.py run` still takes the config **positionally** and still offers `--train --eval --device --seed --workspace`, and offers no `--config`. Inspects `--help` only. | — |
 | `DATA-01` | `dataset_status` | Per dataset: raw present, file count and size; processed present and non-empty; processed older than raw. | `dataset_status.csv`, `dataset_status.json` |
 | `CFG-01` | `config_validity` | Every config under `configs/` parses, declares `model` / `train_test_split` / `feature` / `label` each with a `name`, and names only registered implementations. Declared `cell_data_path`s are checked for existence. | `config_validity.json` |
+| `VAL-01` | `validator_contract` | Runs the real `config_validator.validate_config` over every run config and reports which the execution gate would refuse. Structure only (`require_data=False`), so it needs no data and writes nothing. | `validator_contract.json` |
 | `SPLIT-01` | `split_requirements` | For each of the eight presets, which processed datasets it requires and which are missing — derived from two independent sources and cross-checked. | `split_requirements.json` |
 | `REG-01` | `registry_integrity` | Every registered name resolves and is unique; the `batteryml_web/models/` extension point is self-consistent; every `input_type` the CLI advertises has a preprocessor; per-model origin, task and device support. | `registry_integrity.json` |
 
@@ -120,6 +121,12 @@ Every result records which source it used, in `evidence.registry_source` /
 start because an import failed, `CLI-01` reports **SKIP** and points at
 `ENV-01`: a missing dependency is the environment check's finding, not a
 contract violation.
+
+`VAL-01` is the one check with no dependency-free fallback, by design. It
+exercises the real execution gate, which resolves names against the live
+registries; a source-scanned approximation would test something other than what
+gates a run. It asks `config_validator.registry_status()` once up front, so a
+missing dependency reads as one SKIP rather than as 130 refused configs.
 
 ## Dependencies
 
