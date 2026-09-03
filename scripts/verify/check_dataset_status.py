@@ -175,22 +175,10 @@ def check(output_dir: Path | None = None) -> CheckResult:
             artifacts,
         )
 
+    # An empty processed directory is DATA-02's failure to report: it owns that
+    # condition over the whole data/processed/ tree, not only the registered
+    # datasets seen here, so it is reported once rather than by both checks.
     empty = by_state.get(STATE_EMPTY_PROCESSED, [])
-    if empty:
-        return CheckResult(
-            CHECK_ID,
-            CHECK_NAME,
-            FAIL,
-            f"{len(empty)} processed directory/directories exist but contain no "
-            f"{PROCESSED_GLOB} file: {', '.join(empty)}. An empty processed directory "
-            "satisfies BaseTrainTestSplitter's `assert path.exists()` "
-            "(batteryml/train_test_split/base.py:25) and then yields an empty cell list, "
-            "so training proceeds on nothing instead of failing loudly. Either run "
-            "preprocessing (scripts/preprocess_sweep.py --only <DATASET>) or remove the "
-            "empty directory.",
-            evidence,
-            artifacts,
-        )
 
     ready = by_state.get(STATE_READY, [])
     stale = by_state.get(STATE_STALE, [])
@@ -203,6 +191,11 @@ def check(output_dir: Path | None = None) -> CheckResult:
     )
     if stale:
         summary += f" Stale (processed older than raw): {', '.join(stale)} — re-run preprocessing."
+    if empty:
+        summary += (
+            f" {len(empty)} processed directory/directories are empty "
+            f"({', '.join(empty)}); DATA-02 reports that as a failure."
+        )
     return CheckResult(CHECK_ID, CHECK_NAME, PASS, summary, evidence, artifacts)
 
 

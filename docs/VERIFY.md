@@ -1,6 +1,6 @@
 # `scripts/verify/` — the verification harness
 
-Six independent checks that inspect the repository, the environment and the
+Eight independent checks that inspect the repository, the environment and the
 filesystem. They are the cheap half of the verification loop described in
 `CLAUDE.md` §0: they establish what can be established without running the
 pipeline, so that the expensive half — the user running the real thing on the
@@ -60,6 +60,7 @@ preprocessing).
 | `ENV-01` | `environment` | Python version against the minimum; every distribution declared in `requirements.txt`, installed or not, with the installed version; `batteryml` importable; GPU visible via torch and `nvidia-smi`. | `environment_check.json`, `package_versions.txt` |
 | `CLI-01` | `cli_contract` | That `run_batteryml_cli.py run` still takes the config **positionally** and still offers `--train --eval --device --seed --workspace`, and offers no `--config`. Inspects `--help` only. | — |
 | `DATA-01` | `dataset_status` | Per dataset: raw present, file count and size; processed present and non-empty; processed older than raw. | `dataset_status.csv`, `dataset_status.json` |
+| `DATA-02` | `empty_processed_dirs` | That no directory under `data/processed/` exists while containing no `.pkl`. Scans **every** directory, not only registered datasets. Owns this failure; DATA-01 reports it as a state. | `empty_processed_dirs.json` |
 | `CFG-01` | `config_validity` | Every config under `configs/` parses, declares `model` / `train_test_split` / `feature` / `label` each with a `name`, and names only registered implementations. Declared `cell_data_path`s are checked for existence. | `config_validity.json` |
 | `VAL-01` | `validator_contract` | Runs the real `config_validator.validate_config` over every run config and reports which the execution gate would refuse. Structure only (`require_data=False`), so it needs no data and writes nothing. | `validator_contract.json` |
 | `SPLIT-01` | `split_requirements` | For each of the eight presets, which processed datasets it requires and which are missing — derived from two independent sources and cross-checked. | `split_requirements.json` |

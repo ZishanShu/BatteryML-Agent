@@ -236,9 +236,14 @@ already in them.
 | `unrecognized arguments: --config` | the config path is positional | see `CLAUDE.md` §5 |
 | `ModuleNotFoundError: ... 'batteryml' is not a package` | `bin/batteryml.py` was run directly | go through `batteryml_web/core/run_batteryml_cli.py` |
 
-The CLI wrapper exits **2** for an extension-registration problem and **1** for
-a failure inside BatteryML itself, so the exit code alone tells you which layer
-to look at.
+The CLI wrapper's exit code tells you which layer failed:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | the underlying CLI succeeded |
+| 1 | the CLI itself failed and printed its own error |
+| 2 | a wrapper precondition failed: extension registration, or an unimplemented `input_type` |
+| 3 | preprocessing ran but produced no BatteryData |
 
 ---
 

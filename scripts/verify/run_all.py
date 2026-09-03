@@ -45,6 +45,9 @@ CHECKS: tuple[tuple[str, str, str, bool], ...] = (
     ("ENV-01", "environment", "check_environment", True),
     ("CLI-01", "cli_contract", "check_cli_contract", False),
     ("DATA-01", "dataset_status", "check_dataset_status", True),
+    # DATA-02 owns the empty-processed-directory failure, over the whole tree
+    # rather than only the registered datasets DATA-01 knows about.
+    ("DATA-02", "empty_processed_dirs", "check_empty_processed_dirs", True),
     ("CFG-01", "config_validity", "check_config_validity", True),
     # After CFG-01: that establishes the configs are sound, this establishes the
     # execution gate agrees with them.
