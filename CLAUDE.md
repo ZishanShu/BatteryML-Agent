@@ -223,17 +223,45 @@ Changes reach the server through GitHub, so:
 - Default demo configuration: dataset **MATR**, task **RUL**, model **XGBoost**,
   device **cpu**, seed **0**.
 - Target manuscript: Nature Protocols (2–4 h from setup to first prediction).
-- Server `data/raw/` contains: `CALCE, HNEI, HUST, MATR, RWTH, SNL, UL_PUR`.
-  Processed data status (observed on server filesystem `[STATIC]`): `MATR` has
-  `data/processed/MATR/` populated (180 items); `HUST` populated (77 items);
-  `CALCE/HNEI/SNL/UL_PUR/RWTH` dirs exist but are empty — preprocessing still needed.
-- Verified-working path on the server so far: `[ASSUMED]` MATR preprocess output
-  present; MATR + XGBoost train/eval NOT yet confirmed by the user this session.
-- Current top-3 priorities:
-  1. Complete the Nature Protocols protocol so **Route A (LLM-guided), Route B
-     (quick-start, offline, no API key), and Route C (extension)** all work end-to-end.
-  2. Confirm and lock the MATR + XGBoost demo (preprocess → train → eval) as the
-     reproducible Route B baseline.
-  3. `docs/SPEC.md` does not exist yet in this repo (no `docs/` dir) — it is cited
-     throughout CLAUDE.md as the single source of truth for spec IDs. Decide whether
-     to restore it or rework the spec-ID workflow before deep platform work.
+
+### Server environment (measured 2026-09-01)
+
+> The dataset inventory previously recorded here was written from a **different
+> machine** and did not describe this server. Every line below is now tagged with
+> how it was established. Re-measure with `python -m scripts.verify.run_all` and
+> read `runs/verify/dataset_status.csv` rather than trusting this list.
+
+- Interpreter: Python 3.10.20, conda env `batteryml`. All 16 declared packages
+  installed; `batteryml` importable. 8 × NVIDIA RTX 3090 visible.
+  `[VERIFIED]` — ENV-01, user-pasted output.
+- Dataset state, `data/processed/`:
+  | Dataset | Processed | Raw | How established |
+  | --- | --- | --- | --- |
+  | `MATR` | populated, ready | present | `[VERIFIED]` SPLIT-01 + four real train/eval runs |
+  | `HUST` | populated, ready | present | `[VERIFIED]` SPLIT-01 (`hust` preset ready) |
+  | `SNL` | **directory exists, empty** | present | `[VERIFIED]` DATA-01; preprocessing ran and produced nothing (sweep) |
+  | `HNEI` | **directory exists, empty** | **absent** | `[VERIFIED]` DATA-01 + sweep `skipped_no_raw` |
+  | `UL_PUR` | **directory exists, empty** | **absent** | `[VERIFIED]` DATA-01 + sweep `skipped_no_raw` |
+  | `OX` | **directory exists, empty** | not measured | `[VERIFIED]` DATA-01; raw state `[ASSUMED]` |
+  | `CALCE` | absent | not measured | `[VERIFIED]` SPLIT-01 lists it missing and DATA-01 does not list it empty |
+  | `RWTH` | absent | not measured | as `CALCE` |
+- Split presets ready: `clo`, `hust`, `matr_1`, `matr_2`. Not ready: `cruh`,
+  `crush`, `mix`, `snl`. `[VERIFIED]` — SPLIT-01.
+- Verified-working path: MATR + `matr_1` train/eval on cpu, seed 0, confirmed for
+  XGBoost's four siblings (Ridge, KernelRidge, ExtraTrees, Huber). Identical
+  config + seed reproduces `metrics.csv` bit-for-bit after clearing `cache/`.
+  `[VERIFIED]` — user-pasted output.
+- **`cache/` is not invalidated by re-preprocessing.** `build_dataset` hashes only
+  config fields (`batteryml/pipeline.py:186`), never the data. Clear `cache/`
+  before trusting any number after a preprocessing run. `[STATIC]`,
+  see `docs/DEBUGGING.md` §7.
+
+### Current top-3 priorities
+
+1. Complete the Nature Protocols protocol so **Route A (LLM-guided), Route B
+   (quick-start, offline, no API key), and Route C (extension)** all work end-to-end.
+2. Confirm and lock the MATR + XGBoost demo (preprocess → train → eval) as the
+   reproducible Route B baseline.
+3. `docs/SPEC.md` does not exist yet in this repo — it is cited throughout
+   CLAUDE.md as the single source of truth for spec IDs. Decide whether to restore
+   it or rework the spec-ID workflow before deep platform work.
