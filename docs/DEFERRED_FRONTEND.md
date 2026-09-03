@@ -220,3 +220,83 @@ before a run is to catch a missing or empty `data/processed/<DATASET>` with an
 actionable message instead of an `AssertionError` from
 `BaseTrainTestSplitter`. The `"<missing-config>"` placeholder at `:1176` should
 be replaced by refusing to launch at all when no config is selected.
+
+---
+
+## DF-05 — the custom-upload UI offers three cycler formats that cannot be preprocessed
+
+| Field | Value |
+| --- | --- |
+| File | `batteryml_web/core/custom_uploads.py:12`, surfaced by `batteryml_web/app.py:756` (frozen) |
+| Found while | Acting on REG-01's finding that six advertised `input_type`s have no preprocessor. |
+| Basis | `[VERIFIED]` — REG-01 on the server reports six unresolved `input_type`s; the intersection with the UI's list was read from source. |
+
+### Symptom
+
+`batteryml/preprocess/__init__.py` advertises eight cycler formats:
+
+```python
+'CYCLERS': ['ARBIN', 'BATTERYARCHIVE', "BIOLOGIC", 'INDIGO', "LANDT", "MACCOR", 'NEWARE', 'NOVONIX']
+```
+
+Only two are implemented — `ARBINPreprocessor` and `NEWAREPreprocessor`. The
+other six have no registered class.
+
+The custom-upload UI offers five of them:
+
+```python
+# batteryml_web/core/custom_uploads.py:12
+ALLOWED_CUSTOM_SOURCE_FORMATS = ["ARBIN", "BIOLOGIC", "LANDT", "MACCOR", "NEWARE"]
+```
+
+rendered as a `st.selectbox` at `app.py:756`. **Three of the five —
+`BIOLOGIC`, `LANDT`, `MACCOR` — cannot work.** A user who uploads data, selects
+one of them and clicks through reaches
+`run_batteryml_preprocess_for_split` (`custom_uploads.py:88`), which shells out
+to the CLI wrapper. The promise the UI makes cannot be kept.
+
+The remaining three unimplemented formats — `BATTERYARCHIVE`, `INDIGO`,
+`NOVONIX` — are reachable only from the command line, not from the UI.
+
+### What has been fixed, and what has not
+
+`batteryml_web/core/run_batteryml_cli.py` now refuses a declared-but-
+unimplemented `input_type` **before** the CLI runs, exiting 2 with a message
+that names the format, states that it is declared upstream but not implemented,
+lists the formats that are implemented, and creates no output directory.
+Previously this died inside `PREPROCESSORS.build` with a bare
+`KeyError: BIOLOGICPreprocessor is not registered to Preprocessors!`. Since
+`custom_uploads.py:105` reports `success = proc.returncode == 0`, the UI now
+surfaces a real failure with a usable explanation instead of a traceback.
+
+Upstream `batteryml/` was deliberately **not** changed: removing the six names
+from `SUPPORTED_SOURCES` would widen the divergence from
+microsoft/BatteryML for no gain.
+
+What remains is that the UI still *offers* the three impossible options, so the
+user only learns after uploading.
+
+### Change needed later
+
+Narrow the selectbox to formats that actually resolve, rather than hard-coding a
+list that can drift:
+
+```python
+# batteryml_web/core/custom_uploads.py — not frozen, can be changed now
+def available_custom_source_formats() -> list[str]:
+    """Cycler formats the UI may offer: advertised AND implemented."""
+    from batteryml import preprocess as preprocess_package
+    from batteryml.builders import PREPROCESSORS
+    advertised = preprocess_package.SUPPORTED_SOURCES.get("CYCLERS", [])
+    return [n for n in advertised if f"{n}Preprocessor" in PREPROCESSORS.class_mapping]
+```
+
+`app.py:756` then reads that instead of `ALLOWED_CUSTOM_SOURCE_FORMATS`, which
+is the one line in the frozen file that has to change. Deriving the list means a
+format implemented upstream later appears automatically, and one that disappears
+stops being offered — neither needs an edit here.
+
+If the manuscript commits to supporting `BIOLOGIC`, `LANDT` or `MACCOR`, the
+alternative is to implement those preprocessors in `batteryml_web/` through the
+`PREPROCESSORS` registry, the same extension route the models use. That is a
+larger piece of work and a scope decision, not a fix.
