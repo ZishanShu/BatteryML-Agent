@@ -9,6 +9,8 @@ import yaml
 
 
 MODEL_DISPLAY_NAMES = {
+    "cptransformer": "CPTransformer — CyclePatch Transformer",
+
     "xgb": "XGBoost — Extreme Gradient Boosting",
     "xgboost": "XGBoost — Extreme Gradient Boosting",
     "rf": "Random Forest",
@@ -37,6 +39,8 @@ MODEL_DISPLAY_NAMES = {
 }
 
 MODEL_KEY_ALIASES = {
+    "cptransformer": "cptransformer",
+
     "xgboost": "xgb",
     "rf": "rf",
     "random forest": "rf",
@@ -69,6 +73,8 @@ MODEL_KEY_ALIASES = {
 # declare LinearRegressionRULPredictor, so the class name alone cannot tell
 # them apart; the directory name is authoritative and is consulted first.
 MODEL_CLASS_KEYS = {
+    "cptransformerrulpredictor": "cptransformer",
+
     "xgboostrulpredictor": "xgb",
     "randomforestrulpredictor": "rf",
     "mlprulpredictor": "mlp",
