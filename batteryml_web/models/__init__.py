@@ -63,6 +63,7 @@ EXTENSION_MODULES: tuple[str, ...] = (
     "knn",
     "lasso",
     "cptransformer",
+    "batlinet",
 )
 
 _PACKAGE_DIR = Path(__file__).resolve().parent

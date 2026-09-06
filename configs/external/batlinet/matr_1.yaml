@@ -1,0 +1,47 @@
+model:
+    name: 'BatLiNetRULPredictor'
+
+    epochs: 100
+    batch_size: 1
+    lr: 0.00005
+
+    evaluate_freq: 10
+    checkpoint_freq: 10
+
+    in_channels: 6
+    channels: 32
+
+    input_height: 20
+    input_width: 1000
+
+    alpha: 0.5
+
+    train_support_size: 1
+    test_support_size: 1
+
+train_test_split:
+    name: 'MATRPrimaryTestTrainTestSplitter'
+    cell_data_path: 'data/processed/MATR'
+
+feature:
+    name: 'BatLiNetFeatureExtractor'
+
+    interp_dim: 1000
+
+    diff_base: 5
+
+    min_cycle_index: 1
+    max_cycle_index: 20
+
+    max_capacity: 1.2
+    current_threshold_a: 0.1
+
+label:
+    name: 'RULLabelAnnotator'
+
+feature_transformation:
+    name: 'SequentialDataTransformation'
+    transformations: []
+
+label_transformation:
+    name: 'ZScoreDataTransformation'
