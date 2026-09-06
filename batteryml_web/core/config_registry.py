@@ -9,6 +9,8 @@ import yaml
 
 
 MODEL_DISPLAY_NAMES = {
+    "batlinet": "BatLiNet — Inter-cell Lifetime Prediction",
+
     "cptransformer": "CPTransformer — CyclePatch Transformer",
 
     "xgb": "XGBoost — Extreme Gradient Boosting",
@@ -39,6 +41,8 @@ MODEL_DISPLAY_NAMES = {
 }
 
 MODEL_KEY_ALIASES = {
+    "batlinet": "batlinet",
+
     "cptransformer": "cptransformer",
 
     "xgboost": "xgb",
@@ -73,6 +77,8 @@ MODEL_KEY_ALIASES = {
 # declare LinearRegressionRULPredictor, so the class name alone cannot tell
 # them apart; the directory name is authoritative and is consulted first.
 MODEL_CLASS_KEYS = {
+    "batlinetrulpredictor": "batlinet",
+
     "cptransformerrulpredictor": "cptransformer",
 
     "xgboostrulpredictor": "xgb",
