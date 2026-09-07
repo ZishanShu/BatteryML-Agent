@@ -1,455 +1,500 @@
-"""BatteryML Configuration Catalog Builder.
+"""Structured catalog and execution-readiness gate for BatteryML methods.
 
-Dynamically scans configs/ directory and builds a catalog of available
-models, datasets, tasks with their metadata and readiness status.
+The catalog is derived exclusively from run configs under ``configs/**/*.yaml``.
+It does not render UI and has no Streamlit dependency.
 """
 
 from __future__ import annotations
 
-import yaml
-from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Any
+import inspect
+from dataclasses import asdict, dataclass, field
 from enum import Enum
+from pathlib import Path
+from typing import Any, Iterable, Mapping
+
+import yaml
 
 
-class TaskType(Enum):
-    RUL = "RUL"
-    SOH = "SOH"
-    SOC = "SOC"
-    UNKNOWN = "unknown"
+class MethodCategory(str, Enum):
+    CLASSICAL_ML = "classical_ml"
+    NEURAL = "neural"
+    PROBABILISTIC = "probabilistic"
+    GENERATIVE = "generative"
+    TRAJECTORY = "trajectory"
 
 
-class Status(Enum):
-    READY = "ready"                    # Config + processed data exists
-    CONFIG_ONLY = "config_only"        # Config exists but no data at all
-    NEED_PREPROCESS = "need_preprocess"  # Raw exists but processed missing
-    MISSING = "missing"                # Config exists but raw missing
-    EXPERIMENTAL = "experimental"      # Implementation incomplete
+class CatalogStatus(str, Enum):
+    RUNNABLE = "runnable"
+    IMPORT_FAILED = "import_failed"
+    MISSING_SCHEMA_FIELDS = "missing_schema_fields"
+    CONFIG_INVALID = "config_invalid"
+    NEEDS_PREPROCESSING = "needs_preprocessing"
+    MISSING_CHECKPOINT = "missing_checkpoint"
+    MISSING_ASSET = "missing_asset"
 
 
-@dataclass
-class ModelConfig:
-    """Represents a single model configuration."""
+@dataclass(frozen=True)
+class GateFailure:
+    status: CatalogStatus
+    condition: str
+    detail: str
+    path: str | None = None
+
+
+@dataclass(frozen=True)
+class CatalogEntry:
     config_path: Path
-    model_name: str
-    model_class: str
+    model_name: str | None
+    feature_name: str | None
+    label_name: str | None
+    split_name: str | None
+    cell_data_paths: tuple[Path, ...]
+    datasets: tuple[str, ...]
     dataset: str
-    task: TaskType
-    feature_extractor: str
-    train_test_split: str
-    device_support: List[str] = field(default_factory=lambda: ["cpu"])
-    is_experimental: bool = False
-    is_debug: bool = False
-    status: Status = Status.MISSING
-    raw_exists: bool = False
-    processed_exists: bool = False
-    notes: str = ""
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "config_path": str(self.config_path),
-            "model_name": self.model_name,
-            "model_class": self.model_class,
-            "dataset": self.dataset,
-            "task": self.task.value,
-            "feature_extractor": self.feature_extractor,
-            "train_test_split": self.train_test_split,
-            "device_support": self.device_support,
-            "is_experimental": self.is_experimental,
-            "is_debug": self.is_debug,
-            "status": self.status.value,
-            "raw_exists": self.raw_exists,
-            "processed_exists": self.processed_exists,
-            "notes": self.notes,
-        }
-
-
-@dataclass
-class DatasetInfo:
-    """Information about a dataset."""
-    name: str
-    raw_path: Path
-    processed_path: Path
-    raw_exists: bool = False
-    processed_exists: bool = False
-    configs: List[ModelConfig] = field(default_factory=list)
-    custom: bool = False  # True if user-uploaded custom dataset
+    task: str
+    device: str
+    devices: tuple[str, ...]
+    category: MethodCategory
+    debug_only: bool
+    required_checkpoints: tuple[Path, ...]
+    required_assets: tuple[Path, ...]
+    failures: tuple[GateFailure, ...] = field(default_factory=tuple)
 
     @property
-    def status(self) -> Status:
-        if self.configs:
-            # Aggregate status from configs
-            statuses = [c.status for c in self.configs]
-            if Status.READY in statuses:
-                return Status.READY
-            elif Status.NEED_PREPROCESS in statuses:
-                return Status.NEED_PREPROCESS
-            elif Status.CONFIG_ONLY in statuses:
-                return Status.CONFIG_ONLY
-        return Status.MISSING
+    def status(self) -> CatalogStatus:
+        return self.failures[0].status if self.failures else CatalogStatus.RUNNABLE
 
+    @property
+    def runnable(self) -> bool:
+        return not self.failures
 
-class ConfigCatalog:
-    """Catalog of all available BatteryML configurations."""
-
-    # Known dataset names from BatteryML
-    KNOWN_DATASETS = [
-        "MATR", "HUST", "CALCE", "RWTH", "SNL", "HNEI", "UL_PUR", "CLO",
-        "CRUH", "CRUSH", "MIX", "OX", "ARBIN", "NEWARE"
-    ]
-
-    # Model class to task mapping
-    MODEL_TASK_PATTERNS = {
-        # RUL models
-        "RUL": ["RUL", "rul"],
-        # SOH models
-        "SOH": ["SOH", "soh", "StateOfHealth"],
-        # SOC models
-        "SOC": ["SOC", "soc", "StateOfCharge"],
-    }
-
-    # NN model patterns that support CUDA
-    NN_MODEL_PATTERNS = ["LSTM", "GRU", "CNN", "MLP", "Transformer", "RNN"]
-    # Sklearn/XGB patterns that are CPU-first
-    SKLEARN_PATTERNS = ["XGB", "RandomForest", "Ridge", "Linear", "PLSR", "PCR",
-                        "Dummy", "GPR", "GaussianProcess", "SVM", "ElasticNet"]
-
-    # Debug/Smoke test models
-    DEBUG_MODELS = ["DummyRULPredictor", "DummySOHPredictor"]
-
-    # Experimental models
-    EXPERIMENTAL_MODELS = ["BatLiNet"]
-
-    def __init__(self, root_dir: Path = None):
-        self.root_dir = root_dir or Path(".")
-        self.configs_dir = self.root_dir / "configs"
-        self.data_dir = self.root_dir / "data"
-        self.raw_dir = self.data_dir / "raw"
-        self.processed_dir = self.data_dir / "processed"
-
-        self.datasets: Dict[str, DatasetInfo] = {}
-        self.configs: List[ModelConfig] = []
-        self._catalog_built = False
-
-    def build_catalog(self, include_debug: bool = False) -> "ConfigCatalog":
-        """Scan all configs and build the catalog."""
-        if not self.configs_dir.exists():
-            print(f"Configs directory not found: {self.configs_dir}")
-            return self
-
-        # First pass: scan all yaml files
-        for config_file in self.configs_dir.rglob("*.yaml"):
-            try:
-                config = self._parse_config(config_file)
-                if config is None:
-                    continue
-
-                # Skip debug models unless explicitly included
-                if config.is_debug and not include_debug:
-                    continue
-
-                self.configs.append(config)
-
-                # Add to dataset
-                if config.dataset not in self.datasets:
-                    self.datasets[config.dataset] = self._create_dataset_info(config.dataset)
-                self.datasets[config.dataset].configs.append(config)
-
-            except Exception as e:
-                print(f"Error parsing {config_file}: {e}")
-
-        # Second pass: check data existence for all datasets
-        self._check_all_data_status()
-
-        self._catalog_built = True
-        return self
-
-    def _parse_config(self, config_path: Path) -> Optional[ModelConfig]:
-        """Parse a single config file and extract metadata."""
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                content = yaml.safe_load(f)
-        except Exception:
-            return None
-
-        if not content or not isinstance(content, dict):
-            return None
-
-        # Extract model info
-        model_info = content.get("model", {})
-        model_class = model_info.get("name", "Unknown")
-
-        # Extract dataset from cell_data_path or path
-        dataset = self._infer_dataset(config_path, content)
-        if not dataset:
-            return None  # Skip configs we can't identify
-
-        # Extract task from label or model name
-        task = self._infer_task(content, model_class)
-
-        # Extract feature extractor
-        feature_info = content.get("feature", {})
-        feature_extractor = feature_info.get("name", "Unknown")
-
-        # Extract train test split
-        split_info = content.get("train_test_split", {})
-        train_test_split = split_info.get("name", "Unknown")
-
-        # Determine device support
-        device_support = self._infer_device_support(model_class)
-
-        # Check if debug model
-        is_debug = any(dm in model_class for dm in self.DEBUG_MODELS)
-
-        # Check if experimental
-        is_experimental = any(em in model_class for em in self.EXPERIMENTAL_MODELS)
-
-        # Generate model display name
-        model_name = self._generate_model_name(model_class, dataset, config_path)
-
-        return ModelConfig(
-            config_path=config_path,
-            model_name=model_name,
-            model_class=model_class,
-            dataset=dataset,
-            task=task,
-            feature_extractor=feature_extractor,
-            train_test_split=train_test_split,
-            device_support=device_support,
-            is_experimental=is_experimental,
-            is_debug=is_debug,
-        )
-
-    def _infer_dataset(self, config_path: Path, content: Dict) -> Optional[str]:
-        """Infer dataset from config path or content."""
-        # Try cell_data_path first
-        split_info = content.get("train_test_split", {})
-        cell_data_path = split_info.get("cell_data_path", "")
-
-        if cell_data_path:
-            # Extract from path like 'data/processed/MATR'
-            parts = Path(cell_data_path).parts
-            for part in parts:
-                upper_part = part.upper()
-                for ds in self.KNOWN_DATASETS:
-                    if ds.upper() == upper_part:
-                        return ds
-
-        # Try to infer from file path
-        path_str = str(config_path).upper()
-        for ds in self.KNOWN_DATASETS:
-            if ds.upper() in path_str:
-                return ds
-
-        # Try filename
-        filename = config_path.stem.upper()
-        for ds in self.KNOWN_DATASETS:
-            if ds.upper() in filename:
-                return ds
-
-        return None
-
-    def _infer_task(self, content: Dict, model_class: str) -> TaskType:
-        """Infer task type from label name or model class."""
-        label_info = content.get("label", {})
-        label_name = label_info.get("name", "")
-
-        # Check label name
-        if label_name:
-            if "RUL" in label_name:
-                return TaskType.RUL
-            if "SOH" in label_name or "StateOfHealth" in label_name:
-                return TaskType.SOH
-            if "SOC" in label_name or "StateOfCharge" in label_name:
-                return TaskType.SOC
-
-        # Check model class
-        model_upper = model_class.upper()
-        if "RUL" in model_upper:
-            return TaskType.RUL
-        if "SOH" in model_upper:
-            return TaskType.SOH
-        if "SOC" in model_upper:
-            return TaskType.SOC
-
-        return TaskType.UNKNOWN
-
-    def _infer_device_support(self, model_class: str) -> List[str]:
-        """Infer supported devices from model class."""
-        model_upper = model_class.upper()
-
-        # Check if NN model (supports both CPU and CUDA)
-        for pattern in self.NN_MODEL_PATTERNS:
-            if pattern.upper() in model_upper:
-                return ["cpu", "cuda"]
-
-        # Sklearn-based models - CPU first, CUDA experimental for XGB
-        for pattern in self.SKLEARN_PATTERNS:
-            if pattern.upper() in model_upper:
-                if "XGB" in model_upper:
-                    return ["cpu", "cuda"]  # XGBoost has GPU support
-                return ["cpu"]  # Others CPU only
-
-        # Default to CPU only
-        return ["cpu"]
-
-    def _generate_model_name(self, model_class: str, dataset: str, config_path: Path) -> str:
-        """Generate a display name for the model."""
-        # Get method from path (e.g., xgb, lstm, ridge)
-        method = config_path.parent.name
-        return f"{model_class} ({method})"
-
-    def _create_dataset_info(self, dataset_name: str) -> DatasetInfo:
-        """Create a DatasetInfo for a known dataset."""
-        raw_path = self.raw_dir / dataset_name
-        processed_path = self.processed_dir / dataset_name
-
-        return DatasetInfo(
-            name=dataset_name,
-            raw_path=raw_path,
-            processed_path=processed_path,
-            raw_exists=raw_path.exists() and any(raw_path.iterdir()),
-            processed_exists=processed_path.exists() and any(processed_path.iterdir()),
-        )
-
-    def _check_all_data_status(self):
-        """Update status for all configs based on data existence."""
-        for config in self.configs:
-            if config.dataset in self.datasets:
-                ds_info = self.datasets[config.dataset]
-                config.raw_exists = ds_info.raw_exists
-                config.processed_exists = ds_info.processed_exists
-
-                # Determine status
-                if config.is_experimental:
-                    config.status = Status.EXPERIMENTAL
-                elif config.processed_exists:
-                    config.status = Status.READY
-                elif config.raw_exists:
-                    config.status = Status.NEED_PREPROCESS
-                else:
-                    # Check if any config for this dataset has data
-                    any_processed = any(c.processed_exists for c in ds_info.configs)
-                    any_raw = any(c.raw_exists for c in ds_info.configs)
-
-                    if any_processed:
-                        config.status = Status.READY  # Data exists for other split
-                    elif any_raw:
-                        config.status = Status.NEED_PREPROCESS
-                    else:
-                        config.status = Status.CONFIG_ONLY
-
-    def get_datasets(self) -> List[str]:
-        """Get all dataset names."""
-        return sorted(self.datasets.keys())
-
-    def get_tasks_for_dataset(self, dataset: str) -> List[TaskType]:
-        """Get available tasks for a dataset."""
-        if dataset not in self.datasets:
-            return []
-
-        tasks = set()
-        for config in self.datasets[dataset].configs:
-            if not config.is_debug:  # Exclude debug models from task list
-                tasks.add(config.task)
-        return sorted(tasks, key=lambda t: t.value)
-
-    def get_models_for_dataset_task(self, dataset: str, task: TaskType,
-                                     include_debug: bool = False) -> List[ModelConfig]:
-        """Get models available for a dataset+task combination."""
-        if dataset not in self.datasets:
-            return []
-
-        models = []
-        for config in self.datasets[dataset].configs:
-            if config.task == task:
-                if config.is_debug and not include_debug:
-                    continue
-                models.append(config)
-
-        return sorted(models, key=lambda m: (m.is_experimental, m.model_name))
-
-    def get_configs_for_model(self, dataset: str, task: TaskType,
-                              model_class: str) -> List[ModelConfig]:
-        """Get all config variants for a specific model class."""
-        if dataset not in self.datasets:
-            return []
-
-        return [
-            c for c in self.datasets[dataset].configs
-            if c.task == task and c.model_class == model_class
+    def to_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["config_path"] = self.config_path.as_posix()
+        value["cell_data_paths"] = [path.as_posix() for path in self.cell_data_paths]
+        value["required_checkpoints"] = [path.as_posix() for path in self.required_checkpoints]
+        value["required_assets"] = [path.as_posix() for path in self.required_assets]
+        value["category"] = self.category.value
+        value["status"] = self.status.value
+        value["runnable"] = self.runnable
+        value["failures"] = [
+            {**asdict(item), "status": item.status.value} for item in self.failures
         ]
+        return value
 
-    def get_debug_models(self) -> List[ModelConfig]:
-        """Get all debug/smoke test models."""
-        return [c for c in self.configs if c.is_debug]
 
-    def get_experimental_models(self) -> List[ModelConfig]:
-        """Get all experimental models."""
-        return [c for c in self.configs if c.is_experimental]
+@dataclass(frozen=True)
+class CatalogIssue:
+    config_path: Path
+    status: CatalogStatus
+    detail: str
 
-    def check_compatibility(self, dataset: str, task: TaskType,
-                           model_class: str) -> tuple[bool, str]:
-        """Check if a model is compatible with a task for a dataset."""
-        if dataset not in self.datasets:
-            return False, f"Dataset {dataset} not found in catalog"
-
-        models = self.get_models_for_dataset_task(dataset, task)
-        model_classes = [m.model_class for m in models]
-
-        if model_class not in model_classes:
-            # Check if model exists but for different task
-            all_dataset_models = [
-                c for c in self.datasets[dataset].configs
-                if c.model_class == model_class
-            ]
-            if all_dataset_models:
-                available_tasks = list(set(c.task.value for c in all_dataset_models))
-                return False, f"Model {model_class} is designed for tasks: {available_tasks}, not {task.value}"
-            return False, f"Model {model_class} not available for dataset {dataset}"
-
-        return True, ""
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Export catalog to dictionary."""
+    def to_dict(self) -> dict[str, str]:
         return {
-            "datasets": {
-                name: {
-                    "name": info.name,
-                    "raw_path": str(info.raw_path),
-                    "processed_path": str(info.processed_path),
-                    "raw_exists": info.raw_exists,
-                    "processed_exists": info.processed_exists,
-                    "status": info.status.value,
-                    "config_count": len(info.configs),
-                }
-                for name, info in self.datasets.items()
-            },
-            "configs": [c.to_dict() for c in self.configs],
-            "stats": {
-                "total_datasets": len(self.datasets),
-                "total_configs": len(self.configs),
-                "ready_configs": len([c for c in self.configs if c.status == Status.READY]),
-                "experimental_configs": len([c for c in self.configs if c.is_experimental]),
-                "debug_configs": len([c for c in self.configs if c.is_debug]),
-            }
+            "config_path": self.config_path.as_posix(),
+            "status": self.status.value,
+            "detail": self.detail,
         }
 
 
-# Global catalog instance
-catalog_instance: Optional[ConfigCatalog] = None
+@dataclass(frozen=True)
+class MethodCatalog:
+    entries: tuple[CatalogEntry, ...]
+    issues: tuple[CatalogIssue, ...] = field(default_factory=tuple)
+    registry_error: str | None = None
+
+    def methods(
+        self,
+        *,
+        include_debug: bool = False,
+        runnable_only: bool = False,
+    ) -> tuple[CatalogEntry, ...]:
+        """Return config-derived method entries, excluding debug entries by default."""
+        return tuple(
+            entry
+            for entry in self.entries
+            if (include_debug or not entry.debug_only)
+            and (not runnable_only or entry.runnable)
+        )
+
+    def to_dict(self, *, include_debug: bool = False) -> dict[str, Any]:
+        visible = self.methods(include_debug=include_debug)
+        return {
+            "entries": [entry.to_dict() for entry in visible],
+            "issues": [issue.to_dict() for issue in self.issues],
+            "registry_error": self.registry_error,
+            "counts": {
+                "scanned_run_configs": len(self.entries),
+                "visible_methods": len(visible),
+                "runnable_methods": sum(entry.runnable for entry in visible),
+                "debug_methods": sum(entry.debug_only for entry in self.entries),
+                "scan_issues": len(self.issues),
+            },
+        }
 
 
-def get_catalog(root_dir: Path = None, force_rebuild: bool = False,
-                include_debug: bool = False) -> ConfigCatalog:
-    """Get or create the global catalog instance."""
-    global catalog_instance
-    if catalog_instance is None or force_rebuild:
-        catalog_instance = ConfigCatalog(root_dir).build_catalog(include_debug=include_debug)
-    return catalog_instance
+_REQUIRED_SECTIONS = ("model", "train_test_split", "feature", "label")
+_NON_RUN_ROOTS = {"cyclers"}
+_CATEGORY_VALUES = {item.value: item for item in MethodCategory}
+_PATH_EXCLUSIONS = {"cell_data_path", "workspace", "output_dir", "config_path"}
 
 
-def refresh_catalog(root_dir: Path = None, include_debug: bool = False) -> ConfigCatalog:
-    """Force refresh the catalog."""
-    return get_catalog(root_dir, force_rebuild=True, include_debug=include_debug)
+def _mapping_name(config: Mapping[str, Any], section: str) -> str | None:
+    value = config.get(section)
+    if not isinstance(value, Mapping):
+        return None
+    name = value.get("name")
+    return str(name).strip() if isinstance(name, str) and name.strip() else None
+
+
+def _cell_data_paths(config: Mapping[str, Any]) -> tuple[Path, ...]:
+    split = config.get("train_test_split")
+    value = split.get("cell_data_path") if isinstance(split, Mapping) else None
+    if isinstance(value, str) and value.strip():
+        return (Path(value),)
+    if isinstance(value, list):
+        return tuple(Path(str(item)) for item in value if str(item).strip())
+    return ()
+
+
+def _task(label_name: str | None) -> str:
+    upper = (label_name or "").upper()
+    if "SOH" in upper:
+        return "SOH"
+    if "RUL" in upper:
+        return "RUL"
+    if "SOC" in upper:
+        return "SOC"
+    return "unknown"
+
+
+def _required_files(config: Mapping[str, Any]) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    checkpoints: list[Path] = []
+    assets: list[Path] = []
+
+    def visit(value: Any, key: str = "") -> None:
+        if isinstance(value, Mapping):
+            for child_key, child in value.items():
+                visit(child, str(child_key).lower())
+            return
+        if isinstance(value, list):
+            for child in value:
+                visit(child, key)
+            return
+        if not isinstance(value, str) or not value.strip() or key in _PATH_EXCLUSIONS:
+            return
+        if "checkpoint" in key or key in {"ckpt", "ckpt_to_resume"}:
+            checkpoints.append(Path(value))
+        elif key in {"external_asset", "external_assets"} or key.endswith("_filepath"):
+            assets.append(Path(value))
+
+    visit(config)
+    return tuple(dict.fromkeys(checkpoints)), tuple(dict.fromkeys(assets))
+
+
+def _load_registries() -> tuple[dict[str, dict[str, type]], str | None]:
+    try:
+        import batteryml  # noqa: F401
+        import batteryml.feature  # noqa: F401
+        import batteryml.label  # noqa: F401
+        import batteryml.train_test_split  # noqa: F401
+        import batteryml.preprocess  # noqa: F401
+        from batteryml import builders
+        from batteryml_web.models import register_extension_models
+
+        register_extension_models()
+        registries: dict[str, dict[str, type]] = {}
+        for name in ("MODELS", "FEATURE_EXTRACTORS", "LABEL_ANNOTATORS", "TRAIN_TEST_SPLITTERS", "DATA_TRANSFORMATIONS"):
+            registry = getattr(builders, name)
+            registries[name] = dict(registry.class_mapping)
+        return registries, None
+    except Exception as exc:  # noqa: BLE001 - retained as a gate failure
+        return {}, f"{type(exc).__name__}: {exc}"
+
+
+def _category(config: Mapping[str, Any], model_class: type | None) -> MethodCategory:
+    model = config.get("model")
+    declared = model.get("category") if isinstance(model, Mapping) else None
+    if declared is None and model_class is not None:
+        declared = getattr(model_class, "category", None)
+    if declared is not None:
+        normalized = str(getattr(declared, "value", declared)).strip().lower()
+        if normalized in _CATEGORY_VALUES:
+            return _CATEGORY_VALUES[normalized]
+
+    if model_class is not None:
+        try:
+            from batteryml.models.nn_model import NNModel
+            if issubclass(model_class, NNModel):
+                return MethodCategory.NEURAL
+        except Exception:  # noqa: BLE001 - registry import status is reported separately
+            pass
+        qualified = f"{model_class.__module__}.{model_class.__name__}".lower()
+        if "gaussian_process" in qualified or "probabilistic" in qualified:
+            return MethodCategory.PROBABILISTIC
+        if "generative" in qualified:
+            return MethodCategory.GENERATIVE
+        if "trajectory" in qualified:
+            return MethodCategory.TRAJECTORY
+    return MethodCategory.CLASSICAL_ML
+
+
+def _devices(model_class: type | None) -> tuple[str, ...]:
+    if model_class is None:
+        return ("cpu",)
+    try:
+        from batteryml.models.nn_model import NNModel
+        if issubclass(model_class, NNModel):
+            return ("cpu", "cuda")
+    except Exception:  # noqa: BLE001 - registry import status is reported separately
+        pass
+    return ("cpu",)
+
+
+def _debug_only(config: Mapping[str, Any], model_name: str | None, model_class: type | None) -> bool:
+    model = config.get("model")
+    declared = model.get("debug_only") if isinstance(model, Mapping) else None
+    if declared is None and model_class is not None:
+        declared = getattr(model_class, "debug_only", None)
+    if declared is not None:
+        return bool(declared)
+    return bool(model_name and model_name.lower().startswith("dummy"))
+
+
+def _validate_signatures(model_class: type) -> list[str]:
+    failures: list[str] = []
+    required = {
+        "fit": ("self", "dataset", "timestamp"),
+        "predict": ("self", "dataset", "data_type"),
+        "dump_checkpoint": ("self", "path"),
+        "load_checkpoint": ("self", "path"),
+        "to": ("self", "device"),
+    }
+    for method_name, prefix in required.items():
+        method = getattr(model_class, method_name, None)
+        if not callable(method):
+            failures.append(f"model {model_class.__name__} has no callable {method_name}")
+            continue
+        try:
+            actual = tuple(inspect.signature(method).parameters)
+        except (TypeError, ValueError) as exc:
+            failures.append(f"cannot inspect {model_class.__name__}.{method_name}: {exc}")
+            continue
+        if actual[: len(prefix)] != prefix:
+            failures.append(
+                f"{model_class.__name__}.{method_name}{actual} must start with {prefix}"
+            )
+    return failures
+
+
+def _structural_failures(config: Mapping[str, Any]) -> list[GateFailure]:
+    failures: list[GateFailure] = []
+    for section in _REQUIRED_SECTIONS:
+        value = config.get(section)
+        if not isinstance(value, Mapping):
+            failures.append(GateFailure(
+                CatalogStatus.MISSING_SCHEMA_FIELDS,
+                "config_schema",
+                f"missing mapping section `{section}`",
+            ))
+        elif not _mapping_name(config, section):
+            failures.append(GateFailure(
+                CatalogStatus.MISSING_SCHEMA_FIELDS,
+                "config_schema",
+                f"section `{section}` has no non-empty `name`",
+            ))
+    if not _cell_data_paths(config):
+        failures.append(GateFailure(
+            CatalogStatus.MISSING_SCHEMA_FIELDS,
+            "config_schema",
+            "`train_test_split.cell_data_path` must be a path or non-empty path list",
+        ))
+    return failures
+
+
+def _entry_from_config(
+    path: Path,
+    config: Mapping[str, Any],
+    registries: Mapping[str, Mapping[str, type]],
+    registry_error: str | None,
+) -> CatalogEntry:
+    model_name = _mapping_name(config, "model")
+    feature_name = _mapping_name(config, "feature")
+    label_name = _mapping_name(config, "label")
+    split_name = _mapping_name(config, "train_test_split")
+    declared_paths = _cell_data_paths(config)
+    paths = tuple(
+        item if item.is_absolute() else path.parents[3] / item
+        for item in declared_paths
+    )
+    datasets = tuple(dict.fromkeys(item.name for item in declared_paths))
+    dataset = datasets[0] if len(datasets) == 1 else "+".join(datasets) or "unknown"
+    declared_checkpoints, declared_assets = _required_files(config)
+    root = path.parents[3]
+    checkpoints = tuple(
+        item if item.is_absolute() else root / item for item in declared_checkpoints
+    )
+    assets = tuple(item if item.is_absolute() else root / item for item in declared_assets)
+    failures = _structural_failures(config)
+
+    model_class = registries.get("MODELS", {}).get(model_name or "")
+    if registry_error:
+        failures.append(GateFailure(
+            CatalogStatus.IMPORT_FAILED,
+            "registry_import",
+            f"registries could not be imported: {registry_error}",
+        ))
+    else:
+        resolutions = (
+            ("model", model_name, "MODELS"),
+            ("feature extractor", feature_name, "FEATURE_EXTRACTORS"),
+            ("label annotator", label_name, "LABEL_ANNOTATORS"),
+            ("splitter", split_name, "TRAIN_TEST_SPLITTERS"),
+        )
+        for label, name, registry_name in resolutions:
+            if name and name not in registries.get(registry_name, {}):
+                failures.append(GateFailure(
+                    CatalogStatus.IMPORT_FAILED,
+                    f"{label}_registration",
+                    f"{name!r} is not registered in {registry_name}",
+                ))
+        if model_class is not None:
+            for detail in _validate_signatures(model_class):
+                failures.append(GateFailure(
+                    CatalogStatus.CONFIG_INVALID,
+                    "model_interface",
+                    detail,
+                ))
+
+    if not failures:
+        try:
+            from batteryml_web.core.config_validator import load_and_validate_config_file
+            validation = load_and_validate_config_file(path, require_data=False)
+        except Exception as exc:  # noqa: BLE001 - retained as a gate failure
+            failures.append(GateFailure(
+                CatalogStatus.IMPORT_FAILED,
+                "config_validator",
+                f"validator import or execution failed: {type(exc).__name__}: {exc}",
+            ))
+        else:
+            if not validation.get("valid"):
+                failures.append(GateFailure(
+                    CatalogStatus.CONFIG_INVALID,
+                    "config_validation",
+                    "; ".join(str(item) for item in validation.get("errors", [])),
+                ))
+
+    for data_path in paths:
+        if not data_path.is_dir() or not any(data_path.glob("*.pkl")):
+            failures.append(GateFailure(
+                CatalogStatus.NEEDS_PREPROCESSING,
+                "processed_dataset",
+                f"processed dataset is absent or has no *.pkl files: {data_path}",
+                data_path.as_posix(),
+            ))
+    for checkpoint in checkpoints:
+        if not checkpoint.is_file():
+            failures.append(GateFailure(
+                CatalogStatus.MISSING_CHECKPOINT,
+                "required_checkpoint",
+                f"required checkpoint does not exist: {checkpoint}",
+                checkpoint.as_posix(),
+            ))
+    for asset in assets:
+        if not asset.exists():
+            failures.append(GateFailure(
+                CatalogStatus.MISSING_ASSET,
+                "required_external_asset",
+                f"required external asset does not exist: {asset}",
+                asset.as_posix(),
+            ))
+
+    model_section = config.get("model")
+    requested_device = "cpu"
+    if isinstance(model_section, Mapping) and model_section.get("device"):
+        requested_device = str(model_section["device"])
+    supported_devices = _devices(model_class)
+    if requested_device not in supported_devices:
+        failures.append(GateFailure(
+            CatalogStatus.CONFIG_INVALID,
+            "device_support",
+            f"device {requested_device!r} is not supported; expected one of {supported_devices}",
+        ))
+
+    return CatalogEntry(
+        config_path=path,
+        model_name=model_name,
+        feature_name=feature_name,
+        label_name=label_name,
+        split_name=split_name,
+        cell_data_paths=paths,
+        datasets=datasets,
+        dataset=dataset,
+        task=_task(label_name),
+        device=requested_device,
+        devices=supported_devices,
+        category=_category(config, model_class),
+        debug_only=_debug_only(config, model_name, model_class),
+        required_checkpoints=checkpoints,
+        required_assets=assets,
+        failures=tuple(failures),
+    )
+
+
+def build_catalog(root_dir: Path | str | None = None) -> MethodCatalog:
+    """Scan ``configs/**/*.yaml`` and return a structured, non-rendering catalog."""
+    root = Path(root_dir) if root_dir is not None else Path(__file__).resolve().parents[2]
+    configs_root = root / "configs"
+    registries, registry_error = _load_registries()
+    entries: list[CatalogEntry] = []
+    issues: list[CatalogIssue] = []
+
+    if not configs_root.is_dir():
+        return MethodCatalog(
+            (),
+            (CatalogIssue(configs_root, CatalogStatus.CONFIG_INVALID, "configs directory does not exist"),),
+            registry_error,
+        )
+
+    for path in sorted(configs_root.rglob("*.yaml")):
+        relative_parts = path.relative_to(configs_root).parts
+        if relative_parts and relative_parts[0] in _NON_RUN_ROOTS:
+            continue
+        try:
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError) as exc:
+            issues.append(CatalogIssue(
+                path,
+                CatalogStatus.CONFIG_INVALID,
+                f"cannot read valid YAML: {type(exc).__name__}: {exc}",
+            ))
+            continue
+        if not isinstance(loaded, Mapping):
+            issues.append(CatalogIssue(
+                path,
+                CatalogStatus.CONFIG_INVALID,
+                f"top level is {type(loaded).__name__}, expected mapping",
+            ))
+            continue
+        entries.append(_entry_from_config(path, loaded, registries, registry_error))
+
+    return MethodCatalog(tuple(entries), tuple(issues), registry_error)
+
+
+# Compatibility entry points for backend callers. No catalog is cached because
+# filesystem readiness is part of the result and can change after preprocessing.
+def get_catalog(
+    root_dir: Path | str | None = None,
+    force_rebuild: bool = False,
+    include_debug: bool = False,
+) -> MethodCatalog:
+    del force_rebuild, include_debug
+    return build_catalog(root_dir)
+
+
+def refresh_catalog(
+    root_dir: Path | str | None = None,
+    include_debug: bool = False,
+) -> MethodCatalog:
+    del include_debug
+    return build_catalog(root_dir)

@@ -51,6 +51,7 @@ CHECKS: tuple[tuple[str, str, str, bool], ...] = (
     ("VAL-01", "validator_contract", "check_validator_contract", True),
     ("SPLIT-01", "split_requirements", "check_split_requirements", True),
     ("REG-01", "registry_integrity", "check_registry_integrity", True),
+    ("EXT-01", "extension_contract", "extension_contract", True),
 )
 
 DEFAULT_OUTPUT_DIR = Path("runs") / "verify"

@@ -1,36 +1,62 @@
-data
-**/__pycache__/
-.vscode/
+
 !src/data/
-workspaces/
-experiments/
-**/cache/
-
-
+# ===== External repositories =====
+# ===== Local data =====
+# ===== Model weights / archives =====
+# ===== OS =====
+# ===== Python =====
+# ===== Runtime outputs =====
+# ===== Secrets =====
 # Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-
 # Distribution / packaging
+*$py.class
+**/__pycache__/
+**/cache/
+*.bin
+*.ckpt
+*.egg
+*.egg-info/
+*.key
+*.pt
+*.pth
+*.py[cod]
+*.pyc
+*.safetensors
+*.tar
+*.tar.gz
+*.zip
+.DS_Store
 .Python
+.eggs/
+.env
+.env.*
+.installed.cfg
+.pytest_cache/
+.vscode/
+MANIFEST
+__pycache__/
 build/
+cache/
+checkpoints/
+data
+data/processed/
+data/raw/
 develop-eggs/
 dist/
 downloads/
 eggs/
-.eggs/
+experiments/
 lib/
 lib64/
+logs/
 parts/
+runs/
 sdist/
+share/python-wheels/
+third_party/BatteryLife/
+third_party/BatteryMFormer/
+third_party/DiffBatt/
+third_party/PBT/
 var/
 wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-runs/
-.DS_Store
-logs/
+workspaces/
