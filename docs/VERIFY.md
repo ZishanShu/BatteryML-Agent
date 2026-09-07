@@ -64,6 +64,7 @@ preprocessing).
 | `VAL-01` | `validator_contract` | Runs the real `config_validator.validate_config` over every run config and reports which the execution gate would refuse. Structure only (`require_data=False`), so it needs no data and writes nothing. | `validator_contract.json` |
 | `SPLIT-01` | `split_requirements` | For each of the eight presets, which processed datasets it requires and which are missing — derived from two independent sources and cross-checked. | `split_requirements.json` |
 | `REG-01` | `registry_integrity` | Every registered name resolves and is unique; the `batteryml_web/models/` extension point is self-consistent; every `input_type` the CLI advertises has a preprocessor; per-model origin, task and device support. | `registry_integrity.json` |
+| `FIG-01` | `figure_contract` | Every contracted figure has a unique id, an existing builder in `batteryml_web/viz/figures.py`, a filename that is safe and unique, and a dispatch branch in the viz CLI. Each is then rendered twice to memory and the two byte strings compared, which is what establishes the determinism `CLAUDE.md` §8 requires. Audits `figure_manifest.json` against the files on disk when one is present. | `figure_contract.json` |
 
 `run_all` additionally writes `verification_report.json` (the full structured
 result of every check) and `verification_summary.txt` (the same, readable top to
@@ -136,6 +137,13 @@ missing dependency reads as one SKIP rather than as 130 refused configs.
 Standard library, plus `pyyaml` — already in `requirements.txt`. In particular
 the harness does **not** use pandas, so `ENV-01` can report that pandas is
 missing rather than failing to import.
+
+`FIG-01` is the one exception, and it is unavoidable: a check that draws a
+figure needs the library that draws figures. It requires `numpy` and
+`matplotlib`, both already declared in `requirements.txt`, and reports **SKIP**
+with the missing package named when either is absent — so a machine without them
+gets a stated gap, not a failure. It needs no torch, so it still runs where the
+rest of BatteryML cannot be imported.
 
 PEP 440 version comparison is deliberately not implemented: `ENV-01` reports the
 declared specifier next to the installed version, and only judges an
