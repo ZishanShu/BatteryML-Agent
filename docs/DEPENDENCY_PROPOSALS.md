@@ -171,15 +171,83 @@ catboost       # PIN: fill from environment_check.json -> packages[catboost].ins
 
 ---
 
+## Plotly
+
+**Requested by the user (this session): "matplotlib + plotly interactive".** The
+concern below was raised before the choice and the choice was reaffirmed, so this
+section records how to add it safely rather than arguing against it.
+
+### What it would add
+
+An interactive layer on the Streamlit results page (`VIZ-06`): zoom into the
+parity cloud, hover a point to read which cell it is and what it predicted,
+brush a region of the residual plot. On a 42-cell MATR test split
+(`batteryml/train_test_split/MATR_split.py:43-59`: 43 test IDs, one popped,
+so 42) the parity plot is dense enough in the low-RUL corner that "which cell is
+that outlier" is a real question a static figure answers only through the three
+direct labels it can fit.
+
+### What it must not do
+
+Route B — offline, no API key, no network — is a requirement, not a fallback
+(`CLAUDE.md` §1). So plotly must be **optional**:
+
+* the manuscript figures stay matplotlib. A `.png`/`.svg`/`.pdf` is what the
+  paper quotes; an interactive chart cannot go into a paper, so plotly is a
+  second rendering of the same numbers, never the source of them;
+* `batteryml_web/viz/` must not import plotly at module level. The import belongs
+  inside the Streamlit page, guarded, with the static figure as the fallback;
+* nothing in `batteryml_web/viz/cli.py`, `contract.py`, `loaders.py`,
+  `figures.py` or `render.py` may reference it, so `FIG-01` and the CLI keep
+  working on a machine without it.
+
+That last point is what keeps this different from the LightGBM / CatBoost
+blocker above: those enter through the model extension point, where a failed
+import raises `ExtensionRegistrationError` and takes down every CLI invocation
+including `preprocess` and `--help`. A lazily imported plotting library used by
+one Streamlit page fails only on that page, and only into a stated fallback.
+
+### Install cost
+
+`[ASSUMED]` — not measured here; this environment has no pip index. Plotly is
+pure Python with a large bundled JavaScript payload; expect tens of MB. It pulls
+`narwhals` (and historically `tenacity`) rather than a compiled toolchain, so
+there is no build step. Confirm on the server with `pip show plotly`.
+
+### Recommendation
+
+**Add it, optional, after the static figures are verified.** The order matters:
+`VIZ-04` is what the paper depends on, and `VIZ-06` is what makes the platform
+pleasant. Adding the interactive layer before the static figures have been seen
+on real data would mean debugging two renderings of numbers nobody has checked
+once.
+
+```
+# requirements-optional.txt — NOT requirements.txt, so Route B does not need it
+plotly         # PIN: fill from `pip show plotly` on the server
+```
+
+### Before the page lands, send me
+
+1. `pip show plotly | head -2` from the server, so it is pinned to what you have;
+2. whether you want a `requirements-optional.txt` or a comment-marked optional
+   block inside `requirements.txt` — the repository has no convention for an
+   optional dependency yet, and this is the second proposal that needs one.
+
+---
+
 ## Summary
 
 | Package | Fills a gap in the grid? | Suits `N ≈ 41`? | Install cost | Recommendation |
 | --- | --- | --- | --- | --- |
 | lightgbm | No — XGBoost holds that slot | No; defaults near-degenerate, needs tuning | Low | Skip |
 | catboost | Same slot, genuinely different algorithm | Yes — ordered boosting targets small `N` | High (~100 MB) | Add only as an optional dependency |
+| plotly | Not a model — an interactive layer for `VIZ-06` | n/a | `[ASSUMED]` tens of MB, pure Python | Requested; add as an **optional** dependency, imported lazily by the Streamlit page only |
 
-If you want neither, nothing needs doing: the five models added today are pure
-scikit-learn and introduce no new dependency at all.
+If you want neither of the two model libraries, nothing needs doing: the five
+models added today are pure scikit-learn and introduce no new dependency at all.
+Plotly is a separate decision from those two — it is a rendering library for the
+UI, not a model, and it is already requested.
 
 ### If you decide to proceed
 
