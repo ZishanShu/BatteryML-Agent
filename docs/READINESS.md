@@ -1,0 +1,126 @@
+# Backend readiness layer (`batteryml_web/core/readiness.py`)
+
+One module that answers, from real files and live registries only:
+
+* Is this **dataset** usable for a run right now?
+* Is this **model** runnable on this dataset right now?
+
+It is the state source for the current validators, the current backend and the
+future LLM agent. The agent must read this state instead of guessing from
+filenames, and it must never manufacture readiness that this layer does not
+report.
+
+## Dataset states
+
+| Status | Meaning | Current examples (2026-09, server filesystem) |
+| --- | --- | --- |
+| `READY` | `data/processed/<DATASET>/` holds `*.pkl` files | MATR (180), HUST (77) |
+| `RAW_ONLY` | raw data present, no usable processed output | CALCE, RWTH, SDU, Tongji, XJTU |
+| `INCOMPLETE_PROCESSED` | processed directory exists but holds no `*.pkl` | HNEI, OX, SNL, UL_PUR |
+| `MISSING` | nothing usable locally (declared datasets report this too) | MICH, MICH_EXP, Stanford_2, ISU_ILCC |
+
+`RAW_ONLY` and `MISSING` are **states, not platform failures**. The empty
+processed directories flagged under `INCOMPLETE_PROCESSED` are dangerous
+rather than merely unfinished: `BaseTrainTestSplitter` only asserts existence
+(`batteryml/train_test_split/base.py:25`), so an empty directory yields an
+empty cell list instead of failing loudly.
+
+```python
+from batteryml_web.core.readiness import assess_dataset, list_dataset_readiness
+
+assess_dataset("CALCE").to_dict()
+# {'dataset': 'CALCE', 'status': 'RAW_ONLY', 'raw_available': True,
+#  'processed_available': False, 'processed_sample_count': 0, ...,
+#  'recommended_action': 'Run preprocessing before model execution.'}
+```
+
+`list_dataset_readiness()` reports the union of the declared platform datasets
+(`PLATFORM_DATASETS`) and everything found under `data/raw` / `data/processed`,
+so nothing on disk is silently left out; `_`-prefixed internal directories are
+ignored.
+
+## Model states
+
+| Status | Meaning |
+| --- | --- |
+| `READY` | registered (or its external runner is wired) and at least one validated config's data is present |
+| `NEEDS_ASSETS` | source exists; a pretrained checkpoint / PCA / LLM asset is missing |
+| `NEEDS_DATA` | the required dataset or a config for the requested dataset is missing |
+| `DEPENDENCY_UNAVAILABLE` | the runtime (conda env, batteryml import) is not usable |
+| `UNREGISTERED` | no config resolves to the model, so the pipeline cannot build it |
+| `CONFIG_INVALID` | a config exists but fails the deterministic validator for non-data reasons |
+
+Two backends, one report shape (`ModelReadiness.to_dict()`):
+
+* **Registry models** (`assess_registry_model`) — everything running through
+  the BatteryML pipeline (XGBoost ... CPTransformer, BatLiNet). READY requires
+  that a config passes `config_validator.load_and_validate_config_file` with
+  data required — the same gate a run goes through — and that the config's
+  model class is in the live `MODELS` registry, populated via
+  `register_extension_models()` exactly as `run_batteryml_cli.py` does.
+  A model with no config for the requested dataset is `NEEDS_DATA` for that
+  dataset, never READY by borrowing another dataset's config.
+* **External models** (`assess_external_model`) — PBT and BatteryMFormer,
+  declared in `EXTERNAL_MODELS` with their fixed task semantics:
+  PBT → `RUL prediction` (scalar lifetime), BatteryMFormer →
+  `Degradation trajectory forecasting` (never a scalar RUL model, never
+  through `RULLabelAnnotator`). Readiness is filesystem inspection of
+  `third_party/` plus, for PBT, a cheap conda environment check
+  (`probe_environment=True` additionally probes `from models import PBT`
+  inside pbt311 through `external_runners.pbt.PBTRunner`). Nothing in
+  `third_party/` is modified or executed by a readiness check.
+
+Current verified results:
+
+| Model | Status | Blocking inputs |
+| --- | --- | --- |
+| CPTransformer | `READY` | — |
+| BatLiNet | `READY` | — |
+| PBT | `NEEDS_ASSETS` | checkpoint archive not unpacked, PCA, LLM checkpoint, PBT-format dataset (pbt311 env itself is available) |
+| BatteryMFormer | `NEEDS_DATA` | BatteryLife v11 unpacked data, `processed_SOH` (Qwen3 embeddings and split JSONs are present) |
+
+An external model whose status is not READY is **correct**, not a failure to
+be worked around by substituting another model, another dataset, or placeholder
+assets (CLAUDE.md §7).
+
+## Agent-facing context
+
+```python
+from batteryml_web.core.readiness import get_workflow_context
+
+ctx = get_workflow_context(dataset="MATR", task="RUL prediction")
+# {
+#   "dataset": {...},                  # DatasetReadiness for MATR
+#   "task": "RUL prediction",
+#   "available_models": [...],         # READY models for this dataset/task
+#   "blocked_models": [...],           # the rest, each with `missing` + action
+#   "recommended_next_steps": [...],   # ordered, actionable
+# }
+```
+
+Task labels fold case-insensitively: `RUL` / `RUL prediction`, `SOH` /
+`SOH estimation`, `trajectory` / `Degradation trajectory forecasting`.
+For the trajectory task only external models are listed: the registry models
+are scalar RUL/SOH predictors by construction.
+
+The five agent responsibilities (workflow guidance, readiness explanation,
+config suggestion, troubleshooting, result interpretation) all consume this
+state. What the agent may *not* do: generate executable Python, write an
+unvalidated config, decide that a missing file exists, or produce a number
+that BatteryML did not compute.
+
+## Tests
+
+`tests/test_readiness.py` (stdlib `unittest`, no pytest needed, no GPU, no
+downloads; registry-backed cases skip themselves when `batteryml` cannot be
+imported):
+
+```bash
+python -m unittest tests.test_readiness -v
+```
+
+Covers: the four dataset states on temporary paths, READY CPTransformer and
+BatLiNet against the live registries (the §11 regression check), the MATR
+external configs against the execution gate, PBT/BatteryMFormer status on the
+real tree plus synthetic READY trees, and the workflow context for MATR/RUL,
+trajectory, and RAW_ONLY datasets.

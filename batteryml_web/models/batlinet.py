@@ -12,7 +12,7 @@ from tqdm import tqdm
 from batteryml.builders import FEATURE_EXTRACTORS, MODELS
 from batteryml.data.battery_data import BatteryData
 from batteryml.feature.base import BaseFeatureExtractor
-from batteryml.models.base import BaseModel
+from batteryml.models.nn_model import NNModel
 
 
 # ============================================================
@@ -623,10 +623,7 @@ class _BatLiNetCore(nn.Module):
 # ============================================================
 
 @MODELS.register()
-class BatLiNetRULPredictor(
-    BaseModel,
-    nn.Module,
-):
+class BatLiNetRULPredictor(NNModel):
 
     def __init__(
         self,
@@ -644,28 +641,14 @@ class BatLiNetRULPredictor(
         input_width: int = 1000,
         in_channels: int = 6,
     ):
-        nn.Module.__init__(self)
-        BaseModel.__init__(
+        NNModel.__init__(
             self,
-            workspace,
-        )
-
-        self.train_epochs = int(
-            epochs
-        )
-
-        self.batch_size = int(
-            batch_size
-        )
-
-        self.lr = float(lr)
-
-        self.evaluate_freq = int(
-            evaluate_freq
-        )
-
-        self.checkpoint_freq = int(
-            checkpoint_freq
+            batch_size=batch_size,
+            epochs=epochs,
+            workspace=workspace,
+            evaluate_freq=evaluate_freq,
+            checkpoint_freq=checkpoint_freq,
+            lr=lr,
         )
 
         self.train_support_size = int(
@@ -1050,7 +1033,7 @@ class BatLiNetRULPredictor(
         path,
     ):
         torch.save(
-            self.network.state_dict(),
+            self.state_dict(),
             path,
         )
 
@@ -1063,7 +1046,7 @@ class BatLiNetRULPredictor(
             map_location="cpu",
         )
 
-        self.network.load_state_dict(
+        self.load_state_dict(
             state
         )
 
