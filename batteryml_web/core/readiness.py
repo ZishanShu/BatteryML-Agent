@@ -123,6 +123,7 @@ class DatasetReadiness:
     recommended_action: str
     raw_path: str
     processed_path: str
+    preprocessing_supported: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -135,6 +136,7 @@ class DatasetReadiness:
             "recommended_action": self.recommended_action,
             "raw_path": self.raw_path,
             "processed_path": self.processed_path,
+            "preprocessing_supported": self.preprocessing_supported,
         }
 
 
@@ -208,9 +210,12 @@ def assess_dataset(
     raw_path = raw_dir
     raw_count = _dir_file_count(raw_dir)
     invalid_alt_archive: Path | None = None
+    uses_alternate_raw_source = False
 
     # Known BatteryLife-v11 archives are legitimate alternate RAW sources.
-    # They are raw-only: they never make a BatteryML dataset READY.
+    # They are raw-only: they never make a BatteryML dataset READY, and they
+    # are not wired to the BatteryML preprocessing route, so no executable
+    # preprocessing command may be emitted for them.
     if raw_root is None and raw_count == 0:
         archive_names = {
             "MICH": "MICH.zip",
@@ -234,6 +239,7 @@ def assess_dataset(
                 if zipfile.is_zipfile(candidate):
                     raw_path = candidate
                     raw_count = 1
+                    uses_alternate_raw_source = True
                 else:
                     invalid_alt_archive = candidate
 
@@ -320,6 +326,10 @@ def assess_dataset(
         ],
         raw_path=str(raw_path),
         processed_path=str(processed_dir),
+        preprocessing_supported=(
+            status is DatasetStatus.RAW_ONLY
+            and not uses_alternate_raw_source
+        ),
     )
 
 def list_dataset_readiness(
@@ -930,7 +940,19 @@ def get_workflow_context(
     if not dataset_name:
         raise ValueError("dataset must be a non-empty string when provided.")
 
-    data_readiness = assess_dataset(dataset_name)
+    data_readiness = assess_dataset(
+        dataset_name,
+        raw_root=(
+            (root / "data" / "raw")
+            if repo_root is not None
+            else None
+        ),
+        processed_root=(
+            (root / "data" / "processed")
+            if repo_root is not None
+            else None
+        ),
+    )
 
     config_reg = get_config_registry(str(root))
     reports: list[ModelReadiness] = []
@@ -967,12 +989,22 @@ def get_workflow_context(
                 f"'{normalized_task}' is executable yet."
             )
     elif data_readiness.status is DatasetStatus.RAW_ONLY:
-        steps.append(
-            f"Dataset '{dataset_name}' is RAW_ONLY: run preprocessing "
-            "(python batteryml_web/core/run_batteryml_cli.py preprocess "
-            f"{dataset_name} data/raw/{dataset_name} data/processed/{dataset_name}) "
-            "before any model run."
-        )
+        if data_readiness.preprocessing_supported:
+            steps.append(
+                f"Dataset '{dataset_name}' is RAW_ONLY: run preprocessing "
+                "(python batteryml_web/core/run_batteryml_cli.py preprocess "
+                f"{dataset_name} data/raw/{dataset_name} data/processed/{dataset_name}) "
+                "before any model run."
+            )
+        else:
+            steps.append(
+                f"Dataset '{dataset_name}' is RAW_ONLY: BatteryLife v11 "
+                f"{dataset_name} data are present locally "
+                f"({_display_path(Path(data_readiness.raw_path))}), but this "
+                "archive is not yet wired to the BatteryML preprocessing "
+                "route. Prepare/unpack an approved BatteryML-compatible "
+                f"{dataset_name} input before model execution."
+            )
     elif data_readiness.status is DatasetStatus.INCOMPLETE_PROCESSED:
         steps.append(
             f"Dataset '{dataset_name}' has a processed directory without usable "
