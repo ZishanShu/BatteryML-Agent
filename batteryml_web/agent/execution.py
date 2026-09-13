@@ -142,6 +142,25 @@ def _default_workspace(dataset: str, model: str) -> str:
     return f"runs/{safe or 'agent_run'}"
 
 
+def _validate_epochs(epochs: int | None) -> Optional[int]:
+    """Validate the planner-owned epoch override.
+
+    Only ``None`` (preserve the config's epoch schedule) or a positive
+    ``int`` is accepted. ``bool`` is rejected explicitly because it is an
+    ``int`` subclass in Python and ``True`` would otherwise mean 1 epoch.
+    No other CLI flag overrides exist; this is the single allowed one.
+    """
+    if epochs is None:
+        return None
+    if isinstance(epochs, bool) or not isinstance(epochs, int):
+        raise ValueError(
+            f"epochs must be a positive int or None, got {epochs!r}."
+        )
+    if epochs <= 0:
+        raise ValueError(f"epochs must be a positive int or None, got {epochs!r}.")
+    return epochs
+
+
 def build_execution_plan(
     dataset: str,
     task: str,
@@ -152,6 +171,7 @@ def build_execution_plan(
     seed: int = 0,
     workspace: str | None = None,
     workflow_context: Optional[Dict[str, Any]] = None,
+    epochs: int | None = None,
 ) -> Dict[str, Any]:
     """Build a validated, non-executing run plan for one model.
 
@@ -166,11 +186,17 @@ def build_execution_plan(
             mocked READY state). When omitted it is built from
             ``(dataset, task)``; only its ``validated_config`` values may
             ever appear in the plan.
+        epochs: optional positive-int ``--epochs`` override owned by the
+            planner (``bin/batteryml.py run`` accepts ``--epochs`` as a
+            number-of-epochs override). ``None`` preserves the config's own
+            schedule exactly. This is the only CLI flag override permitted;
+            no arbitrary extra flags are accepted.
 
     Returns a dict with ``dataset``, ``task``, ``model``, ``model_status``,
     ``dataset_status``, ``config_path`` (verbatim readiness value or None),
     ``config_valid``, ``can_execute``, ``validation_errors``, ``command``
-    (argv list or None) and ``reason``. No subprocess is ever started.
+    (argv list or None), ``epochs`` and ``reason``. No subprocess is ever
+    started.
     """
     if not str(dataset or "").strip():
         raise ValueError("build_execution_plan: dataset is empty.")
@@ -178,6 +204,7 @@ def build_execution_plan(
         raise ValueError("build_execution_plan: task is empty.")
     if not str(model or "").strip():
         raise ValueError("build_execution_plan: model is empty.")
+    epochs_value = _validate_epochs(epochs)
 
     from ..core.config_validator import load_and_validate_config_file
 
@@ -270,6 +297,8 @@ def build_execution_plan(
             "--seed",
             str(seed),
         ]
+        if epochs_value is not None:
+            command.extend(["--epochs", str(epochs_value)])
         reason = f"Model {model_key!r} is READY with a validated config; plan only, nothing executed."
     else:
         command = None
@@ -294,6 +323,7 @@ def build_execution_plan(
         "can_execute": can_execute,
         "validation_errors": errors,
         "command": command,
+        "epochs": epochs_value,
         "reason": reason,
     }
 
@@ -305,6 +335,7 @@ def plan_for_request(
     device: str = "cpu",
     seed: int = 0,
     workspace: str | None = None,
+    epochs: int | None = None,
 ) -> Dict[str, Any]:
     """End-to-end deterministic plan for one natural-language request.
 
@@ -313,7 +344,9 @@ def plan_for_request(
     :func:`build_execution_plan`. When intent or the model mention cannot be
     resolved, or the dataset is not READY, the result has
     ``can_execute=False`` and states what is needed — the LLM is not
-    consulted and no fuzzy fallback model is picked.
+    consulted and no fuzzy fallback model is picked. ``epochs`` is the
+    planner-owned positive-int ``--epochs`` override (None preserves the
+    config schedule); it is validated by :func:`build_execution_plan`.
     """
     if not str(user_request or "").strip():
         raise ValueError("plan_for_request: user_request is empty.")
@@ -366,6 +399,7 @@ def plan_for_request(
         seed=seed,
         workspace=workspace,
         workflow_context=context,
+        epochs=epochs,
     )
     plan["reason"] = f"Request resolved to dataset={dataset}, task={task}. " + str(plan.get("reason"))
     return plan

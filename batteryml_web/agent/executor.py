@@ -147,6 +147,13 @@ def validate_plan_for_execution(
         )
     if "--train" not in argv or "--eval" not in argv:
         return reject("plan command lacks mandatory --train/--eval flags; refused.")
+    if "--epochs" in argv:
+        index = argv.index("--epochs")
+        value = argv[index + 1] if index + 1 < len(argv) else None
+        if value is None or not value.isdigit() or int(value) <= 0:
+            return reject(
+                "plan command carries an invalid --epochs override; refused."
+            )
     if not Path(config_path).is_file():
         return reject(f"config_path does not exist on disk: {config_path}")
 
