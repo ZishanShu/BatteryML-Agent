@@ -13,7 +13,18 @@ from typing import Any
 
 from .llm_client import run_llm_prompt
 from .prompts import build_results_summary_prompt
+from .results import build_result_interpretation_prompt
 
+RESULT_SYSTEM_PROMPT = (
+    "You are a run-result interpretation assistant. Return JSON only. "
+    "The structured run result below is authoritative: restate its metrics "
+    "exactly, never recompute, round, or invent a metric value, never claim "
+    "a missing metric, never claim benchmark performance, convergence, or "
+    "scientific superiority from a smoke run, and interpret MAPE as a ratio "
+    "(e.g. 0.662 means about 66.2%) while preserving the raw number."
+)
+
+# Backwards-compatible alias: existing callers import SYSTEM_PROMPT.
 SYSTEM_PROMPT = (
     "You are a results explanation assistant. Return JSON only. "
     "Never restate, recompute, round, or invent a metric value."
@@ -108,4 +119,74 @@ def explain_results(
     # The caller's metrics object wins unconditionally: whatever the model
     # echoed back under this key is discarded.
     parsed["metrics"] = metrics
+    return parsed
+
+
+def explain_run_result(
+    result_context: dict[str, Any],
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    timeout: int = 60,
+    llm_call: Any | None = None,
+) -> dict[str, Any]:
+    """Explain a structured run result from :func:`results.build_result_context`.
+
+    Reuses the existing explanation boundary (:func:`explain_results` rules):
+    metrics pass through verbatim and the reply is parsed as JSON. Unlike
+    :func:`explain_results`, this entry point accepts the whole structured
+    context — including the empty-metrics case, which it reports honestly
+    instead of raising, and the smoke-run warning, which the prompt carries
+    so the LLM restates it rather than claiming benchmark performance.
+
+    Args:
+        result_context: dict from
+            :func:`batteryml_web.agent.results.build_result_context`.
+        base_url / api_key / model / timeout: forwarded to the LLM client
+            unless ``llm_call`` is given.
+        llm_call: injectable ``(prompt, *, system_prompt, **kwargs) -> str``
+            boundary for tests.
+
+    Returns:
+        A dict with the LLM's parsed reply plus ``result_context`` holding
+        the caller's input object unchanged, so prose is never the source
+        of any number.
+
+    Raises:
+        ValueError: if ``result_context`` is empty or a failed run carries
+            fabricated metrics.
+        RuntimeError: if the API call itself fails.
+    """
+    if not result_context:
+        raise ValueError(
+            "explain_run_result: result_context is empty. Build it with "
+            "batteryml_web.agent.results.build_result_context first."
+        )
+    metrics = dict(result_context.get("metrics") or {})
+    if not result_context.get("success") and metrics:
+        raise ValueError(
+            "explain_run_result: failed run carries metrics; refusing to "
+            "interpret fabricated values."
+        )
+
+    prompt = build_result_interpretation_prompt(result_context)
+    caller = llm_call if llm_call is not None else run_llm_prompt
+    try:
+        content = caller(
+            prompt,
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            system_prompt=RESULT_SYSTEM_PROMPT,
+            timeout=timeout,
+        )
+    except TypeError:
+        content = caller(prompt, system_prompt=RESULT_SYSTEM_PROMPT)
+    parsed = _extract_json(content, source="explain_run_result")
+
+    # The caller's context wins unconditionally: whatever the model echoed
+    # back under these keys is discarded.
+    parsed["metrics"] = metrics
+    parsed["result_context"] = result_context
     return parsed
