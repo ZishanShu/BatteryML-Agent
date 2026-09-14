@@ -13,6 +13,7 @@ import streamlit as st
 import torch
 
 from batteryml_web.agent.llm_client import run_llm_prompt, save_llm_output, test_llm_connection
+from batteryml_web.ui.agent_workflow import render_agent_workflow
 from batteryml_web.core.custom_uploads import (
     ALLOWED_CUSTOM_SOURCE_FORMATS,
     build_uploaded_dataset_manifest,
@@ -1473,6 +1474,8 @@ elif current_step == "prepare_data":
     render_prepare_data_page()
 elif current_step == "run_model":
     render_run_model_page()
+elif current_step == "agent_workflow":
+    render_agent_workflow()
 elif current_step == "review_results":
     render_review_results_page()
 else:

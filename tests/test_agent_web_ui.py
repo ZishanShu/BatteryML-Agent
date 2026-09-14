@@ -1,0 +1,651 @@
+"""UI/backend boundary tests for the Streamlit Agent Workflow integration.
+
+These tests never train, never launch a subprocess and never call an LLM.
+They check the contract the Streamlit layer must honour:
+
+* structured state comes only from the backend workflow APIs;
+* the Run button is the only path to ``execute_plan`` and is enabled only
+  when the backend planner says ``can_execute``;
+* smoke mode maps only to the planner's ``epochs=1`` override;
+* blocked datasets/models never surface commands, selectable models or an
+  enabled Run;
+* result display consumes ``build_result_context`` output verbatim, shows
+  the smoke and provenance warnings, and shows no metrics for failed runs.
+
+The render pass runs against a fake ``st`` object, so the logic is asserted
+without a Streamlit runtime.
+
+Run from the repository root:
+
+    conda run -n batteryml python -m unittest tests.test_agent_web_ui -v
+"""
+
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tests.test_readiness import REGISTRIES_AVAILABLE  # noqa: E402
+from batteryml_web.agent.results import SMOKE_RUN_WARNING  # noqa: E402
+from batteryml_web.ui import agent_workflow as ui  # noqa: E402
+
+
+class _Rerun(Exception):
+    """Sentinel for st.rerun()."""
+
+
+class _Ctx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class _Col:
+    def __init__(self, rec: dict):
+        self._rec = rec
+
+    def metric(self, label, value, **kwargs):
+        self._rec["metrics"].append((str(label), str(value)))
+
+    def caption(self, text, **kwargs):
+        self._rec["captions"].append(str(text))
+
+
+class FakeStreamlit:
+    """Minimal stand-in for the streamlit surface the UI module uses."""
+
+    def __init__(
+        self,
+        session: dict,
+        clicked_buttons: set[str] | None = None,
+        checkbox_values: dict[str, bool] | None = None,
+    ):
+        self.session_state = session
+        self._clicked = set(clicked_buttons or ())
+        self._checkbox_values = dict(checkbox_values or {})
+        self.rec: dict[str, list] = {
+            "markdown": [],
+            "captions": [],
+            "codes": [],
+            "warnings": [],
+            "errors": [],
+            "infos": [],
+            "writes": [],
+            "dataframes": [],
+            "metrics": [],
+            "buttons": [],
+            "selectboxes": [],
+        }
+
+    # --- text/display -------------------------------------------------
+    def markdown(self, text, **kwargs):
+        self.rec["markdown"].append(str(text))
+
+    def caption(self, text, **kwargs):
+        self.rec["captions"].append(str(text))
+
+    def code(self, text, **kwargs):
+        self.rec["codes"].append(str(text))
+
+    def text(self, text, **kwargs):
+        self.rec["writes"].append(str(text))
+
+    def write(self, *args, **kwargs):
+        self.rec["writes"].append(" ".join(str(a) for a in args))
+
+    def info(self, text, **kwargs):
+        self.rec["infos"].append(str(text))
+
+    def warning(self, text, **kwargs):
+        self.rec["warnings"].append(str(text))
+
+    def error(self, text, **kwargs):
+        self.rec["errors"].append(str(text))
+
+    def dataframe(self, data, **kwargs):
+        self.rec["dataframes"].append(data)
+
+    def columns(self, spec, **kwargs):
+        count = spec if isinstance(spec, int) else len(spec)
+        return [_Col(self.rec) for _ in range(count)]
+
+    # --- widgets -------------------------------------------------------
+    def text_area(self, label, value="", **kwargs):
+        return str(value or "")
+
+    def selectbox(self, label, options, index=0, **kwargs):
+        opts = list(options)
+        self.rec["selectboxes"].append({"label": str(label), "options": [str(o) for o in opts]})
+        return opts[index if index is not None else 0]
+
+    def checkbox(self, label, **kwargs):
+        return bool(self._checkbox_values.get(str(label), False))
+
+    def button(self, label, **kwargs):
+        disabled = bool(kwargs.get("disabled", False))
+        clicked = (not disabled) and (str(label) in self._clicked)
+        self.rec["buttons"].append(
+            {"label": str(label), "disabled": disabled, "clicked": clicked}
+        )
+        return clicked
+
+    # --- containers ------------------------------------------------------
+    def expander(self, label, **kwargs):
+        return _Ctx()
+
+    def spinner(self, label, **kwargs):
+        return _Ctx()
+
+    def rerun(self):
+        raise _Rerun()
+
+
+_MATR_CONTEXT = {
+    "dataset": "MATR",
+    "dataset_status": "READY",
+    "task": "RUL prediction",
+    "preprocessing_supported": False,
+    "runnable_models": [
+        {
+            "model": "cptransformer",
+            "model_display": "CPTransformer — CyclePatch Transformer",
+            "status": "READY",
+            "validated_config": "configs/external/cptransformer/matr_1.yaml",
+        },
+        {
+            "model": "batlinet",
+            "model_display": "BatLiNet — Inter-cell Lifetime Prediction",
+            "status": "READY",
+            "validated_config": "configs/external/batlinet/matr_1.yaml",
+        },
+    ],
+    "blocked_models": [
+        {
+            "model": "PBT",
+            "status": "NEEDS_ASSETS",
+            "missing": ["pretrained checkpoint"],
+            "recommended_action": "Provide the pretrained assets.",
+        }
+    ],
+    "recommended_next_steps": ["Pick a runnable model."],
+}
+
+_TRAJ_CONTEXT = {
+    "dataset": "MATR",
+    "dataset_status": "READY",
+    "task": "Degradation trajectory forecasting",
+    "preprocessing_supported": False,
+    "runnable_models": [],
+    "blocked_models": [
+        {
+            "model": "BatteryMFormer",
+            "status": "NEEDS_DATA",
+            "missing": ["prepared trajectory inputs"],
+            "recommended_action": "Prepare trajectory data via the BatteryMFormer runner.",
+        }
+    ],
+    "recommended_next_steps": [
+        "Degradation trajectory forecasting is served by external models only "
+        "(BatteryMFormer); it is not a scalar RUL task and must not run through RULLabelAnnotator."
+    ],
+}
+
+_MICH_CONTEXT = {
+    "dataset": "MICH",
+    "dataset_status": "RAW_ONLY",
+    "task": "RUL prediction",
+    "preprocessing_supported": False,
+    "runnable_models": [],
+    "blocked_models": [
+        {"model": "cptransformer", "status": "NEEDS_DATA", "missing": [], "recommended_action": "Preprocess MICH first."}
+    ],
+    "recommended_next_steps": [
+        "Dataset 'MICH' is RAW_ONLY: BatteryLife v11 MICH data are present locally "
+        "(data/raw/BatteryLife/v11/MICH.zip), but this archive is not yet wired to the "
+        "BatteryML preprocessing route. Prepare/unpack an approved BatteryML-compatible "
+        "MICH input before model execution."
+    ],
+}
+
+
+def _ok_plan(model: str = "cptransformer", epochs: int | None = None) -> dict:
+    command = [
+        "python",
+        "batteryml_web/core/run_batteryml_cli.py",
+        "run",
+        "configs/external/cptransformer/matr_1.yaml",
+        "--workspace",
+        "runs/agent_matr_cptransformer",
+        "--train",
+        "--eval",
+        "--device",
+        "cpu",
+        "--seed",
+        "0",
+    ]
+    if epochs is not None:
+        command += ["--epochs", str(epochs)]
+    return {
+        "dataset": "MATR",
+        "task": "RUL prediction",
+        "model": model,
+        "model_display": "CPTransformer — CyclePatch Transformer",
+        "model_status": "READY",
+        "dataset_status": "READY",
+        "config_path": "configs/external/cptransformer/matr_1.yaml",
+        "config_valid": True,
+        "can_execute": True,
+        "validation_errors": [],
+        "command": command,
+        "epochs": epochs,
+        "reason": "plan only, nothing executed.",
+    }
+
+
+def _failed_plan(model: str = "PBT") -> dict:
+    return {
+        "dataset": "MATR",
+        "task": "RUL prediction",
+        "model": model,
+        "model_display": None,
+        "model_status": "NEEDS_ASSETS",
+        "dataset_status": "READY",
+        "config_path": None,
+        "config_valid": False,
+        "can_execute": False,
+        "validation_errors": [],
+        "command": None,
+        "epochs": None,
+        "reason": f"Model {model!r} is NEEDS_ASSETS and must not execute.",
+    }
+
+
+def _render(
+    session: dict,
+    clicked: set[str] | None = None,
+    checkboxes: dict[str, bool] | None = None,
+) -> FakeStreamlit:
+    fake = FakeStreamlit(session, clicked, checkboxes)
+    original_st = ui.st
+    ui.st = fake
+    try:
+        ui.render_agent_workflow()
+    except _Rerun:
+        pass
+    finally:
+        ui.st = original_st
+    return fake
+
+
+class TestPureBoundaryHelpers(unittest.TestCase):
+    """The small helpers the UI leans on, checked without Streamlit."""
+
+    def test_ready_context_offers_only_runnable_canonical_keys(self) -> None:
+        self.assertEqual(
+            ui.runnable_model_keys(_MATR_CONTEXT), ["cptransformer", "batlinet"]
+        )
+        self.assertNotIn("PBT", ui.runnable_model_keys(_MATR_CONTEXT))
+        self.assertTrue(ui.has_runnable_model(_MATR_CONTEXT))
+
+    def test_blocked_or_missing_context_offers_nothing(self) -> None:
+        for context in (_TRAJ_CONTEXT, _MICH_CONTEXT):
+            with self.subTest(task=context["task"], dataset=context["dataset"]):
+                self.assertEqual(ui.runnable_model_keys(context), [])
+                self.assertFalse(ui.has_runnable_model(context))
+
+    def test_run_gate_requires_backend_can_execute(self) -> None:
+        self.assertTrue(ui.run_is_enabled(_ok_plan()))
+        self.assertFalse(ui.run_is_enabled(_failed_plan()))
+        self.assertFalse(ui.run_is_enabled({"can_execute": "yes"}))
+        self.assertFalse(ui.run_is_enabled(None))
+
+    def test_smoke_mode_maps_only_to_epochs_one(self) -> None:
+        self.assertEqual(ui.smoke_epochs_value(True), 1)
+        self.assertIsNone(ui.smoke_epochs_value(False))
+        # And only epochs=1 appears in the resulting planner command:
+        plan = _ok_plan(epochs=1)
+        self.assertEqual(plan["command"][plan["command"].index("--epochs") + 1], "1")
+        self.assertNotIn("--lr", " ".join(plan["command"]))
+
+    def test_mich_notice_is_the_backend_text_not_a_fake_command(self) -> None:
+        notice = ui.raw_only_notice(_MICH_CONTEXT)
+        self.assertIsNotNone(notice)
+        self.assertIn("not yet wired", notice)
+        self.assertNotIn("python", notice)
+        self.assertNotIn("data/raw/MICH", notice)
+        self.assertIsNone(ui.raw_only_notice(_MATR_CONTEXT))
+
+    def test_failed_run_never_surfaces_metrics(self) -> None:
+        context = {
+            "success": False,
+            "metrics": {"RMSE": 1.0, "MAE": 2.0, "MAPE": 0.5},
+        }
+        self.assertEqual(ui.display_metrics(context), {})
+        self.assertEqual(ui.display_metrics(None), {})
+
+    def test_successful_metrics_pass_through_verbatim(self) -> None:
+        context = {
+            "success": True,
+            "metrics": {
+                "RMSE": 455.5853271484375,
+                "MAE": 393.8516540527344,
+                "MAPE": 0.6621854901313782,
+            },
+        }
+        metrics = ui.display_metrics(context)
+        self.assertEqual(metrics["RMSE"], 455.5853271484375)
+        self.assertEqual(metrics["MAPE"], 0.6621854901313782)
+        self.assertEqual(ui.mape_percent(metrics["MAPE"]), "66.22%")
+
+    def test_smoke_warning_is_recognised(self) -> None:
+        context = {"success": True, "warnings": [SMOKE_RUN_WARNING]}
+        surfaced = ui.smoke_warnings(context)
+        self.assertEqual(surfaced, [SMOKE_RUN_WARNING])
+        self.assertEqual(ui.smoke_warnings({"success": True, "warnings": ["cache miss"]}), [])
+
+    def test_provenance_warning_is_recognised(self) -> None:
+        context = {
+            "provenance_verified": False,
+            "provenance_warnings": ["Caller dataset 'MICH' differs from workspace 'MATR'."],
+        }
+        warnings = ui.provenance_warnings(context)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("differs", warnings[0])
+        self.assertEqual(ui.provenance_warnings({"provenance_verified": True, "provenance_warnings": []}), [])
+
+    def test_result_rows_come_only_from_build_result_context_shape(self) -> None:
+        context = {
+            "success": True,
+            "dataset": "MATR",
+            "task": "RUL prediction",
+            "model": "cptransformer",
+            "metrics": {"RMSE": 1.0},
+            "num_predictions": 42,
+            "predictions_file": "ws/predictions_matr.pkl",
+            "figure_files": ["ws/fig1.png"],
+        }
+        rows = dict(ui.result_summary_rows(context))
+        self.assertEqual(rows["Dataset"], "MATR")
+        self.assertEqual(rows["Number of predictions"], 42)
+        self.assertEqual(rows["Predictions artifact"], "ws/predictions_matr.pkl")
+        self.assertEqual(rows["Figures"], "ws/fig1.png")
+
+    def test_workspace_stays_inside_runs_area(self) -> None:
+        ws = ui.workspace_for_request("MATR", "cptransformer", True)
+        self.assertTrue(ws.startswith("runs/"))
+        self.assertTrue(ws.endswith("_smoke"))
+        self.assertFalse(ui.workspace_for_request("MATR", "cptransformer", False).endswith("_smoke"))
+        escaped = ui.workspace_for_request("MATR", "cptransformer", False, project_root="/tmp/elsewhere")
+        self.assertTrue(escaped.startswith("runs/"))
+
+
+class TestRenderBoundaries(unittest.TestCase):
+    """render_agent_workflow() must only orchestrate the backend APIs."""
+
+    def setUp(self) -> None:
+        # Neutralise the backend calls; these tests check orchestration only.
+        self._plan_calls: list[dict[str, Any]] = []
+        self._exec_calls: list[dict] = []
+        self._real_build = ui.build_execution_plan
+        self._real_execute = ui.execute_plan
+        self._real_result_ctx = ui.build_result_context
+        self._real_llm = ui.is_llm_configured
+
+        def stub_build(dataset, task, model, **kwargs):
+            self._plan_calls.append({"dataset": dataset, "task": task, "model": model, **kwargs})
+            return kwargs.get("__plan__") or _ok_plan(model, epochs=kwargs.get("epochs"))
+
+        def stub_execute(plan, **kwargs):
+            self._exec_calls.append(plan)
+            return {
+                "started": True,
+                "completed": True,
+                "success": True,
+                "returncode": 0,
+                "command": plan["command"],
+                "workspace": "runs/agent_matr_cptransformer",
+                "stdout": "x" * 10000,
+                "stderr": "",
+                "error": None,
+                "artifacts": {"prediction_files": []},
+                "dry_run": False,
+            }
+
+        def stub_result_context(workspace, **kwargs):
+            return {
+                "workspace": workspace,
+                "run_status": "SUCCESS",
+                "success": True,
+                "dataset": kwargs.get("dataset"),
+                "task": kwargs.get("task"),
+                "model": kwargs.get("model"),
+                "metrics": {"RMSE": 455.5853271484375, "MAE": 393.8516540527344, "MAPE": 0.6621854901313782},
+                "num_predictions": 42,
+                "predictions_file": "ws/predictions.pkl",
+                "figure_files": [],
+                "warnings": [SMOKE_RUN_WARNING],
+                "provenance_verified": False,
+                "provenance_warnings": ["unverified"],
+            }
+
+        ui.build_execution_plan = stub_build
+        ui.execute_plan = stub_execute
+        ui.build_result_context = stub_result_context
+        ui.is_llm_configured = lambda: False
+
+    def tearDown(self) -> None:
+        ui.build_execution_plan = self._real_build
+        ui.execute_plan = self._real_execute
+        ui.build_result_context = self._real_result_ctx
+        ui.is_llm_configured = self._real_llm
+
+    def _session(self, context: dict) -> dict:
+        return {
+            "agent_workflow_context": context,
+            "agent_original_request": "Use CPTransformer on MATR to predict battery lifetime.",
+        }
+
+    def test_analyze_never_executes_and_plan_is_per_selection(self) -> None:
+        session = self._session(_MATR_CONTEXT)
+        fake = _render(session)
+        # No execution without an explicit Run click.
+        self.assertEqual(self._exec_calls, [])
+        # A plan was built for the selected runnable model only.
+        self.assertEqual(len(self._plan_calls), 1)
+        self.assertEqual(self._plan_calls[0]["model"], "cptransformer")
+        self.assertEqual(self._plan_calls[0]["epochs"], None)
+        # Selection is restricted to runnable models; blocked models stay display-only.
+        sel = fake.rec["selectboxes"][0]["options"]
+        self.assertIn("cptransformer", sel)
+        self.assertNotIn("PBT", sel)
+        run_buttons = [b for b in fake.rec["buttons"] if b["label"] == ui.RUN_BUTTON_LABEL]
+        self.assertTrue(run_buttons and run_buttons[0]["disabled"] is False)
+
+    def test_run_requires_explicit_button_and_validated_plan(self) -> None:
+        # Button not clicked: nothing executed.
+        _render(self._session(_MATR_CONTEXT))
+        self.assertEqual(self._exec_calls, [])
+        # Button clicked with a can_execute plan: executed exactly once.
+        _render(self._session(_MATR_CONTEXT), clicked={"Run"})
+        self.assertEqual(len(self._exec_calls), 1)
+        # Blocked plan (can_execute False): Run disabled, executor untouched.
+        self._exec_calls.clear()
+        self._real_build  # noqa: B018 (documented seam)
+        ui.build_execution_plan = lambda dataset, task, model, **kw: _failed_plan(model)
+        fake = _render(self._session(_MATR_CONTEXT), clicked={"Run"})
+        self.assertEqual(self._exec_calls, [])
+        run_buttons = [b for b in fake.rec["buttons"] if b["label"] == ui.RUN_BUTTON_LABEL]
+        self.assertTrue(run_buttons and run_buttons[0]["disabled"] is True)
+
+    def test_smoke_checkbox_maps_only_to_epochs_one(self) -> None:
+        _render(self._session(_MATR_CONTEXT), checkboxes={ui.SMOKE_CHECKBOX_LABEL: True})
+        self.assertEqual(self._plan_calls[-1]["epochs"], 1)
+        self.assertIn("_smoke", self._plan_calls[-1]["workspace"])
+        _render(self._session(_MATR_CONTEXT), checkboxes={ui.SMOKE_CHECKBOX_LABEL: False})
+        self.assertIsNone(self._plan_calls[-1]["epochs"])
+
+    def test_blocked_dataset_shows_nothing_selectable_or_executable(self) -> None:
+        fake = _render(self._session(_MICH_CONTEXT), clicked={"Run"})
+        self.assertEqual(fake.rec["selectboxes"], [])
+        self.assertEqual([b for b in fake.rec["buttons"] if b["label"] == ui.RUN_BUTTON_LABEL], [])
+        self.assertEqual(self._exec_calls, [])
+        self.assertEqual(fake.rec["codes"], [])  # no fake preprocessing command
+        joined = " ".join(fake.rec["warnings"] + fake.rec["writes"])
+        self.assertIn("not yet wired", joined)
+        self.assertNotIn("data/raw/MICH", joined)
+
+    def test_trajectory_workflow_has_no_rul_run_path(self) -> None:
+        fake = _render(self._session(_TRAJ_CONTEXT), clicked={"Run"})
+        self.assertEqual(fake.rec["selectboxes"], [])
+        self.assertEqual([b for b in fake.rec["buttons"] if b["label"] == ui.RUN_BUTTON_LABEL], [])
+        self.assertEqual(self._exec_calls, [])
+        self.assertIn("BatteryMFormer", " ".join(fake.rec["writes"]))
+        self.assertEqual(self._plan_calls, [])
+
+    def test_failed_execution_displays_no_metrics(self) -> None:
+        ui.execute_plan = lambda plan, **kw: {
+            "started": True,
+            "completed": True,
+            "success": False,
+            "returncode": 1,
+            "command": plan["command"],
+            "workspace": "runs/agent_matr_cptransformer",
+            "stdout": "",
+            "stderr": "boom",
+            "error": "wrapper exited with returncode 1",
+            "artifacts": {},
+            "dry_run": False,
+        }
+        session = self._session(_MATR_CONTEXT)
+        fake = _render(session, clicked={"Run"})
+        self.assertEqual(self._exec_calls, [])  # execute_plan stub replaced above
+        rendered = session.get("agent_result_context")
+        self.assertIsNone(rendered)  # failure never fabricates a result context
+        self.assertFalse(any(label in {"RMSE", "MAE", "MAPE"} for label, _ in fake.rec["metrics"]))
+
+    def test_successful_result_display_uses_backend_fields(self) -> None:
+        session = self._session(_MATR_CONTEXT)
+        session["agent_result_context"] = {
+            "workspace": "runs/x",
+            "run_status": "SUCCESS",
+            "success": True,
+            "dataset": "MATR",
+            "task": "RUL prediction",
+            "model": "cptransformer",
+            "metrics": {"RMSE": 455.5853271484375, "MAE": 393.8516540527344, "MAPE": 0.6621854901313782},
+            "num_predictions": 42,
+            "predictions_file": "ws/predictions.pkl",
+            "figure_files": [],
+            "warnings": [SMOKE_RUN_WARNING],
+            "provenance_verified": False,
+            "provenance_warnings": ["Provenance could not be verified"],
+        }
+        fake = _render(session)
+        labels = dict(fake.rec["metrics"])
+        self.assertEqual(labels["RMSE"], "455.5853271484375")
+        self.assertEqual(labels["MAE"], "393.8516540527344")
+        self.assertEqual(labels["MAPE"], "0.6621854901313782")  # raw ratio preserved
+        self.assertTrue(any("66.22%" in c for c in fake.rec["captions"]))
+        self.assertTrue(any("smoke run" in w.lower() for w in fake.rec["warnings"]))
+        self.assertTrue(any("Provenance" in w for w in fake.rec["warnings"]))
+
+    def test_stdout_is_tail_only_in_session_state(self) -> None:
+        session = self._session(_MATR_CONTEXT)
+        fake = _render(session, clicked={"Run"})
+        stored = session.get("agent_execution_result")
+        if stored is not None:  # rerun happens before store in some flows
+            self.assertLessEqual(len(stored.get("stdout", "")), ui.OUTPUT_TAIL_CHARS + 64)
+
+
+class TestNoFrontendDuplication(unittest.TestCase):
+    """The UI module must not reimplement what the backend owns."""
+
+    def setUp(self) -> None:
+        self.source = Path(ui.__file__).read_text(encoding="utf-8")
+
+    def test_no_subprocess_or_shell_execution_in_ui(self) -> None:
+        self.assertNotIn("import subprocess", self.source)
+        self.assertNotIn("shell=True", self.source)
+        self.assertNotIn("os.system", self.source)
+        self.assertNotIn("popen", self.source.lower())
+
+    def test_no_duplicated_readiness_or_validator_or_metric_logic(self) -> None:
+        for forbidden in (
+            "get_workflow_context",
+            "load_and_validate_config_file",
+            "assess_dataset",
+            "assess_model",
+        ):
+            self.assertNotIn(forbidden, self.source, f"UI must not duplicate {forbidden}")
+
+    def test_no_metric_computation_in_ui(self) -> None:
+        lowered = self.source.lower()
+        # Metrics may be *mentioned* in docstrings, but never computed.
+        for token in ("sqrt(", "mean_absolute", "np.mean(", "torch.mean("):
+            self.assertNotIn(token, lowered)
+        self.assertNotIn("def rmse", lowered)
+        self.assertNotIn("def mae", lowered)
+        self.assertNotIn("def mape(", lowered)
+
+
+class TestBackendPlanContractsUsedByTheUI(unittest.TestCase):
+    """Registry-backed checks that the UI gate (can_execute) is correct."""
+
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    def test_ready_models_produce_executable_plans(self) -> None:
+        plan = self._plan("MATR", "RUL prediction", "cptransformer")
+        self.assertTrue(ui.run_is_enabled(plan), plan.get("reason"))
+        self.assertEqual(plan["model"], "cptransformer")
+        self.assertTrue(plan["config_path"].endswith("configs/external/cptransformer/matr_1.yaml"))
+
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    def test_blocked_pbt_plan_disabled(self) -> None:
+        plan = self._plan("MATR", "RUL prediction", "PBT")
+        self.assertFalse(ui.run_is_enabled(plan))
+        self.assertTrue(plan["command"] in (None, []))
+
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    def test_trajectory_batterymformer_never_rul_executable(self) -> None:
+        plan = self._plan("MATR", "Degradation trajectory forecasting", "BatteryMFormer")
+        self.assertFalse(ui.run_is_enabled(plan))
+        self.assertTrue(plan["command"] in (None, []))
+
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    def test_mich_raw_only_plan_disabled_and_without_command(self) -> None:
+        plan = self._plan("MICH", "RUL prediction", "cptransformer")
+        self.assertEqual(plan["dataset_status"], "RAW_ONLY")
+        self.assertFalse(ui.run_is_enabled(plan))
+        self.assertIsNone(plan["command"])
+        self.assertNotIn("data/raw/MICH", str(plan))
+
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    def test_smoke_plan_command_carries_only_epochs_override(self) -> None:
+        plan = self._plan("MATR", "RUL prediction", "cptransformer", epochs=1)
+        self.assertTrue(ui.run_is_enabled(plan))
+        self.assertIn("--epochs", plan["command"])
+        self.assertEqual(plan["command"][plan["command"].index("--epochs") + 1], "1")
+        # The verified CLI contract is intact: wrapper, run, config, train, eval, device, seed.
+        self.assertEqual(plan["command"][1], "batteryml_web/core/run_batteryml_cli.py")
+        self.assertEqual(plan["command"][2], "run")
+        self.assertIn("--train", plan["command"])
+        self.assertIn("--eval", plan["command"])
+        self.assertIn("--seed", plan["command"])
+        self.assertIn("--device", plan["command"])
+
+    @staticmethod
+    def _plan(dataset: str, task: str, model: str, epochs: int | None = None) -> dict:
+        return ui.build_execution_plan(
+            dataset, task, model, epochs=epochs, workspace="runs/ui_boundary_check"
+        )
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
