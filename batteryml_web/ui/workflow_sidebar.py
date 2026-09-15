@@ -1,16 +1,16 @@
 """Sidebar navigation.
 
-Two ways into the platform, deliberately shown as two:
+Two ways into the platform, shown as two: the **Agent Workflow** (describe
+the task in natural language) and the numbered **Protocol Workflow** (the
+manual route a reviewer follows without any LLM — Route B in `CLAUDE.md`
+§1). The agent is not numbered inside the protocol sequence, because it is
+not a stage of it; both routes reach the same validated execution path.
 
-* the **Agent Workflow** — describe the task in natural language and let the
-  deterministic backend resolve, plan and (on an explicit click) run it;
-* the **Protocol Workflow** — the numbered manual route a reviewer follows
-  without any LLM (Route B in `CLAUDE.md` §1).
-
-The agent is an alternative entry point, not step 3 of 4: numbering it
-inside the sequence made it look like a mandatory stage of the manual
-route, which it is not. Both routes reach the same validated execution
-path.
+Label convention: the Agent Workflow entry is written exactly
+``Agent Workflow`` — no emoji, no caret, no numbering — wherever it appears
+(Home, sidebar, page heading, navigation buttons). Decorative prefixes on
+that entry carried no information and made the same destination read as
+three different things.
 """
 
 from __future__ import annotations
@@ -31,7 +31,8 @@ NAV_STEPS = [
     {
         "key": "agent_workflow",
         "label": "Agent Workflow",
-        "emoji": "🤖",
+        # Deliberately empty: this entry carries no emoji anywhere.
+        "emoji": "",
         "description": "Describe a task in plain language; the backend resolves, plans and runs it on an explicit click",
         "group": "agent",
     },
@@ -110,14 +111,31 @@ def llm_status_badge() -> tuple[str, str]:
     return "Configured / Not tested", "#b7791f"
 
 
+def nav_label(step: dict) -> str:
+    """The label for one navigation entry.
+
+    A step with no emoji gets none: the Agent Workflow entry is exactly
+    ``Agent Workflow``. Numbered protocol steps keep their number, because
+    the number is information — it is the order a reviewer follows.
+    """
+    parts = []
+    if step.get("step_no") is not None:
+        parts.append(f"{step['step_no']}.")
+    if step.get("emoji"):
+        parts.append(str(step["emoji"]))
+    parts.append(str(step["label"]))
+    return " ".join(parts)
+
+
 def _nav_button(step: dict, current_step: str) -> None:
-    """One sidebar entry: the current step is text, the others are buttons."""
-    if step["group"] == "workflow":
-        label = f"{step['step_no']}. {step['emoji']} {step['label']}"
-    else:
-        label = f"{step['emoji']} {step['label']}"
+    """One sidebar entry: the current step is text, the others are buttons.
+
+    The current entry is marked by weight alone. A caret prefix decorated
+    the label without saying anything the bold text did not.
+    """
+    label = nav_label(step)
     if current_step == step["key"]:
-        st.markdown(f"**▶ {label}**")
+        st.markdown(f"**{label}**")
         st.caption(step["description"])
     else:
         if st.button(label, key=f"sidebar_go_{step['key']}", use_container_width=True):
@@ -136,8 +154,6 @@ def render_sidebar_workflow():
         _nav_button(NAV_STEPS[0], st.session_state.get("current_step", "home"))
 
         st.divider()
-        st.markdown("**Intelligent entry point**")
-        st.caption("An alternative to the numbered route below — not a step in it.")
         current_step = st.session_state.get("current_step", "home")
         for step in AGENT_STEPS:
             _nav_button(step, current_step)

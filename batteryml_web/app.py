@@ -25,6 +25,14 @@ from batteryml_web.core.custom_uploads import (
     validate_processed_output,
 )
 from batteryml_web.core.results_reader import find_result_files, load_metrics, load_metrics_from_logs, load_predictions
+from batteryml_web.ui.feedback import (
+    EVENT_PREPROCESS_DONE,
+    EVENT_PROJECT_CREATED,
+    EVENT_QUICKSTART_READY,
+    EVENT_RUN_COMPLETED,
+    notify_success,
+    toast,
+)
 from batteryml_web.ui.llm_state import ensure_llm_state_defaults, get_llm_status, is_llm_configured, refresh_llm_status_from_config, set_llm_settings
 from batteryml_web.ui.progress_utils import get_safe_runtime_env, run_command_with_progress
 from batteryml_web.ui.workflow_sidebar import NAV_STEPS, get_current_step_index, render_sidebar_workflow, set_current_step
@@ -343,28 +351,25 @@ def render_bottom_step_navigation():
 
 
 def _render_project_created_notice() -> None:
-    """Show the success state for the project just created, if any.
+    """Report the project just created: a toast, plus where it landed.
 
-    Reads what ``_ensure_project`` actually created; it never reports a
-    project that was not written to disk.
+    Success is transient (``ui/feedback.py``): the confirmation is a toast,
+    not a green box that outlives the action. The project name and workspace
+    stay on the page as plain text, because they are information the user
+    goes on to need, not a status message.
     """
     notice = st.session_state.get("project_created_notice")
     if not isinstance(notice, dict):
         return
-    st.success("✅ Project created successfully")
+    notify_success(
+        f"Project '{notice.get('name')}' created",
+        event_key=EVENT_PROJECT_CREATED,
+        signature=notice.get("workspace"),
+    )
+    st.caption("Created project")
     st.write(f"**Project:** {notice.get('name')}")
     st.write("**Workspace:**")
     st.code(str(notice.get("workspace")), language="text")
-
-
-def _toast(message: str, icon: str | None = None) -> None:
-    """st.toast where the installed Streamlit has it; a no-op otherwise."""
-    toast = getattr(st, "toast", None)
-    if callable(toast):
-        try:
-            toast(message, icon=icon) if icon else toast(message)
-        except TypeError:
-            toast(message)
 
 
 def render_home_agent_entry() -> None:
@@ -376,7 +381,7 @@ def render_home_agent_entry() -> None:
     Workflow page against the existing backend. Pressing this button never
     executes anything; execution still needs the explicit Run there.
     """
-    st.subheader("🤖 Agent Workflow", anchor=False)
+    st.subheader("Agent Workflow", anchor=False)
     st.caption(
         "Describe the task in plain language. The deterministic backend resolves "
         "the dataset, task and model, checks readiness and builds a plan; nothing "
@@ -468,7 +473,6 @@ def render_home_page():
                 "name": created.name,
                 "workspace": created.as_posix(),
             }
-            _toast(f"Project '{created.name}' created", icon="✅")
             st.rerun()
         _render_project_created_notice()
 
@@ -500,11 +504,21 @@ def render_home_page():
         st.text_input("Model", key="llm_model")
         connected = is_llm_configured()
         st.caption(f"Status: {'Connected' if connected else 'Not connected'}")
-        if st.button("Test connection", key="home_llm_test", use_container_width=True):
-            st.success("LLM assistant is connected." if connected else "LLM assistant is not connected.")
+        if st.button("Check settings", key="home_llm_test", use_container_width=True):
+            # This checks that the three fields are filled; it does not call the
+            # endpoint. Reporting "not connected" in a green success box said the
+            # opposite of what it meant.
+            if connected:
+                toast("LLM settings are complete", icon="✅")
+            else:
+                st.warning(
+                    "LLM assistant is not configured: Base URL, API key and model "
+                    "are all required. The platform runs the full deterministic "
+                    "workflow without them."
+                )
 
     st.markdown("---")
-    st.subheader("⚡ Quick Start", anchor=False)
+    st.subheader("Quick Start", anchor=False)
     st.info("Run a built-in MATR RUL example to verify the full local BatteryML workflow: dataset → processed files → config → model run → metrics/results.")
     raw_path = Path("data/raw/MATR")
     processed_path = Path("data/processed/MATR")
@@ -547,7 +561,9 @@ def render_home_page():
             st.session_state["selected_model"] = "XGBoost"
             st.session_state["selected_config"] = str(QUICKSTART_CONFIG)
             st.session_state["selected_device"] = "cpu"
-            st.success("MATR demo loaded into the workspace settings.")
+            st.session_state["quickstart_loaded_serial"] = (
+                int(st.session_state.get("quickstart_loaded_serial", 0)) + 1
+            )
     with q2:
         if st.button("Run MATR Demo", use_container_width=True, key="home_run_matr_demo", disabled=not preflight_ok):
             workspace_root = project_root or Path("runs/web_projects/default")
@@ -586,8 +602,22 @@ def render_home_page():
             st.session_state["project_root"] = str(workspace_root)
             st.session_state["workspace_dir"] = str(workspace_dir)
             st.session_state["last_run_code"] = result["return_code"]
+            if result["success"]:
+                notify_success(
+                    "Quick-start run completed",
+                    event_key=EVENT_RUN_COMPLETED,
+                    signature=["quickstart", str(workspace_dir), result["return_code"]],
+                )
             st.session_state["current_step"] = "review_results"
             st.rerun()
+
+    quickstart_serial = st.session_state.get("quickstart_loaded_serial")
+    if quickstart_serial:
+        notify_success(
+            "MATR quick-start demo loaded into the workspace settings",
+            event_key=EVENT_QUICKSTART_READY,
+            signature=quickstart_serial,
+        )
 
     st.markdown("---")
     render_home_agent_entry()
@@ -1011,7 +1041,17 @@ def render_prepare_data_page():
                     (uploads_dir / "preprocess_report.json").write_text(json.dumps({"train": report}, indent=2, ensure_ascii=False), encoding="utf-8")
                     (uploads_dir / "preprocess_train.log").write_text((report["stdout"] or "") + "\n" + (report["stderr"] or ""), encoding="utf-8")
                     st.session_state["custom_train_preprocess_report"] = report
-                    st.success("Training split preprocessing finished." if report["success"] else "Training split preprocessing failed.")
+                    if report["success"]:
+                        notify_success(
+                            "Training split preprocessing finished",
+                            event_key=EVENT_PREPROCESS_DONE,
+                            signature=["train", str(project_dir / "processed" / "train")],
+                        )
+                    else:
+                        st.error(
+                            "Training split preprocessing failed; see the report and log "
+                            f"written under {uploads_dir}."
+                        )
         with c2:
             if st.button("Preprocess validation/test split", use_container_width=True, key="custom_preprocess_valid"):
                 if not collect_raw_files(valid_dir):
@@ -1026,7 +1066,17 @@ def render_prepare_data_page():
                     report_path.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
                     (uploads_dir / "preprocess_valid.log").write_text((report["stdout"] or "") + "\n" + (report["stderr"] or ""), encoding="utf-8")
                     st.session_state["custom_valid_preprocess_report"] = report
-                    st.success("Validation/test split preprocessing finished." if report["success"] else "Validation/test split preprocessing failed.")
+                    if report["success"]:
+                        notify_success(
+                            "Validation/test split preprocessing finished",
+                            event_key=EVENT_PREPROCESS_DONE,
+                            signature=["valid", str(project_dir / "processed" / "valid")],
+                        )
+                    else:
+                        st.error(
+                            "Validation/test split preprocessing failed; see the report and log "
+                            f"written under {uploads_dir}."
+                        )
         with c3:
             if st.button("Validate processed outputs", use_container_width=True, key="custom_validate_outputs"):
                 train_result = validate_processed_output(project_dir / "processed" / "train")
@@ -1428,7 +1478,11 @@ def render_run_model_page():
                 st.session_state["last_run_command"] = " ".join(command)
                 _collect_run_outputs(_project_root() or Path("runs/web_projects/default"), Path(config_path), Path(result["log_path"]), workspace_dir)
                 if result["success"]:
-                    st.success("Run completed successfully.")
+                    notify_success(
+                        "Run completed",
+                        event_key=EVENT_RUN_COMPLETED,
+                        signature=["run_model", str(workspace_dir), result["return_code"]],
+                    )
                     if st.button("Review Results →", use_container_width=True, key="run_go_results_after_run"):
                         set_current_step("review_results")
         render_run_model_llm_output_panel("run_model_command_llm_output", "Command guidance", "Command guidance", "Command assistant")

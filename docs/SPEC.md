@@ -122,13 +122,19 @@ each route is offered, not what either one does.
 | `UI-02` | Home records the request in session state and navigates; it resolves no intent, reads no readiness, builds no plan and executes nothing. The Agent Workflow page analyses the handed-over request once on arrival through the existing backend; execution still requires the explicit Run button there. | `IMPLEMENTED-STATIC` | `batteryml_web/app.py`, `batteryml_web/ui/agent_workflow.py` (`_analyze_request`) |
 | `UI-03` | Page and section headings use native Streamlit primitives with `anchor=False`, so no heading anchor, link icon or raw markup is exposed in the rendered page. | `IMPLEMENTED-STATIC` | `batteryml_web/app.py`, `batteryml_web/ui/agent_workflow.py` |
 | `UI-04` | The sidebar shows the Agent Workflow as an alternative intelligent entry point in its own block, not as a numbered step of the protocol workflow. The manual route stays numbered 1–3 and remains fully usable with no LLM. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/workflow_sidebar.py` |
-| `UI-05` | Creating a project shows an explicit success state naming the project and its workspace, drawn from the directory that was actually created. Project filesystem semantics are unchanged. | `IMPLEMENTED-STATIC` | `batteryml_web/app.py` (`_ensure_project`, `_render_project_created_notice`) |
+| `UI-05` | Creating a project confirms what was created — the project name and its workspace, drawn from the directory that was actually created — and the confirmation itself is transient (see `UI-09`). Project filesystem semantics are unchanged. | `IMPLEMENTED-STATIC` | `batteryml_web/app.py` (`_ensure_project`, `_render_project_created_notice`) |
+| `UI-06` | The Agent Workflow entry is written exactly `Agent Workflow` wherever it appears — Home, sidebar, page heading, navigation buttons. No emoji, no caret, no numbering, and no copy explaining that it is an alternative route: one destination, one name. Quick Start and Agent Workflow remain equal primary Home entries. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/workflow_sidebar.py` (`nav_label`), `batteryml_web/app.py`, `batteryml_web/ui/agent_workflow.py` |
+| `UI-07` | The request is supplied through two tabs: **Describe request** (free text) and **Examples** (clickable). Examples are built from the backend catalog and, where readiness is known, name a model that is actually runnable — no model name is written into the UI. Clicking one fills the request field and reruns; it never analyses and never executes. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/catalog.py` (`build_example_requests`), `batteryml_web/ui/agent_workflow.py` (`_render_examples`) |
+| `UI-08` | The Streamlit developer toolbar is not offered to end users: `client.toolbarMode = "viewer"` in `.streamlit/config.toml`. Configured, not scripted — no JavaScript intercepts keystrokes. | `IMPLEMENTED-STATIC` | `.streamlit/config.toml` |
+| `UI-09` | Success is transient and failure is persistent. An ordinary successful action reports through one `st.toast`, emitted once per occurrence; Streamlit reruns do not repeat it, and a signature keyed on the action's *subject* keeps a device or checkbox change from toasting. Failures stay on the page as `st.error` / `st.warning`, and a failure is never rendered in a success box. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/feedback.py` |
 
 The tests for this group are `tests/test_web_navigation.py` (source- and
 AST-level, so Home's boundary is checked without importing torch or
-Streamlit) and the handover class in `tests/test_agent_web_ui.py`. Nothing
-here may be marked `VERIFIED` from this environment: no Streamlit page has
-been rendered in it.
+Streamlit), `tests/test_ui_feedback.py`, and the handover, request-tab and
+feedback classes in `tests/test_agent_web_ui.py`. Nothing here may be marked
+`VERIFIED` from this environment: no Streamlit page has been rendered in it,
+and `UI-08` in particular can only be confirmed by looking at the running
+app's toolbar.
 
 ---
 

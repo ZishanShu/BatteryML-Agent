@@ -36,6 +36,7 @@ from batteryml_web.agent.results import SMOKE_RUN_WARNING  # noqa: E402
 from batteryml_web.agent.run_policy import SMOKE_NOTICE  # noqa: E402
 from batteryml_web.core import device_inventory as di  # noqa: E402
 from batteryml_web.ui import agent_workflow as ui  # noqa: E402
+from batteryml_web.ui import feedback as ui_feedback  # noqa: E402
 
 #: A fixed two-GPU inventory. Seeded into session state by every render test
 #: so the UI never shells out to nvidia-smi during the suite and the device
@@ -125,6 +126,8 @@ class FakeStreamlit:
             "buttons": [],
             "selectboxes": [],
             "progress": [],
+            "tabs": [],
+            "toasts": [],
         }
 
     # --- text/display -------------------------------------------------
@@ -180,6 +183,13 @@ class FakeStreamlit:
         return clicked
 
     # --- containers ------------------------------------------------------
+    def tabs(self, labels, **kwargs):
+        self.rec["tabs"].append([str(label) for label in labels])
+        return [_Ctx() for _ in labels]
+
+    def toast(self, message, **kwargs):
+        self.rec["toasts"].append(str(message))
+
     def expander(self, label, **kwargs):
         return _Ctx()
 
@@ -196,6 +206,13 @@ class FakeStreamlit:
     def rerun(self):
         raise _Rerun()
 
+
+#: Example requests as the backend would build them for this stub catalog.
+_FAKE_EXAMPLES = (
+    "Use CPTransformer on MATR to predict battery lifetime.",
+    "Recommend a model to predict battery lifetime on MATR.",
+    "帮我用 MATR 做电池寿命预测",
+)
 
 #: A catalog stub large enough for the model-request resolution the UI does.
 _FAKE_CATALOG = {
@@ -338,15 +355,36 @@ def _render(
     checkboxes: dict[str, bool] | None = None,
 ) -> FakeStreamlit:
     fake = FakeStreamlit(session, clicked, checkboxes)
-    original_st = ui.st
-    ui.st = fake
-    try:
-        ui.render_agent_workflow()
-    except _Rerun:
-        pass
-    finally:
-        ui.st = original_st
+    with _fake_streamlit(fake):
+        try:
+            ui.render_agent_workflow()
+        except _Rerun:
+            pass
     return fake
+
+
+class _fake_streamlit:
+    """Point both the UI module and the feedback helper at the fake.
+
+    ``ui/feedback.py`` reads ``st.session_state`` to deduplicate toasts, and
+    that call needs a Streamlit script context. Swapping its module-level
+    ``st`` for the same fake keeps these tests free of a runtime.
+    """
+
+    def __init__(self, fake: FakeStreamlit):
+        self._fake = fake
+        self._saved: list = []
+
+    def __enter__(self):
+        for module in (ui, ui_feedback):
+            self._saved.append((module, module.st))
+            module.st = self._fake
+        return self._fake
+
+    def __exit__(self, *exc_info):
+        for module, original in self._saved:
+            module.st = original
+        return False
 
 
 class TestPureBoundaryHelpers(unittest.TestCase):
@@ -964,9 +1002,7 @@ class TestLlmAssistedIntentInTheUi(unittest.TestCase):
 
     def test_offline_shortfall_is_stated_plainly(self) -> None:
         fake = FakeStreamlit({})
-        original = ui.st
-        ui.st = fake
-        try:
+        with _fake_streamlit(fake):
             ui._render_intent(
                 {
                     "source": "deterministic_fallback",
@@ -978,16 +1014,12 @@ class TestLlmAssistedIntentInTheUi(unittest.TestCase):
                     "clarification_question": None,
                 }
             )
-        finally:
-            ui.st = original
         joined = " ".join(fake.rec["captions"])
         self.assertIn("advanced natural-language understanding is unavailable", joined)
 
     def test_rejected_values_are_shown_not_hidden(self) -> None:
         fake = FakeStreamlit({})
-        original = ui.st
-        ui.st = fake
-        try:
+        with _fake_streamlit(fake):
             ui._render_intent(
                 {
                     "source": "llm",
@@ -1002,8 +1034,6 @@ class TestLlmAssistedIntentInTheUi(unittest.TestCase):
                     "clarification_question": "Which dataset should I use?",
                 }
             )
-        finally:
-            ui.st = original
         self.assertIn("MATR has validated RUL configs.", " ".join(fake.rec["writes"]))
         self.assertIn("Backend-owned field(s) discarded.", " ".join(fake.rec["warnings"]))
         self.assertIn("config_path", " ".join(fake.rec["writes"]))
@@ -1011,9 +1041,7 @@ class TestLlmAssistedIntentInTheUi(unittest.TestCase):
 
     def test_blocked_model_is_reported_and_not_substituted(self) -> None:
         fake = FakeStreamlit({})
-        original = ui.st
-        ui.st = fake
-        try:
+        with _fake_streamlit(fake):
             ui._render_model_request(
                 {
                     "requested": "PBT",
@@ -1025,8 +1053,6 @@ class TestLlmAssistedIntentInTheUi(unittest.TestCase):
                     "requires_confirmation": True,
                 }
             )
-        finally:
-            ui.st = original
         self.assertIn("NEEDS_ASSETS", " ".join(fake.rec["warnings"]))
         joined = " ".join(fake.rec["writes"])
         self.assertIn("cptransformer", joined)
@@ -1034,28 +1060,20 @@ class TestLlmAssistedIntentInTheUi(unittest.TestCase):
 
     def test_runnable_request_renders_no_warning(self) -> None:
         fake = FakeStreamlit({})
-        original = ui.st
-        ui.st = fake
-        try:
+        with _fake_streamlit(fake):
             ui._render_model_request(
                 {"requested": "batlinet", "status": "runnable", "model_key": "batlinet",
                  "model_display": "BatLiNet", "reason": "", "alternatives": [],
                  "requires_confirmation": False}
             )
-        finally:
-            ui.st = original
         self.assertEqual(fake.rec["warnings"], [])
 
     def test_blocked_suggestions_are_never_offered_as_runnable(self) -> None:
         fake = FakeStreamlit({})
-        original = ui.st
-        ui.st = fake
-        try:
+        with _fake_streamlit(fake):
             ui._render_suggestions(
                 {"runnable": ["cptransformer"], "blocked": ["PBT"], "unknown": ["MegaNet"]}
             )
-        finally:
-            ui.st = original
         joined = " ".join(fake.rec["writes"])
         self.assertIn("runnable now:** cptransformer", joined)
         self.assertIn("blocked:** PBT", joined)
@@ -1091,12 +1109,10 @@ class TestLlmAssistedIntentInTheUi(unittest.TestCase):
 
         session: dict = {}
         fake = FakeStreamlit(session)
-        original = ui.st
-        ui.st = fake
         try:
-            ui._analyze_request("Use PBT on MATR to predict battery lifetime.")
+            with _fake_streamlit(fake):
+                ui._analyze_request("Use PBT on MATR to predict battery lifetime.")
         finally:
-            ui.st = original
             ui.resolve_workflow_intent_with_llm = real_resolve
             ui.build_agent_workflow_context = real_context
             ui.build_intent_catalog = real_catalog
@@ -1110,6 +1126,90 @@ class TestLlmAssistedIntentInTheUi(unittest.TestCase):
         self.assertNotIn("agent_selected_model", session)
         self.assertEqual(session["agent_suggestions"]["runnable"], ["cptransformer"])
         self.assertEqual(session["agent_suggestions"]["blocked"], ["PBT"])
+
+
+class TestRequestTabsAndExamples(unittest.TestCase):
+    """B: two ways to supply a request; examples fill the box and stop there."""
+
+    def setUp(self) -> None:
+        self._real_resolve = ui.resolve_workflow_intent_with_llm
+        self._real_catalog = ui.build_intent_catalog
+        self._real_examples = ui.build_example_requests
+        self._real_stream = ui.execute_plan_streaming
+        self._real_llm = ui.is_llm_configured
+        self.analysed: list[str] = []
+        self.executed: list = []
+
+        def stub_resolve(request, **kwargs):
+            self.analysed.append(request)
+            raise AssertionError("clicking an example must not analyse")
+
+        def stub_stream(plan, **kwargs):
+            self.executed.append(plan)
+            raise AssertionError("clicking an example must not execute")
+
+        ui.resolve_workflow_intent_with_llm = stub_resolve
+        ui.execute_plan_streaming = stub_stream
+        ui.build_intent_catalog = lambda **kw: _FAKE_CATALOG
+        ui.build_example_requests = lambda catalog, **kw: list(_FAKE_EXAMPLES)
+        ui.is_llm_configured = lambda: False
+
+    def tearDown(self) -> None:
+        ui.resolve_workflow_intent_with_llm = self._real_resolve
+        ui.build_intent_catalog = self._real_catalog
+        ui.build_example_requests = self._real_examples
+        ui.execute_plan_streaming = self._real_stream
+        ui.is_llm_configured = self._real_llm
+
+    def test_the_two_tabs_are_rendered_in_order(self) -> None:
+        fake = _render({"gpu_inventory": _FAKE_GPU_INVENTORY})
+        self.assertIn(["Describe request", "Examples"], fake.rec["tabs"])
+        self.assertEqual(ui.REQUEST_TABS, ("Describe request", "Examples"))
+
+    def test_examples_are_offered_as_buttons(self) -> None:
+        fake = _render({"gpu_inventory": _FAKE_GPU_INVENTORY})
+        labels = [button["label"] for button in fake.rec["buttons"]]
+        for example in _FAKE_EXAMPLES:
+            self.assertIn(example, labels)
+
+    def test_clicking_an_example_fills_the_box_and_does_nothing_else(self) -> None:
+        session = {"gpu_inventory": _FAKE_GPU_INVENTORY, "agent_request_input": "stale text"}
+        chosen = _FAKE_EXAMPLES[0]
+        _render(session, clicked={chosen})
+        # Written into the same field the Describe request tab reads...
+        self.assertEqual(session["agent_original_request"], chosen)
+        # ...the stale widget value is cleared so the box shows it...
+        self.assertNotIn("agent_request_input", session)
+        # ...and nothing was analysed or executed.
+        self.assertEqual(self.analysed, [])
+        self.assertEqual(self.executed, [])
+        self.assertNotIn("agent_workflow_context", session)
+
+    def test_examples_are_computed_once_and_cached(self) -> None:
+        calls: list = []
+
+        def counting(catalog, **kwargs):
+            calls.append(kwargs)
+            return list(_FAKE_EXAMPLES)
+
+        ui.build_example_requests = counting
+        session = {"gpu_inventory": _FAKE_GPU_INVENTORY}
+        _render(session)
+        _render(session)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(session["agent_example_requests"], list(_FAKE_EXAMPLES))
+
+    def test_an_empty_catalog_offers_no_example_rather_than_a_fake_one(self) -> None:
+        ui.build_example_requests = lambda catalog, **kw: []
+        fake = _render({"gpu_inventory": _FAKE_GPU_INVENTORY})
+        self.assertTrue(any("No example can be offered" in text for text in fake.rec["infos"]))
+
+    def test_no_model_name_is_written_into_the_example_ui(self) -> None:
+        """The examples come from the backend; the page names no model."""
+        source = Path(ui.__file__).read_text(encoding="utf-8")
+        render_examples = source.split("def _render_examples")[1].split("\ndef ")[0]
+        for name in ("CPTransformer", "BatLiNet", "XGBoost", "PBT", "MATR"):
+            self.assertNotIn(name, render_examples)
 
 
 class TestNoFrontendDuplication(unittest.TestCase):

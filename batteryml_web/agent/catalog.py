@@ -27,7 +27,7 @@ No Streamlit, no network, no subprocess.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from ..core.readiness import (
     EXTERNAL_MODELS,
@@ -313,3 +313,113 @@ def closest_model_keys(
         if key not in ordered:
             ordered.append(key)
     return ordered[:limit]
+
+
+#: Example workflow requests, as templates over real catalog identifiers.
+#: Kept as templates rather than literal strings so the examples name a
+#: dataset and a model this installation actually has: a hardcoded example
+#: naming a model that was never registered teaches the user a request the
+#: platform will refuse.
+EXAMPLE_REQUEST_TEMPLATES: tuple[str, ...] = (
+    "Use {model} on {dataset} to predict battery lifetime.",
+    "Recommend a model to predict battery lifetime on {dataset}.",
+    "Forecast degradation trajectory for {dataset}.",
+    "帮我用 {dataset} 做电池寿命预测",
+    "{dataset} 上用 {model} 做寿命预测",
+)
+
+
+def _short_display(model_display: str, model_key: str) -> str:
+    """The name a user would type: "CPTransformer", not the full subtitle.
+
+    Display names are written "<name> — <expansion>"; the part before the
+    dash is the name. Falls back to the canonical key when there is no dash.
+    """
+    text = str(model_display or "").strip()
+    if not text:
+        return str(model_key)
+    return text.split("—")[0].strip() or str(model_key)
+
+
+def example_dataset(catalog: Dict[str, Any]) -> Optional[str]:
+    """The dataset the examples should name: a READY one, else one with configs.
+
+    Chosen from the catalog, never hardcoded, so the examples follow the
+    installation. Returns None when the catalog carries no dataset at all.
+    """
+    datasets = catalog.get("datasets", [])
+    if not datasets:
+        return None
+    with_configs = {
+        name
+        for entry in catalog.get("models", [])
+        for name in entry.get("datasets", [])
+    }
+    ready = [e for e in datasets if e.get("status") == "READY" and e.get("dataset") in with_configs]
+    if ready:
+        return str(ready[0].get("dataset"))
+    configured = [e for e in datasets if e.get("dataset") in with_configs]
+    if configured:
+        return str(configured[0].get("dataset"))
+    return str(datasets[0].get("dataset"))
+
+
+def example_model(
+    catalog: Dict[str, Any],
+    dataset: Optional[str],
+    *,
+    runnable_keys: Optional[Sequence[str]] = None,
+) -> Optional[str]:
+    """A model name to put in the examples: one with a config for ``dataset``.
+
+    Args:
+        catalog: the canonical menu.
+        dataset: the dataset the example will name.
+        runnable_keys: canonical keys the readiness layer currently reports
+            as runnable for that dataset. When given, one of those is
+            preferred, so the example is a request that would actually
+            succeed rather than one the platform would refuse.
+
+    Prefers a non-external model, because an external runner is not what a
+    "Use <model> on <dataset>" request resolves to. Returns None when no
+    model in the catalog covers the dataset. No model name is written here:
+    the choice comes from the catalog and from readiness.
+    """
+    candidates = [
+        entry
+        for entry in catalog.get("models", [])
+        if not entry.get("external")
+        and (dataset is None or dataset in entry.get("datasets", []))
+    ]
+    if not candidates:
+        return None
+    if runnable_keys:
+        preferred = [
+            entry for entry in candidates if str(entry.get("model_key")) in set(runnable_keys)
+        ]
+        candidates = preferred or candidates
+    return _short_display(candidates[0].get("model_display"), candidates[0].get("model_key"))
+
+
+def build_example_requests(
+    catalog: Dict[str, Any],
+    *,
+    runnable_keys: Optional[Sequence[str]] = None,
+) -> List[str]:
+    """Clickable example requests, filled from this installation's catalog.
+
+    Templates that need a model are dropped when the catalog offers none, so
+    an example never names something that does not exist. The returned
+    strings are plain requests: they are written into the request box and
+    resolved by the ordinary backend path, never executed.
+    """
+    dataset = example_dataset(catalog)
+    if not dataset:
+        return []
+    model = example_model(catalog, dataset, runnable_keys=runnable_keys)
+    examples: List[str] = []
+    for template in EXAMPLE_REQUEST_TEMPLATES:
+        if "{model}" in template and not model:
+            continue
+        examples.append(template.format(dataset=dataset, model=model or ""))
+    return examples

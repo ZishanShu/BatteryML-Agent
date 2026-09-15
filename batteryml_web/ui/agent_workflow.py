@@ -31,7 +31,7 @@ from typing import Any
 
 import streamlit as st
 
-from ..agent.catalog import build_intent_catalog
+from ..agent.catalog import build_example_requests, build_intent_catalog
 from ..agent.execution import build_execution_plan
 from ..agent.llm_intent import (
     filter_suggestions,
@@ -61,12 +61,26 @@ from ..core.device_inventory import (
     inventory_rows,
     query_gpu_inventory,
 )
+from .feedback import (
+    EVENT_EXPLANATION_READY,
+    EVENT_PLAN_READY,
+    EVENT_REQUEST_ANALYZED,
+    EVENT_RESULT_LOADED,
+    EVENT_RUN_COMPLETED,
+    notify_success,
+    plan_signature,
+)
 from .llm_state import is_llm_configured
 from .progress_utils import get_safe_runtime_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 RUN_BUTTON_LABEL = "Run"
+#: The two ways to supply a request. Ordered as rendered.
+REQUEST_TABS: tuple[str, str] = ("Describe request", "Examples")
+#: Placeholder for the request box. A template-free sentence: the clickable
+#: examples, which do name a model, are built from the backend catalog.
+REQUEST_PLACEHOLDER = "Use CPTransformer on MATR to predict battery lifetime."
 #: Exact wording milestone A requires wherever a smoke run is offered or shown.
 SMOKE_CHECKBOX_LABEL = SMOKE_NOTICE
 #: Raw stdout/stderr are display tails only; metrics never come from them.
@@ -658,6 +672,11 @@ def _analyze_request(trimmed: str) -> None:
         "agent_suggestions",
         filter_suggestions(list(resolution.get("suggested_model_keys") or []), context),
     )
+    notify_success(
+        f"Request resolved: {context.get('dataset')} · {context.get('task')}",
+        event_key=EVENT_REQUEST_ANALYZED,
+        signature=[trimmed, context.get("dataset"), context.get("task")],
+    )
 
     if not is_llm_configured():
         return
@@ -673,9 +692,56 @@ def _analyze_request(trimmed: str) -> None:
         st.session_state["agent_explanation"] = f"LLM guidance failed: {exc}"
 
 
+def _example_requests() -> list[str]:
+    """Example requests for this installation, computed once per session.
+
+    Built from the backend catalog and, where a workflow context has already
+    been loaded, from the models readiness currently reports as runnable —
+    so an example names a dataset and a model that really exist here. No
+    model name is written into the UI.
+    """
+    cached = st.session_state.get("agent_example_requests")
+    if isinstance(cached, list):
+        return [str(item) for item in cached]
+    context = st.session_state.get("agent_workflow_context")
+    runnable = (
+        runnable_model_keys(context) if isinstance(context, dict) else None
+    )
+    examples = build_example_requests(build_intent_catalog(), runnable_keys=runnable)
+    st.session_state["agent_example_requests"] = list(examples)
+    return list(examples)
+
+
+def _render_examples() -> None:
+    """Clickable examples that fill the request box and stop there.
+
+    Clicking writes the example into the same session-state field the
+    Describe request tab reads, and reruns so the text box shows it. It does
+    not analyse and it does not execute: both remain explicit actions.
+    """
+    st.caption(
+        "Pick one to fill the request box. Nothing is analysed or run until you "
+        "press Analyze."
+    )
+    examples = _example_requests()
+    if not examples:
+        st.info(
+            "No example can be offered: the config registry declares no dataset "
+            "this platform could run a workflow on."
+        )
+        return
+    for index, example in enumerate(examples):
+        if st.button(example, key=f"agent_example_{index}", use_container_width=True):
+            st.session_state["agent_original_request"] = example
+            # The text box is a keyed widget: clearing its stored value lets
+            # the freshly chosen example become its content on the rerun.
+            st.session_state.pop("agent_request_input", None)
+            st.rerun()
+
+
 def render_agent_workflow() -> None:
     """Analyze -> select -> plan -> explicit Run -> structured result -> explain."""
-    st.header("🤖 Agent Workflow", anchor=False)
+    st.header("Agent Workflow", anchor=False)
     st.caption(
         "A natural-language request is resolved by the deterministic backend workflow; "
         "readiness, validation and metrics are authoritative. The optional LLM agent "
@@ -689,19 +755,23 @@ def render_agent_workflow() -> None:
     if isinstance(pending, str) and pending.strip():
         _analyze_request(pending.strip())
 
-    request = st.text_area(
-        "Workflow request",
-        value=st.session_state.get("agent_original_request", ""),
-        placeholder="Use CPTransformer on MATR to predict battery lifetime.",
-        key="agent_request_input",
-        height=90,
-    )
-    if st.button("Analyze", key="agent_analyze", use_container_width=True):
-        if not str(request or "").strip():
-            st.error("Enter a workflow request before analyzing.")
-        else:
-            _analyze_request(str(request).strip())
-            st.rerun()
+    describe_tab, examples_tab = st.tabs(list(REQUEST_TABS))
+    with describe_tab:
+        request = st.text_area(
+            "Workflow request",
+            value=st.session_state.get("agent_original_request", ""),
+            placeholder=REQUEST_PLACEHOLDER,
+            key="agent_request_input",
+            height=90,
+        )
+        if st.button("Analyze", key="agent_analyze", use_container_width=True):
+            if not str(request or "").strip():
+                st.error("Enter a workflow request before analyzing.")
+            else:
+                _analyze_request(str(request).strip())
+                st.rerun()
+    with examples_tab:
+        _render_examples()
 
     context = st.session_state.get("agent_workflow_context")
     if not isinstance(context, dict):
@@ -780,6 +850,14 @@ def render_agent_workflow() -> None:
             epochs=smoke_epochs_value(smoke),
         )
         _store_json_state("agent_execution_plan", plan)
+        if run_is_enabled(plan):
+            # Keyed on the plan's subject, not on the device or the smoke box,
+            # so fiddling with those does not toast (see ui/feedback.py).
+            notify_success(
+                f"Execution plan ready for {plan.get('model_display') or plan.get('model')}",
+                event_key=EVENT_PLAN_READY,
+                signature=plan_signature(plan),
+            )
         _render_plan(plan, device=str(device), seed=seed)
     else:
         st.info(
@@ -833,9 +911,28 @@ def render_agent_workflow() -> None:
             _store_json_state("agent_execution_result", _compact_execution_output(result))
             _store_json_state("agent_result_context", result_context)
             st.session_state["agent_run_signature"] = current_signature
+            # A repeat of the identical plan is still a new run worth
+            # reporting, so the feedback signature carries a serial.
+            st.session_state["agent_run_serial"] = (
+                int(st.session_state.get("agent_run_serial", 0)) + 1
+            )
             st.session_state["last_run_status"] = "success" if result.get("success") else "failed"
             st.session_state["last_run_code"] = result.get("returncode")
             st.rerun()
+
+    serial = st.session_state.get("agent_run_serial", 0)
+    if isinstance(execution_result, dict) and execution_result.get("success"):
+        notify_success(
+            "Run completed",
+            event_key=EVENT_RUN_COMPLETED,
+            signature=[serial, execution_result.get("workspace"), execution_result.get("returncode")],
+        )
+    if isinstance(result_context, dict) and result_context.get("success"):
+        notify_success(
+            "Results loaded from the run workspace",
+            event_key=EVENT_RESULT_LOADED,
+            signature=[serial, result_context.get("workspace")],
+        )
 
     if isinstance(execution_result, dict):
         _render_execution_status(
@@ -864,11 +961,21 @@ def render_agent_workflow() -> None:
                     model=st.session_state["llm_model"],
                 )
                 st.session_state["agent_explanation"] = explanation_text(parsed)
+                st.session_state["agent_explanation_serial"] = (
+                    int(st.session_state.get("agent_explanation_serial", 0)) + 1
+                )
             except Exception as exc:
                 st.session_state["agent_explanation"] = f"LLM explanation failed: {exc}"
             st.rerun()
 
     if st.session_state.get("agent_explanation") and isinstance(context, dict):
+        explanation_serial = st.session_state.get("agent_explanation_serial")
+        if explanation_serial:
+            notify_success(
+                "Result explanation ready",
+                event_key=EVENT_EXPLANATION_READY,
+                signature=explanation_serial,
+            )
         with st.expander("Agent explanation", expanded=True):
             st.caption("Explanation only — never a source of metrics or execution.")
             st.write(st.session_state["agent_explanation"])

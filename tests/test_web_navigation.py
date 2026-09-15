@@ -81,8 +81,8 @@ class TestHomeAgentEntry(unittest.TestCase):
         entry = _function(self.tree, "render_home_agent_entry")
         home_body = ast.get_source_segment(self.source, home)
         entry_body = ast.get_source_segment(self.source, entry)
-        self.assertIn('st.subheader("⚡ Quick Start", anchor=False)', home_body)
-        self.assertIn('st.subheader("🤖 Agent Workflow", anchor=False)', entry_body)
+        self.assertIn('st.subheader("Quick Start", anchor=False)', home_body)
+        self.assertIn('st.subheader("Agent Workflow", anchor=False)', entry_body)
         self.assertIn("render_home_agent_entry()", home_body)
 
     def test_home_records_the_request_and_navigates(self) -> None:
@@ -133,16 +133,64 @@ class TestHomeAgentEntry(unittest.TestCase):
         )
 
 
+class TestAgentLabelsAreUndecorated(unittest.TestCase):
+    """A: one name for one destination, everywhere it appears."""
+
+    def setUp(self) -> None:
+        self.sources = {
+            path.as_posix(): path.read_text(encoding="utf-8")
+            for path in (
+                APP_PATH,
+                SIDEBAR_PATH,
+                REPO_ROOT / "batteryml_web" / "ui" / "agent_workflow.py",
+            )
+        }
+
+    def test_the_explanatory_copy_is_gone(self) -> None:
+        for name, source in self.sources.items():
+            self.assertNotIn("Intelligent entry point", source, name)
+            self.assertNotIn("not a step in it", source, name)
+            self.assertNotIn("An alternative to the numbered route", source, name)
+
+    def test_no_decorated_agent_label_remains(self) -> None:
+        for name, source in self.sources.items():
+            for decorated in (
+                "🤖 Agent Workflow",
+                "▶ 🤖",
+                "▶ Agent Workflow",
+            ):
+                self.assertNotIn(decorated, source, f"{name} still decorates the label")
+
+    def test_no_caret_prefix_survives_in_navigation(self) -> None:
+        self.assertNotIn("▶", self.sources[SIDEBAR_PATH.as_posix()])
+
+    def test_the_label_appears_plainly_in_each_surface(self) -> None:
+        self.assertIn('st.subheader("Agent Workflow", anchor=False)', self.sources[APP_PATH.as_posix()])
+        self.assertIn(
+            'st.header("Agent Workflow", anchor=False)',
+            self.sources[(REPO_ROOT / "batteryml_web" / "ui" / "agent_workflow.py").as_posix()],
+        )
+        self.assertIn('"label": "Agent Workflow"', self.sources[SIDEBAR_PATH.as_posix()])
+
+    def test_the_two_home_entries_are_styled_alike(self) -> None:
+        app = self.sources[APP_PATH.as_posix()]
+        self.assertIn('st.subheader("Quick Start", anchor=False)', app)
+        self.assertIn('st.subheader("Agent Workflow", anchor=False)', app)
+
+
 class TestProjectCreationFeedback(unittest.TestCase):
     def setUp(self) -> None:
         self.source = APP_PATH.read_text(encoding="utf-8")
         self.tree = ast.parse(self.source)
 
-    def test_success_state_reports_what_was_created(self) -> None:
+    def test_success_is_transient_and_the_facts_stay(self) -> None:
         notice = _function(self.tree, "_render_project_created_notice")
         self.assertIsNotNone(notice)
         body = ast.get_source_segment(self.source, notice)
-        self.assertIn("✅ Project created successfully", body)
+        # Transient: a toast, not a green box that outlives the action.
+        self.assertIn("notify_success", body)
+        self.assertNotIn("st.success", body)
+        # The facts the user goes on to need are still on the page.
         self.assertIn("**Project:**", body)
         self.assertIn("**Workspace:**", body)
 
@@ -189,10 +237,14 @@ class TestSidebarShape(unittest.TestCase):
             {"home", "agent_workflow", "prepare_data", "run_model", "review_results"},
         )
 
-    def test_sidebar_source_names_it_an_alternative(self) -> None:
-        source = SIDEBAR_PATH.read_text(encoding="utf-8")
-        self.assertIn("Intelligent entry point", source)
-        self.assertIn("not a step in it", source)
+    def test_nav_label_is_exactly_the_agent_workflow_name(self) -> None:
+        agent = self.sidebar.AGENT_STEPS[0]
+        self.assertEqual(self.sidebar.nav_label(agent), "Agent Workflow")
+
+    def test_numbered_steps_keep_the_number_that_carries_meaning(self) -> None:
+        labels = [self.sidebar.nav_label(step) for step in self.sidebar.WORKFLOW_STEPS]
+        self.assertTrue(labels[0].startswith("1."))
+        self.assertTrue(all("Agent Workflow" not in label for label in labels))
 
 
 if __name__ == "__main__":
