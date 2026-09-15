@@ -94,11 +94,14 @@ change what the manuscript reports.
 | `EXEC-03` | BatLiNet's smoke run defaults to and recommends CPU, with the reason stated. An explicit GPU choice is always honoured; the recommendation never selects a device on the user's behalf. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/run_policy.py` (`SMOKE_CPU_RECOMMENDED_MODELS`, `smoke_device_recommendation`) |
 | `EXEC-04` | Selectable devices are enumerated from the machine (`nvidia-smi`), never from a hardcoded GPU count, and each is shown with its observed free/total memory. Unknown memory is displayed as unknown, never as zero. When enumeration fails, an explicit GPU choice remains possible and the enumeration error is shown beside it. | `IMPLEMENTED-STATIC` | `batteryml_web/core/device_inventory.py`, `batteryml_web/ui/agent_workflow.py` (`device_options`) |
 | `EXEC-05` | A failed run is never retried — not on another GPU, not on the same one. A CUDA out-of-memory failure is named as a shared-memory condition, states the CPU-smoke and larger-GPU alternatives, quotes the run's own error line, and leaves the full stdout/stderr (traceback included) available for inspection. No metric is ever derived from a failed run. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/run_policy.py` (`classify_execution_failure`), `batteryml_web/agent/executor.py` |
+| `EXEC-06` | A run reports progress while it runs. The backend executes the same validated plan through `subprocess.Popen` (argv list, `shell=False`) and emits structured events — `stage` / `training_progress` / `output` / `completed` — on the caller's own thread. The executor stays Streamlit-independent; the page renders the events and holds no execution logic. stdout and stderr are preserved in full, carriage returns included, so a tqdm bar and a traceback both survive. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/streaming.py`, `batteryml_web/ui/agent_workflow.py` (`_LiveProgress`) |
+| `EXEC-07` | A percentage is displayed only where the run itself printed a counter. The real tqdm lines the installed models emit are recognised (`Training <Model>: …`, and the upstream `Traning: …` typo in `batteryml/models/nn_model.py`), tqdm's stderr carriage returns included. Where no counter exists, a stage name and an elapsed clock are shown and **no** bar is drawn. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/streaming.py` (`parse_progress_line`, `classify_stage`), `batteryml_web/ui/agent_workflow.py` (`progress_caption`) |
+| `EXEC-08` | Progress output is never a source of scientific truth. Metrics come only from `build_result_context`, which reads BatteryML's own saved `scores`. A failed run ends at stage `Failed` with its return code and stderr intact and no metric of any kind. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/streaming.py`, `batteryml_web/agent/results.py` |
 
-The check that establishes `EXEC-01`…`EXEC-05` is `DEV-01`
+The check that establishes `EXEC-01`…`EXEC-08` is `DEV-01`
 (`scripts/verify/check_runtime_contract.py`); the unit tests are
-`tests/test_agent_smoke.py` and the milestone-A classes in
-`tests/test_agent_web_ui.py`. None of them may be marked `VERIFIED` from this
+`tests/test_agent_smoke.py`, `tests/test_agent_streaming.py` and the
+milestone-A/B classes in `tests/test_agent_web_ui.py`. None of them may be marked `VERIFIED` from this
 environment: it has no torch, no GPU and no Streamlit, so no run has ever
 started here.
 

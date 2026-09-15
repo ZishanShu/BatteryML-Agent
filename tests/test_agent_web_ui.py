@@ -4,8 +4,8 @@ These tests never train, never launch a subprocess and never call an LLM.
 They check the contract the Streamlit layer must honour:
 
 * structured state comes only from the backend workflow APIs;
-* the Run button is the only path to ``execute_plan`` and is enabled only
-  when the backend planner says ``can_execute``;
+* the Run button is the only path to ``execute_plan_streaming`` and is
+  enabled only when the backend planner says ``can_execute``;
 * smoke mode maps only to the planner's ``epochs=1`` override;
 * blocked datasets/models never surface commands, selectable models or an
   enabled Run;
@@ -75,6 +75,31 @@ class _Col:
         self._rec["captions"].append(str(text))
 
 
+class _Slot:
+    """Stand-in for st.empty(): records whatever the live progress draws."""
+
+    def __init__(self, rec: dict):
+        self._rec = rec
+
+    def info(self, text, **kwargs):
+        self._rec["infos"].append(str(text))
+
+    def error(self, text, **kwargs):
+        self._rec["errors"].append(str(text))
+
+    def caption(self, text, **kwargs):
+        self._rec["captions"].append(str(text))
+
+    def code(self, text, **kwargs):
+        self._rec["codes"].append(str(text))
+
+    def text(self, text, **kwargs):
+        self._rec["writes"].append(str(text))
+
+    def progress(self, value=0.0, **kwargs):
+        self._rec["progress"].append(float(value))
+
+
 class FakeStreamlit:
     """Minimal stand-in for the streamlit surface the UI module uses."""
 
@@ -99,6 +124,7 @@ class FakeStreamlit:
             "metrics": [],
             "buttons": [],
             "selectboxes": [],
+            "progress": [],
         }
 
     # --- text/display -------------------------------------------------
@@ -159,6 +185,13 @@ class FakeStreamlit:
 
     def spinner(self, label, **kwargs):
         return _Ctx()
+
+    def empty(self):
+        return _Slot(self.rec)
+
+    def progress(self, value=0.0, **kwargs):
+        self.rec["progress"].append(float(value))
+        return _Slot(self.rec)
 
     def rerun(self):
         raise _Rerun()
@@ -411,7 +444,7 @@ class TestRenderBoundaries(unittest.TestCase):
         self._plan_calls: list[dict[str, Any]] = []
         self._exec_calls: list[dict] = []
         self._real_build = ui.build_execution_plan
-        self._real_execute = ui.execute_plan
+        self._real_execute = ui.execute_plan_streaming
         self._real_result_ctx = ui.build_result_context
         self._real_llm = ui.is_llm_configured
 
@@ -453,13 +486,13 @@ class TestRenderBoundaries(unittest.TestCase):
             }
 
         ui.build_execution_plan = stub_build
-        ui.execute_plan = stub_execute
+        ui.execute_plan_streaming = stub_execute
         ui.build_result_context = stub_result_context
         ui.is_llm_configured = lambda: False
 
     def tearDown(self) -> None:
         ui.build_execution_plan = self._real_build
-        ui.execute_plan = self._real_execute
+        ui.execute_plan_streaming = self._real_execute
         ui.build_result_context = self._real_result_ctx
         ui.is_llm_configured = self._real_llm
 
@@ -528,7 +561,7 @@ class TestRenderBoundaries(unittest.TestCase):
         self.assertEqual(self._plan_calls, [])
 
     def test_failed_execution_displays_no_metrics(self) -> None:
-        ui.execute_plan = lambda plan, **kw: {
+        ui.execute_plan_streaming = lambda plan, **kw: {
             "started": True,
             "completed": True,
             "success": False,
@@ -543,7 +576,7 @@ class TestRenderBoundaries(unittest.TestCase):
         }
         session = self._session(_MATR_CONTEXT)
         fake = _render(session, clicked={"Run"})
-        self.assertEqual(self._exec_calls, [])  # execute_plan stub replaced above
+        self.assertEqual(self._exec_calls, [])  # streaming stub replaced above
         rendered = session.get("agent_result_context")
         self.assertIsNone(rendered)  # failure never fabricates a result context
         self.assertFalse(any(label in {"RMSE", "MAE", "MAPE"} for label, _ in fake.rec["metrics"]))
@@ -629,7 +662,7 @@ class TestBatLiNetSmokeRender(unittest.TestCase):
         self._plan_calls: list[dict[str, Any]] = []
         self._exec_calls: list[dict] = []
         self._real_build = ui.build_execution_plan
-        self._real_execute = ui.execute_plan
+        self._real_execute = ui.execute_plan_streaming
         self._real_llm = ui.is_llm_configured
 
         def stub_build(dataset, task, model, **kwargs):
@@ -641,12 +674,12 @@ class TestBatLiNetSmokeRender(unittest.TestCase):
             raise AssertionError("render must not execute without an explicit Run click")
 
         ui.build_execution_plan = stub_build
-        ui.execute_plan = stub_execute
+        ui.execute_plan_streaming = stub_execute
         ui.is_llm_configured = lambda: False
 
     def tearDown(self) -> None:
         ui.build_execution_plan = self._real_build
-        ui.execute_plan = self._real_execute
+        ui.execute_plan_streaming = self._real_execute
         ui.is_llm_configured = self._real_llm
 
     def _batlinet_session(self) -> dict:
@@ -713,6 +746,124 @@ class TestBatLiNetSmokeRender(unittest.TestCase):
         self.assertTrue(any("OutOfMemoryError" in w for w in fake.rec["writes"]))
         # No metrics for a failed run.
         self.assertFalse(any(label in {"RMSE", "MAE", "MAPE"} for label, _ in fake.rec["metrics"]))
+
+
+class TestLiveProgressRendering(unittest.TestCase):
+    """Milestone B: progress is shown while running, and never invented."""
+
+    def _slots(self) -> tuple[FakeStreamlit, Any]:
+        fake = FakeStreamlit({})
+        progress = ui._LiveProgress(fake.empty(), fake.empty(), fake.empty())
+        return fake, progress
+
+    def test_caption_shows_counter_only_when_the_run_reported_one(self) -> None:
+        with_counter = ui.progress_caption("Training", 3, 10, 65.0)
+        self.assertIn("Training", with_counter)
+        self.assertIn("step 3/10", with_counter)
+        self.assertIn("00:01:05", with_counter)
+        without = ui.progress_caption("Loading data", None, None, 5.0)
+        self.assertIn("Loading data", without)
+        self.assertNotIn("step", without)
+        self.assertNotIn("%", without)
+
+    def test_bar_is_drawn_only_for_a_reported_fraction(self) -> None:
+        fake, progress = self._slots()
+        progress.on_event(
+            {"type": "stage", "stage": "Loading data", "current": None,
+             "total": None, "fraction": None, "message": "Seed is set to 0."}
+        )
+        self.assertEqual(fake.rec["progress"], [])
+        progress.on_event(
+            {"type": "training_progress", "stage": "Training", "current": 1,
+             "total": 4, "fraction": 0.25, "message": "Training BatLiNet:  25%|#| 1/4"}
+        )
+        self.assertEqual(fake.rec["progress"], [0.25])
+
+    def test_stage_changes_are_always_drawn_and_failure_is_an_error(self) -> None:
+        fake, progress = self._slots()
+        progress.on_event(
+            {"type": "stage", "stage": "Loading data", "current": None,
+             "total": None, "fraction": None, "message": "Seed is set to 0."}
+        )
+        progress.on_event(
+            {"type": "completed", "stage": ui.STAGE_FAILED, "current": None,
+             "total": None, "fraction": None, "message": "wrapper exited with returncode 1"}
+        )
+        self.assertTrue(any(ui.STAGE_FAILED in text for text in fake.rec["errors"]))
+
+    def test_heartbeats_do_not_force_a_repaint(self) -> None:
+        fake, progress = self._slots()
+        first = {"type": "stage", "stage": "Training", "current": None,
+                 "total": None, "fraction": None, "message": "Training BatLiNet:  0%|"}
+        progress.on_event(first)
+        drawn = len(fake.rec["infos"])
+        for _ in range(20):
+            progress.on_event(
+                {"type": "stage", "stage": "Training", "current": None,
+                 "total": None, "fraction": None, "message": ui.HEARTBEAT_MESSAGE}
+            )
+        self.assertEqual(len(fake.rec["infos"]), drawn)
+
+    def test_run_click_streams_and_stores_no_fabricated_metrics(self) -> None:
+        emitted: list[dict] = []
+
+        def stub_stream(plan, on_event=None, **kwargs):
+            for event in (
+                {"type": "stage", "stage": "Loading data", "current": None,
+                 "total": None, "fraction": None, "message": "Seed is set to 0."},
+                {"type": "training_progress", "stage": "Training", "current": 1,
+                 "total": 1, "fraction": 1.0, "message": "Training BatLiNet: 100%|##| 1/1"},
+                {"type": "completed", "stage": "Complete", "current": None,
+                 "total": None, "fraction": 1.0, "message": "Finished in 6.8s."},
+            ):
+                emitted.append(event)
+                if on_event is not None:
+                    on_event(event)
+            return {
+                "started": True, "completed": True, "success": True, "returncode": 0,
+                "command": plan["command"], "workspace": "runs/agent_matr_batlinet_smoke",
+                "stdout": "{'RMSE': 794.32}", "stderr": "", "error": None,
+                "artifacts": {"prediction_files": []}, "dry_run": False,
+                "final_stage": "Complete", "elapsed_s": 6.8,
+            }
+
+        real_stream = ui.execute_plan_streaming
+        real_build = ui.build_execution_plan
+        real_ctx = ui.build_result_context
+        real_llm = ui.is_llm_configured
+        seen: list[dict] = []
+
+        def stub_ctx(workspace, **kwargs):
+            seen.append(kwargs)
+            return {"workspace": workspace, "success": True, "metrics": {}, "warnings": []}
+
+        ui.execute_plan_streaming = stub_stream
+        ui.build_execution_plan = lambda d, t_, m, **kw: _ok_plan(m, epochs=kw.get("epochs"))
+        ui.build_result_context = stub_ctx
+        ui.is_llm_configured = lambda: False
+        try:
+            session = {
+                "agent_workflow_context": _MATR_CONTEXT,
+                "agent_original_request": "Use BatLiNet on MATR to predict battery lifetime.",
+                "gpu_inventory": _FAKE_GPU_INVENTORY,
+            }
+            fake = _render(session, clicked={"Run"}, checkboxes={ui.SMOKE_CHECKBOX_LABEL: True})
+        finally:
+            ui.execute_plan_streaming = real_stream
+            ui.build_execution_plan = real_build
+            ui.build_result_context = real_ctx
+            ui.is_llm_configured = real_llm
+
+        self.assertEqual(len(emitted), 3)
+        # Every fraction drawn came from an event that carried one; the UI
+        # never manufactures a position of its own.
+        carried = {e["fraction"] for e in emitted if e.get("fraction") is not None}
+        self.assertTrue(fake.rec["progress"])
+        self.assertTrue(set(fake.rec["progress"]) <= carried)
+        # Metrics come from build_result_context, never from the streamed stdout.
+        self.assertTrue(seen)
+        self.assertEqual(seen[0]["run_status"], "SUCCESS")
+        self.assertFalse(any("794.32" in text for text in fake.rec["infos"]))
 
 
 class TestNoFrontendDuplication(unittest.TestCase):

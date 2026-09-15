@@ -7,8 +7,11 @@ Boundary rules (milestone: agent web integration):
   ``agent.executor`` / ``agent.results`` / ``agent.result_agent``); nothing
   is re-derived here;
 * no subprocess, no shell strings, no stdout metric parsing, no metric
-  computation in this module — execution goes through ``execute_plan`` only,
-  and only from the explicit Run button inside :func:`render_agent_workflow`;
+  computation in this module — execution goes through
+  ``execute_plan_streaming`` only, and only from the explicit Run button
+  inside :func:`render_agent_workflow`. Live progress is rendered from the
+  structured events that function emits; the output is never a source of
+  metrics, and no percentage is drawn that the run did not report;
 * session state holds small JSON-serializable values only (request text,
   workflow context, selected model key, plan, execution result, result
   context, explanation) — never tensors, checkpoints or DataBundle objects.
@@ -22,13 +25,13 @@ Streamlit runtime.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
 import streamlit as st
 
 from ..agent.execution import build_execution_plan
-from ..agent.executor import execute_plan
 from ..agent.intent import resolve_workflow_intent
 from ..agent.result_agent import explain_run_result
 from ..agent.results import METRIC_KEYS, SMOKE_RUN_WARNING, build_result_context
@@ -39,6 +42,11 @@ from ..agent.run_policy import (
     gpu_memory_advisory,
     smoke_device_recommendation,
     smoke_epochs_for,
+)
+from ..agent.streaming import (
+    HEARTBEAT_MESSAGE,
+    STAGE_FAILED,
+    execute_plan_streaming,
 )
 from ..agent.workflow import guide_workflow, workflow_guidance_preview
 from ..core.device_inventory import (
@@ -60,6 +68,12 @@ OUTPUT_TAIL_CHARS = 4000
 #: stderr carries the traceback, so it keeps a much larger tail than stdout
 #: (which is mostly tqdm progress lines).
 ERROR_TAIL_CHARS = 20000
+#: Minimum seconds between two live-progress repaints. The backend emits an
+#: event per tqdm update; repainting on every one would spend the run's time
+#: in Streamlit rather than in BatteryML.
+PROGRESS_REDRAW_INTERVAL_S = 0.25
+#: How many trailing output lines the live log shows while a run is going.
+LIVE_LOG_LINES = 12
 
 
 def _display_name(entry: dict[str, Any]) -> str:
@@ -336,6 +350,88 @@ def _render_plan(plan: dict[str, Any], device: str, seed: int) -> None:
         st.info(SMOKE_NOTICE)
 
 
+def progress_caption(
+    stage: str,
+    current: int | None,
+    total: int | None,
+    elapsed_s: float,
+) -> str:
+    """One status line: the stage, the observed counter, and elapsed time.
+
+    A counter appears only when the run itself reported one. There is no
+    fallback percentage: an unknown position is shown as the stage plus the
+    elapsed clock, never as an invented number.
+    """
+    parts = [str(stage or "Running")]
+    if isinstance(current, int) and isinstance(total, int) and total > 0:
+        parts.append(f"step {current}/{total}")
+    parts.append(f"elapsed {_format_elapsed(elapsed_s)}")
+    return " — ".join(parts)
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+class _LiveProgress:
+    """Renders backend progress events into three Streamlit placeholders.
+
+    Holds no execution logic: it only formats what
+    :func:`batteryml_web.agent.streaming.execute_plan_streaming` reports. It
+    never derives a percentage the run did not provide, and never reads a
+    metric out of the output — ``fraction`` is drawn only when the event
+    carries one.
+    """
+
+    def __init__(self, status_slot: Any, bar_slot: Any, log_slot: Any) -> None:
+        self._status = status_slot
+        self._bar = bar_slot
+        self._log = log_slot
+        self._started = time.monotonic()
+        self._last_draw = 0.0
+        self._stage = ""
+        self._lines: list[str] = []
+
+    def on_event(self, event: dict[str, Any]) -> None:
+        message = str(event.get("message") or "")
+        if event.get("type") in ("output", "training_progress") and message:
+            self._lines.append(message)
+            del self._lines[:-LIVE_LOG_LINES]
+
+        stage = str(event.get("stage") or "")
+        now = time.monotonic()
+        forced = (
+            event.get("type") == "completed"
+            or (stage and stage != self._stage and message != HEARTBEAT_MESSAGE)
+        )
+        if not forced and (now - self._last_draw) < PROGRESS_REDRAW_INTERVAL_S:
+            return
+        self._stage = stage
+        self._last_draw = now
+        self._draw(event)
+
+    def _draw(self, event: dict[str, Any]) -> None:
+        elapsed = time.monotonic() - self._started
+        caption = progress_caption(
+            str(event.get("stage") or ""),
+            event.get("current"),
+            event.get("total"),
+            elapsed,
+        )
+        if event.get("stage") == STAGE_FAILED:
+            self._status.error(caption)
+        else:
+            self._status.info(caption)
+        fraction = event.get("fraction")
+        if isinstance(fraction, (int, float)):
+            self._bar.progress(min(max(float(fraction), 0.0), 1.0))
+        if self._lines:
+            self._log.code("\n".join(self._lines), language="text")
+
+
 def _render_execution_status(
     result: dict[str, Any],
     *,
@@ -558,8 +654,14 @@ def render_agent_workflow() -> None:
             use_container_width=True,
             key="agent_run",
         ):
-            with st.spinner("Executing the validated plan (explicit user action)..."):
-                result = execute_plan(plan, repo_root=REPO_ROOT, env=get_safe_runtime_env())
+            st.caption("Executing the validated plan (explicit user action).")
+            progress = _LiveProgress(st.empty(), st.empty(), st.empty())
+            result = execute_plan_streaming(
+                plan,
+                on_event=progress.on_event,
+                repo_root=REPO_ROOT,
+                env=get_safe_runtime_env(),
+            )
             # Provenance for the failure diagnosis only; neither field is read
             # back by the executor or by build_result_context.
             result["device"] = str(device)

@@ -11,7 +11,9 @@ the web layer relies on at run time still behave as specified:
 * BatLiNet's smoke run recommends CPU, and the required smoke sentence is
   the one the UI shows;
 * a CUDA out-of-memory failure is recognised, is never retried, and no
-  metric is ever produced from a failed run.
+  metric is ever produced from a failed run;
+* the streaming executor stays Streamlit-independent, recognises the real
+  tqdm lines the installed models emit, and fabricates no percentage.
 
 The machine's actual GPU inventory is recorded as *evidence* when
 ``nvidia-smi`` is present. Its absence is never a failure: a CPU-only
@@ -49,6 +51,15 @@ _SAMPLE_CSV = (
 _SAMPLE_OOM_STDERR = (
     "Traceback (most recent call last):\n"
     "torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB\n"
+)
+
+#: Real progress lines the installed models emit; see
+#: batteryml/models/nn_model.py (the upstream "Traning" typo) and
+#: batteryml_web/models/batlinet.py.
+_SAMPLE_PROGRESS_LINES = (
+    ("Training BatLiNet:  10%|#         | 1/10 [00:06<00:54,  6.80s/it]", 1, 10),
+    ("Traning:   1%|          | 1/100 [00:00<00:30,  3.20it/s]", 1, 100),
+    ("Training CPTransformer: 100%|##########| 1/1 [00:07<00:00,  7.00s/it]", 1, 1),
 )
 
 def _device_inventory_problems(module: Any) -> list[str]:
@@ -230,6 +241,43 @@ def _call_name(node: ast.Call) -> str:
     return ""
 
 
+def _streaming_problems(streaming: Any) -> list[str]:
+    """The streaming executor's parser and Streamlit-independence contract."""
+    problems: list[str] = []
+    source = inspect.getsource(streaming)
+    if "shell=False" not in source:
+        problems.append(
+            "batteryml_web/agent/streaming.py no longer passes shell=False; a shell "
+            "string must never be executed."
+        )
+    if "import streamlit" in source:
+        problems.append(
+            "batteryml_web/agent/streaming.py imports streamlit; the executor must stay "
+            "Streamlit-independent."
+        )
+    for line, current, total in _SAMPLE_PROGRESS_LINES:
+        parsed = streaming.parse_progress_line(line)
+        if parsed is None:
+            problems.append(
+                f"parse_progress_line did not recognise a real tqdm line: {line!r}."
+            )
+            continue
+        if parsed.get("current") != current or parsed.get("total") != total:
+            problems.append(
+                f"parse_progress_line read {parsed.get('current')}/{parsed.get('total')} "
+                f"from {line!r}; expected {current}/{total}."
+            )
+    if streaming.parse_progress_line("Loading data from data/processed/MATR") is not None:
+        problems.append(
+            "parse_progress_line invented progress for a line carrying no counter; a "
+            "fabricated percentage is worse than none."
+        )
+    stage = streaming.classify_stage("Traceback (most recent call last):")
+    if stage is not None:
+        problems.append(f"classify_stage invented the stage {stage!r} for a traceback line.")
+    return problems
+
+
 def _observed_inventory(module: Any) -> dict[str, Any]:
     """Record what this machine reports. Absence is never a failure."""
     inventory = module.query_gpu_inventory()
@@ -248,6 +296,7 @@ def check(output_dir: Path | None = None) -> CheckResult:
         from batteryml_web.agent import execution as execution_module
         from batteryml_web.agent import executor as executor_module
         from batteryml_web.agent import run_policy as policy_module
+        from batteryml_web.agent import streaming as streaming_module
         from batteryml_web.core import device_inventory as device_module
     except Exception as exc:  # noqa: BLE001 - reported as a SKIP, never hidden
         return CheckResult(
@@ -264,6 +313,7 @@ def check(output_dir: Path | None = None) -> CheckResult:
     problems.extend(_device_inventory_problems(device_module))
     problems.extend(_smoke_policy_problems(policy_module, execution_module))
     problems.extend(_failure_problems(policy_module, executor_module))
+    problems.extend(_streaming_problems(streaming_module))
 
     config_path = root / BATLINET_CONFIG
     if not config_path.is_file():
@@ -310,7 +360,7 @@ def check(output_dir: Path | None = None) -> CheckResult:
         "Device enumeration is argv-based and count-agnostic; a smoke run is "
         "--epochs 1 on the formal config with no config written; BatLiNet smoke "
         "recommends CPU; CUDA OOM is recognised, never retried and yields no "
-        f"metric. {gpu_note}.",
+        f"metric; streaming progress is parsed, never fabricated. {gpu_note}.",
         evidence,
         artifacts,
     )
