@@ -342,8 +342,86 @@ def render_bottom_step_navigation():
             set_current_step(NAV_STEPS[idx + 1]["key"])
 
 
+def _render_project_created_notice() -> None:
+    """Show the success state for the project just created, if any.
+
+    Reads what ``_ensure_project`` actually created; it never reports a
+    project that was not written to disk.
+    """
+    notice = st.session_state.get("project_created_notice")
+    if not isinstance(notice, dict):
+        return
+    st.success("✅ Project created successfully")
+    st.write(f"**Project:** {notice.get('name')}")
+    st.write("**Workspace:**")
+    st.code(str(notice.get("workspace")), language="text")
+
+
+def _toast(message: str, icon: str | None = None) -> None:
+    """st.toast where the installed Streamlit has it; a no-op otherwise."""
+    toast = getattr(st, "toast", None)
+    if callable(toast):
+        try:
+            toast(message, icon=icon) if icon else toast(message)
+        except TypeError:
+            toast(message)
+
+
+def render_home_agent_entry() -> None:
+    """The natural-language entry point, at the same level as Quick Start.
+
+    Home holds no intent, readiness or planning logic: it records the
+    request and navigates. Everything else — resolving the dataset and task,
+    reading readiness, building and validating a plan — happens in the Agent
+    Workflow page against the existing backend. Pressing this button never
+    executes anything; execution still needs the explicit Run there.
+    """
+    st.subheader("🤖 Agent Workflow", anchor=False)
+    st.caption(
+        "Describe the task in plain language. The deterministic backend resolves "
+        "the dataset, task and model, checks readiness and builds a plan; nothing "
+        "runs until you press Run on the next page."
+    )
+    request = st.text_area(
+        "Describe what you want to do...",
+        value=st.session_state.get("agent_original_request", ""),
+        placeholder="Use CPTransformer on MATR to predict battery lifetime.",
+        key="home_agent_request",
+        height=90,
+    )
+    if st.button("Analyze with Agent", use_container_width=True, key="home_agent_analyze"):
+        trimmed = str(request or "").strip()
+        if not trimmed:
+            st.warning("Enter a request first, for example: "
+                       "Use CPTransformer on MATR to predict battery lifetime.")
+        else:
+            st.session_state["agent_original_request"] = trimmed
+            # Consumed by render_agent_workflow(), which runs the backend
+            # analysis on arrival. Analysis is not execution.
+            st.session_state["agent_pending_request"] = trimmed
+            for key in (
+                "agent_workflow_context",
+                "agent_selected_model",
+                "agent_execution_plan",
+                "agent_execution_result",
+                "agent_result_context",
+                "agent_explanation",
+                "agent_intent",
+                "agent_model_request",
+                "agent_suggestions",
+                "agent_model_choice",
+                "agent_run_signature",
+                # The Agent Workflow page's own text box, so it shows this
+                # request rather than one typed there on an earlier visit.
+                # Safe to delete here: that widget is not rendered on Home.
+                "agent_request_input",
+            ):
+                st.session_state.pop(key, None)
+            set_current_step("agent_workflow")
+
+
 def render_home_page():
-    st.markdown("# 🔋 LLM-guided BatteryML Protocol Platform")
+    st.title("🔋 LLM-guided BatteryML Protocol Platform", anchor=False)
     st.caption("BatteryML performs numerical prediction. The optional LLM agent assists workflow guidance only.")
 
     project_root = _project_root()
@@ -375,18 +453,27 @@ def render_home_page():
     left_col, right_col = st.columns(2, gap="large")
 
     with left_col:
-        st.markdown("#### Create New Project")
+        st.subheader("Create New Project", anchor=False)
         project_name = st.text_input("Project name", value=st.session_state.get("project_name") or "my_battery_project", key="home_project_name")
         base_dir = st.text_input("Projects base directory", value=str(DEFAULT_BASE_DIR), key="home_base_dir")
         project_folder = Path(base_dir) / (project_name.strip() or "my_battery_project")
         st.caption("Project folder")
         st.code(str(project_folder), language="text")
         if st.button("Create New Project", use_container_width=True, key="home_create_project"):
-            _ensure_project(project_name, base_dir)
+            created = _ensure_project(project_name, base_dir)
+            # The filesystem semantics are unchanged; only the confirmation is
+            # new. Stored rather than printed because the rerun below would
+            # otherwise discard the message before it is seen.
+            st.session_state["project_created_notice"] = {
+                "name": created.name,
+                "workspace": created.as_posix(),
+            }
+            _toast(f"Project '{created.name}' created", icon="✅")
             st.rerun()
+        _render_project_created_notice()
 
     with right_col:
-        st.markdown("#### Load Existing Project")
+        st.subheader("Load Existing Project", anchor=False)
         projects = _safe_projects()
         if projects:
             selected = st.selectbox("Select existing project", options=projects, key="home_existing_project")
@@ -397,6 +484,7 @@ def render_home_page():
                 st.session_state["project_root"] = str(folder)
                 st.session_state["project_name"] = selected
                 st.session_state["current_project"] = selected
+                st.session_state.pop("project_created_notice", None)
                 st.rerun()
         else:
             st.info("No existing project found yet.")
@@ -416,7 +504,7 @@ def render_home_page():
             st.success("LLM assistant is connected." if connected else "LLM assistant is not connected.")
 
     st.markdown("---")
-    st.markdown("#### ⚡ Quick Start")
+    st.subheader("⚡ Quick Start", anchor=False)
     st.info("Run a built-in MATR RUL example to verify the full local BatteryML workflow: dataset → processed files → config → model run → metrics/results.")
     raw_path = Path("data/raw/MATR")
     processed_path = Path("data/processed/MATR")
@@ -501,6 +589,10 @@ def render_home_page():
             st.session_state["current_step"] = "review_results"
             st.rerun()
 
+    st.markdown("---")
+    render_home_agent_entry()
+
+    st.markdown("---")
     if st.button("Start workflow →", use_container_width=True, key="home_start_workflow"):
         set_current_step("prepare_data")
 
@@ -662,7 +754,7 @@ def _render_status_card(info: dict[str, Any]) -> None:
 
 
 def render_prepare_data_page():
-    st.markdown("## 🔋 Prepare Data")
+    st.header("🔋 Prepare Data", anchor=False)
     st.caption("Raw data → Preprocessing → Processed records → Feature inspection → Ready for model")
 
     tabs = st.tabs([
@@ -1171,7 +1263,7 @@ def render_llm_output_panel(output_key: str, title: str) -> None:
 
 
 def render_run_model_page():
-    st.markdown("## 🚀 Run Model")
+    st.header("🚀 Run Model", anchor=False)
     st.caption("Configure dataset, prediction task, model, device, and execute the deterministic BatteryML workflow.")
     configs = _discover_run_configs()
     datasets = _ui_dataset_options()
@@ -1388,7 +1480,7 @@ def render_run_model_page():
 
 
 def render_review_results_page():
-    st.markdown("## 📈 Review Results")
+    st.header("📈 Review Results", anchor=False)
     st.markdown("#### Optional LLM interpretation")
     st.caption(
         "Use the LLM assistant to summarize results or explain metrics. BatteryML metrics are computed by BatteryML and will not be modified."
@@ -1564,36 +1656,9 @@ Metrics:
     render_bottom_step_navigation()
 
 
-def render_sidebar_workflow():
-    with st.sidebar:
-        st.markdown("### 🔋 BatteryML")
-        st.caption("Protocol Navigator")
-        st.markdown("**Project**")
-        st.caption(_current_project_name())
-        st.divider()
-        current = st.session_state.get("current_step", "home")
-        for step in NAV_STEPS:
-            label = f"{step['emoji']} {step['label']}"
-            if current == step["key"]:
-                st.markdown(f"**▶ {label}**")
-                st.caption(step["description"])
-            else:
-                if st.button(label, key=f"sidebar_go_{step['key']}", use_container_width=True):
-                    set_current_step(step["key"])
-        st.divider()
-        idx = get_current_step_index()
-        p, n = st.columns(2)
-        with p:
-            if st.button("← Prev", disabled=(idx == 0), use_container_width=True, key="sidebar_prev_step"):
-                set_current_step(NAV_STEPS[idx - 1]["key"])
-        with n:
-            if st.button("Next →", disabled=(idx == len(NAV_STEPS) - 1), use_container_width=True, key="sidebar_next_step"):
-                set_current_step(NAV_STEPS[idx + 1]["key"])
-        st.divider()
-        llm_connected = bool(st.session_state.get("llm_base_url")) and bool(st.session_state.get("llm_api_key"))
-        st.caption(f"LLM: {'Connected' if llm_connected else 'Optional / Not connected'}")
-
-
+# The sidebar lives in batteryml_web/ui/workflow_sidebar.py. A second copy
+# used to be defined here and shadowed the import, so the grouped navigation
+# in that module was dead code.
 render_sidebar_workflow()
 
 current_step = st.session_state.get("current_step", "home")

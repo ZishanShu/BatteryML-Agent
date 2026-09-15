@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..core.device_inventory import validate_device
 from .intent import resolve_workflow_intent
 from .prompts import build_agent_workflow_context
 
@@ -45,8 +46,13 @@ def _registry_tables() -> Tuple[Dict[str, str], Dict[str, str], Any]:
     return MODEL_CLASS_KEYS, normalized_aliases, normalize_model_token
 
 
-def _canonical_model_key(token: str) -> str:
-    """Fold a requested model token onto a canonical key using existing aliases."""
+def canonical_model_key(token: str) -> str:
+    """Fold a requested model token onto a canonical key using existing aliases.
+
+    Public because the catalog and the LLM-intent layer must fold names the
+    same way this planner does; a second, parallel folding table is exactly
+    the kind of drift CLAUDE.md §3 forbids.
+    """
     _, normalized_aliases, normalize_model_token = _registry_tables()
     from ..core.config_registry import MODEL_CLASS_KEYS
 
@@ -91,7 +97,7 @@ def find_model_entry(
     """
     if not str(requested or "").strip():
         raise ValueError("find_model_entry: requested model is empty.")
-    canonical = _canonical_model_key(str(requested))
+    canonical = canonical_model_key(str(requested))
     runnable = {str(e.get("model")): e for e in workflow_context.get("runnable_models", [])}
     blocked = {str(e.get("model")): e for e in workflow_context.get("blocked_models", [])}
     if canonical in runnable:
@@ -101,7 +107,7 @@ def find_model_entry(
     for side, entries in (("runnable", runnable), ("blocked", blocked)):
         for key, entry in entries.items():
             for alias in _aliases_for_entry(key, entry.get("model_display")):
-                if _canonical_model_key(alias) == canonical:
+                if canonical_model_key(alias) == canonical:
                     return entry, side
     lowered = str(requested).strip().lower()
     for side, entries in (("runnable", runnable), ("blocked", blocked)):
@@ -181,7 +187,10 @@ def build_execution_plan(
             output must never be passed here as authority.
         repo_root: forwarded to the readiness layer when the context is
             built inside this call.
-        device / seed / workspace: CLI run parameters (informational only).
+        device / seed / workspace: CLI run parameters. ``device`` must be a
+            single torch device (``cpu``, ``cuda``, ``cuda:<index>``,
+            ``mps``); a multi-device string is refused, because BatteryML
+            forwards this value straight to ``.to(device)``.
         workflow_context: optional prebuilt compact context (test seam for
             mocked READY state). When omitted it is built from
             ``(dataset, task)``; only its ``validated_config`` values may
@@ -205,6 +214,10 @@ def build_execution_plan(
     if not str(model or "").strip():
         raise ValueError("build_execution_plan: model is empty.")
     epochs_value = _validate_epochs(epochs)
+    # A single torch device, always. "cuda:0,1" is refused here rather than
+    # handed to the CLI, where .to(device) would fail deep inside a run; see
+    # docs/GPU_MULTI_GPU_AUDIT.md for why no multi-GPU form is accepted.
+    device_value = validate_device(device)
 
     from ..core.config_validator import load_and_validate_config_file
 
@@ -293,7 +306,7 @@ def build_execution_plan(
             "--train",
             "--eval",
             "--device",
-            str(device),
+            device_value,
             "--seed",
             str(seed),
         ]

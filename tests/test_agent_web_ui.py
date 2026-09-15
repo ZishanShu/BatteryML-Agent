@@ -4,8 +4,8 @@ These tests never train, never launch a subprocess and never call an LLM.
 They check the contract the Streamlit layer must honour:
 
 * structured state comes only from the backend workflow APIs;
-* the Run button is the only path to ``execute_plan`` and is enabled only
-  when the backend planner says ``can_execute``;
+* the Run button is the only path to ``execute_plan_streaming`` and is
+  enabled only when the backend planner says ``can_execute``;
 * smoke mode maps only to the planner's ``epochs=1`` override;
 * blocked datasets/models never surface commands, selectable models or an
   enabled Run;
@@ -33,7 +33,23 @@ if str(REPO_ROOT) not in sys.path:
 
 from tests.test_readiness import REGISTRIES_AVAILABLE  # noqa: E402
 from batteryml_web.agent.results import SMOKE_RUN_WARNING  # noqa: E402
+from batteryml_web.agent.run_policy import SMOKE_NOTICE  # noqa: E402
+from batteryml_web.core import device_inventory as di  # noqa: E402
 from batteryml_web.ui import agent_workflow as ui  # noqa: E402
+
+#: A fixed two-GPU inventory. Seeded into session state by every render test
+#: so the UI never shells out to nvidia-smi during the suite and the device
+#: control is deterministic wherever the tests run.
+_FAKE_GPU_INVENTORY = {
+    "source": "nvidia-smi",
+    "available": True,
+    "device_count": 2,
+    "devices": di.parse_nvidia_smi_gpu_csv(
+        "0, NVIDIA GeForce RTX 3090, 24576, 22500, 2076\n"
+        "1, NVIDIA GeForce RTX 3090, 24576, 14000, 10576\n"
+    ),
+    "error": None,
+}
 
 
 class _Rerun(Exception):
@@ -57,6 +73,31 @@ class _Col:
 
     def caption(self, text, **kwargs):
         self._rec["captions"].append(str(text))
+
+
+class _Slot:
+    """Stand-in for st.empty(): records whatever the live progress draws."""
+
+    def __init__(self, rec: dict):
+        self._rec = rec
+
+    def info(self, text, **kwargs):
+        self._rec["infos"].append(str(text))
+
+    def error(self, text, **kwargs):
+        self._rec["errors"].append(str(text))
+
+    def caption(self, text, **kwargs):
+        self._rec["captions"].append(str(text))
+
+    def code(self, text, **kwargs):
+        self._rec["codes"].append(str(text))
+
+    def text(self, text, **kwargs):
+        self._rec["writes"].append(str(text))
+
+    def progress(self, value=0.0, **kwargs):
+        self._rec["progress"].append(float(value))
 
 
 class FakeStreamlit:
@@ -83,6 +124,7 @@ class FakeStreamlit:
             "metrics": [],
             "buttons": [],
             "selectboxes": [],
+            "progress": [],
         }
 
     # --- text/display -------------------------------------------------
@@ -144,9 +186,31 @@ class FakeStreamlit:
     def spinner(self, label, **kwargs):
         return _Ctx()
 
+    def empty(self):
+        return _Slot(self.rec)
+
+    def progress(self, value=0.0, **kwargs):
+        self.rec["progress"].append(float(value))
+        return _Slot(self.rec)
+
     def rerun(self):
         raise _Rerun()
 
+
+#: A catalog stub large enough for the model-request resolution the UI does.
+_FAKE_CATALOG = {
+    "datasets": [{"dataset": "MATR", "aliases": ["MATR", "matr"], "status": "READY",
+                  "preprocessing_supported": True}],
+    "tasks": [{"task": "RUL prediction", "aliases": ["RUL"]}],
+    "models": [
+        {"model_key": "cptransformer", "model_display": "CPTransformer", "aliases": ["cptransformer"],
+         "datasets": ["MATR"], "tasks": ["RUL prediction"], "has_validated_config": True, "external": False},
+        {"model_key": "batlinet", "model_display": "BatLiNet", "aliases": ["batlinet"],
+         "datasets": ["MATR"], "tasks": ["RUL prediction"], "has_validated_config": True, "external": False},
+        {"model_key": "PBT", "model_display": "PBT", "aliases": ["PBT", "pbt"],
+         "datasets": [], "tasks": ["RUL prediction"], "has_validated_config": False, "external": True},
+    ],
+}
 
 _MATR_CONTEXT = {
     "dataset": "MATR",
@@ -395,7 +459,7 @@ class TestRenderBoundaries(unittest.TestCase):
         self._plan_calls: list[dict[str, Any]] = []
         self._exec_calls: list[dict] = []
         self._real_build = ui.build_execution_plan
-        self._real_execute = ui.execute_plan
+        self._real_execute = ui.execute_plan_streaming
         self._real_result_ctx = ui.build_result_context
         self._real_llm = ui.is_llm_configured
 
@@ -437,13 +501,13 @@ class TestRenderBoundaries(unittest.TestCase):
             }
 
         ui.build_execution_plan = stub_build
-        ui.execute_plan = stub_execute
+        ui.execute_plan_streaming = stub_execute
         ui.build_result_context = stub_result_context
         ui.is_llm_configured = lambda: False
 
     def tearDown(self) -> None:
         ui.build_execution_plan = self._real_build
-        ui.execute_plan = self._real_execute
+        ui.execute_plan_streaming = self._real_execute
         ui.build_result_context = self._real_result_ctx
         ui.is_llm_configured = self._real_llm
 
@@ -451,6 +515,7 @@ class TestRenderBoundaries(unittest.TestCase):
         return {
             "agent_workflow_context": context,
             "agent_original_request": "Use CPTransformer on MATR to predict battery lifetime.",
+            "gpu_inventory": _FAKE_GPU_INVENTORY,
         }
 
     def test_analyze_never_executes_and_plan_is_per_selection(self) -> None:
@@ -511,7 +576,7 @@ class TestRenderBoundaries(unittest.TestCase):
         self.assertEqual(self._plan_calls, [])
 
     def test_failed_execution_displays_no_metrics(self) -> None:
-        ui.execute_plan = lambda plan, **kw: {
+        ui.execute_plan_streaming = lambda plan, **kw: {
             "started": True,
             "completed": True,
             "success": False,
@@ -526,7 +591,7 @@ class TestRenderBoundaries(unittest.TestCase):
         }
         session = self._session(_MATR_CONTEXT)
         fake = _render(session, clicked={"Run"})
-        self.assertEqual(self._exec_calls, [])  # execute_plan stub replaced above
+        self.assertEqual(self._exec_calls, [])  # streaming stub replaced above
         rendered = session.get("agent_result_context")
         self.assertIsNone(rendered)  # failure never fabricates a result context
         self.assertFalse(any(label in {"RMSE", "MAE", "MAPE"} for label, _ in fake.rec["metrics"]))
@@ -563,6 +628,488 @@ class TestRenderBoundaries(unittest.TestCase):
         stored = session.get("agent_execution_result")
         if stored is not None:  # rerun happens before store in some flows
             self.assertLessEqual(len(stored.get("stdout", "")), ui.OUTPUT_TAIL_CHARS + 64)
+
+
+class TestSmokeAndDeviceSelection(unittest.TestCase):
+    """Milestone A: smoke wording, device inventory, and the CPU default."""
+
+    def test_smoke_label_is_the_required_sentence(self) -> None:
+        self.assertEqual(ui.SMOKE_CHECKBOX_LABEL, SMOKE_NOTICE)
+        self.assertEqual(
+            ui.SMOKE_CHECKBOX_LABEL,
+            "1-epoch smoke test — workflow validation only; not benchmark performance.",
+        )
+
+    def test_device_options_follow_the_inventory_not_a_constant(self) -> None:
+        self.assertEqual(
+            ui.device_options(_FAKE_GPU_INVENTORY), ["cpu", "cuda:0", "cuda:1"]
+        )
+        eight = {
+            "devices": di.parse_nvidia_smi_gpu_csv(
+                "".join(f"{i}, RTX 3090, 24576, 22000, 2576\n" for i in range(8))
+            )
+        }
+        self.assertEqual(len(ui.device_options(eight)), 9)
+        # Unknown inventory still allows an explicit GPU choice.
+        self.assertEqual(
+            ui.device_options(di.empty_inventory("no nvidia-smi")), ["cpu", "cuda:0"]
+        )
+
+    def test_batlinet_smoke_defaults_to_cpu_and_explains_why(self) -> None:
+        options = ["cpu", "cuda:0", "cuda:1"]
+        index, reason = ui.default_device_index(options, "batlinet", True)
+        self.assertEqual(options[index], "cpu")
+        self.assertIn("CPU", reason)
+        # No recommendation text for the ordinary cases.
+        self.assertEqual(ui.default_device_index(options, "batlinet", False)[1], "")
+        self.assertEqual(ui.default_device_index(options, "cptransformer", True)[1], "")
+
+    def test_no_hardcoded_gpu_count_in_the_ui_module(self) -> None:
+        source = Path(ui.__file__).read_text(encoding="utf-8")
+        for forbidden in ("cuda:1", "cuda:2", "cuda:3", "cuda:7", "range(8)"):
+            self.assertNotIn(forbidden, source)
+
+
+class TestBatLiNetSmokeRender(unittest.TestCase):
+    """The rendered BatLiNet smoke flow: CPU default, epochs=1, no auto-run."""
+
+    def setUp(self) -> None:
+        self._plan_calls: list[dict[str, Any]] = []
+        self._exec_calls: list[dict] = []
+        self._real_build = ui.build_execution_plan
+        self._real_execute = ui.execute_plan_streaming
+        self._real_llm = ui.is_llm_configured
+
+        def stub_build(dataset, task, model, **kwargs):
+            self._plan_calls.append({"dataset": dataset, "task": task, "model": model, **kwargs})
+            return _ok_plan(model, epochs=kwargs.get("epochs"))
+
+        def stub_execute(plan, **kwargs):
+            self._exec_calls.append(plan)
+            raise AssertionError("render must not execute without an explicit Run click")
+
+        ui.build_execution_plan = stub_build
+        ui.execute_plan_streaming = stub_execute
+        ui.is_llm_configured = lambda: False
+
+    def tearDown(self) -> None:
+        ui.build_execution_plan = self._real_build
+        ui.execute_plan_streaming = self._real_execute
+        ui.is_llm_configured = self._real_llm
+
+    def _batlinet_session(self) -> dict:
+        return {
+            "agent_workflow_context": _MATR_CONTEXT,
+            "agent_original_request": "Use BatLiNet on MATR to predict battery lifetime.",
+            "agent_selected_model": "batlinet",
+            "gpu_inventory": _FAKE_GPU_INVENTORY,
+        }
+
+    def test_smoke_render_uses_cpu_and_epochs_one(self) -> None:
+        session = self._batlinet_session()
+        fake = _render(session, checkboxes={ui.SMOKE_CHECKBOX_LABEL: True})
+        self.assertEqual(self._exec_calls, [])
+        call = self._plan_calls[-1]
+        self.assertEqual(call["model"], "batlinet")
+        self.assertEqual(call["epochs"], 1)
+        self.assertEqual(call["device"], "cpu")
+        # The device control lists every enumerated GPU and defaults to cpu.
+        device_box = [
+            box for box in fake.rec["selectboxes"] if box["label"] == "Device"
+        ]
+        self.assertEqual(device_box[0]["options"], ["cpu", "cuda:0", "cuda:1"])
+        joined = " ".join(fake.rec["infos"])
+        self.assertIn(SMOKE_NOTICE, joined)
+
+    def test_non_smoke_render_leaves_the_config_schedule_alone(self) -> None:
+        session = self._batlinet_session()
+        _render(session, checkboxes={ui.SMOKE_CHECKBOX_LABEL: False})
+        self.assertIsNone(self._plan_calls[-1]["epochs"])
+
+    def test_gpu_inventory_is_displayed_not_invented(self) -> None:
+        fake = _render(self._batlinet_session())
+        rows = [row for frame in fake.rec["dataframes"] if isinstance(frame, list) for row in frame]
+        gpu_rows = [row for row in rows if isinstance(row, dict) and "GPU" in row]
+        self.assertEqual([row["Device"] for row in gpu_rows], ["cuda:0", "cuda:1"])
+        self.assertEqual(gpu_rows[0]["Free (MiB)"], "2076")
+
+    def test_cuda_oom_result_shows_actionable_message_and_keeps_stderr(self) -> None:
+        session = self._batlinet_session()
+        session["agent_execution_result"] = {
+            "started": True,
+            "completed": True,
+            "success": False,
+            "returncode": 1,
+            "command": ["python", "batteryml_web/core/run_batteryml_cli.py", "run"],
+            "workspace": "runs/agent_matr_batlinet_smoke",
+            "stdout": "",
+            "stderr": "Traceback...\ntorch.cuda.OutOfMemoryError: CUDA out of memory.",
+            "error": "wrapper exited with returncode 1",
+            "device": "cuda:0",
+            "smoke": True,
+            "artifacts": {},
+            "dry_run": False,
+        }
+        fake = _render(session)
+        errors = " ".join(fake.rec["errors"])
+        self.assertIn("CUDA out of memory on cuda:0", errors)
+        actions = " ".join(fake.rec["writes"])
+        self.assertIn("CPU", actions)
+        self.assertIn("cuda:1", actions)  # only the GPU with more free memory
+        self.assertIn("never moves a failed run", actions)
+        # The raw traceback is still displayed verbatim.
+        self.assertTrue(any("OutOfMemoryError" in w for w in fake.rec["writes"]))
+        # No metrics for a failed run.
+        self.assertFalse(any(label in {"RMSE", "MAE", "MAPE"} for label, _ in fake.rec["metrics"]))
+
+
+class TestLiveProgressRendering(unittest.TestCase):
+    """Milestone B: progress is shown while running, and never invented."""
+
+    def _slots(self) -> tuple[FakeStreamlit, Any]:
+        fake = FakeStreamlit({})
+        progress = ui._LiveProgress(fake.empty(), fake.empty(), fake.empty())
+        return fake, progress
+
+    def test_caption_shows_counter_only_when_the_run_reported_one(self) -> None:
+        with_counter = ui.progress_caption("Training", 3, 10, 65.0)
+        self.assertIn("Training", with_counter)
+        self.assertIn("step 3/10", with_counter)
+        self.assertIn("00:01:05", with_counter)
+        without = ui.progress_caption("Loading data", None, None, 5.0)
+        self.assertIn("Loading data", without)
+        self.assertNotIn("step", without)
+        self.assertNotIn("%", without)
+
+    def test_bar_is_drawn_only_for_a_reported_fraction(self) -> None:
+        fake, progress = self._slots()
+        progress.on_event(
+            {"type": "stage", "stage": "Loading data", "current": None,
+             "total": None, "fraction": None, "message": "Seed is set to 0."}
+        )
+        self.assertEqual(fake.rec["progress"], [])
+        progress.on_event(
+            {"type": "training_progress", "stage": "Training", "current": 1,
+             "total": 4, "fraction": 0.25, "message": "Training BatLiNet:  25%|#| 1/4"}
+        )
+        self.assertEqual(fake.rec["progress"], [0.25])
+
+    def test_stage_changes_are_always_drawn_and_failure_is_an_error(self) -> None:
+        fake, progress = self._slots()
+        progress.on_event(
+            {"type": "stage", "stage": "Loading data", "current": None,
+             "total": None, "fraction": None, "message": "Seed is set to 0."}
+        )
+        progress.on_event(
+            {"type": "completed", "stage": ui.STAGE_FAILED, "current": None,
+             "total": None, "fraction": None, "message": "wrapper exited with returncode 1"}
+        )
+        self.assertTrue(any(ui.STAGE_FAILED in text for text in fake.rec["errors"]))
+
+    def test_heartbeats_do_not_force_a_repaint(self) -> None:
+        fake, progress = self._slots()
+        first = {"type": "stage", "stage": "Training", "current": None,
+                 "total": None, "fraction": None, "message": "Training BatLiNet:  0%|"}
+        progress.on_event(first)
+        drawn = len(fake.rec["infos"])
+        for _ in range(20):
+            progress.on_event(
+                {"type": "stage", "stage": "Training", "current": None,
+                 "total": None, "fraction": None, "message": ui.HEARTBEAT_MESSAGE}
+            )
+        self.assertEqual(len(fake.rec["infos"]), drawn)
+
+    def test_run_click_streams_and_stores_no_fabricated_metrics(self) -> None:
+        emitted: list[dict] = []
+
+        def stub_stream(plan, on_event=None, **kwargs):
+            for event in (
+                {"type": "stage", "stage": "Loading data", "current": None,
+                 "total": None, "fraction": None, "message": "Seed is set to 0."},
+                {"type": "training_progress", "stage": "Training", "current": 1,
+                 "total": 1, "fraction": 1.0, "message": "Training BatLiNet: 100%|##| 1/1"},
+                {"type": "completed", "stage": "Complete", "current": None,
+                 "total": None, "fraction": 1.0, "message": "Finished in 6.8s."},
+            ):
+                emitted.append(event)
+                if on_event is not None:
+                    on_event(event)
+            return {
+                "started": True, "completed": True, "success": True, "returncode": 0,
+                "command": plan["command"], "workspace": "runs/agent_matr_batlinet_smoke",
+                "stdout": "{'RMSE': 794.32}", "stderr": "", "error": None,
+                "artifacts": {"prediction_files": []}, "dry_run": False,
+                "final_stage": "Complete", "elapsed_s": 6.8,
+            }
+
+        real_stream = ui.execute_plan_streaming
+        real_build = ui.build_execution_plan
+        real_ctx = ui.build_result_context
+        real_llm = ui.is_llm_configured
+        seen: list[dict] = []
+
+        def stub_ctx(workspace, **kwargs):
+            seen.append(kwargs)
+            return {"workspace": workspace, "success": True, "metrics": {}, "warnings": []}
+
+        ui.execute_plan_streaming = stub_stream
+        ui.build_execution_plan = lambda d, t_, m, **kw: _ok_plan(m, epochs=kw.get("epochs"))
+        ui.build_result_context = stub_ctx
+        ui.is_llm_configured = lambda: False
+        try:
+            session = {
+                "agent_workflow_context": _MATR_CONTEXT,
+                "agent_original_request": "Use BatLiNet on MATR to predict battery lifetime.",
+                "gpu_inventory": _FAKE_GPU_INVENTORY,
+            }
+            fake = _render(session, clicked={"Run"}, checkboxes={ui.SMOKE_CHECKBOX_LABEL: True})
+        finally:
+            ui.execute_plan_streaming = real_stream
+            ui.build_execution_plan = real_build
+            ui.build_result_context = real_ctx
+            ui.is_llm_configured = real_llm
+
+        self.assertEqual(len(emitted), 3)
+        # Every fraction drawn came from an event that carried one; the UI
+        # never manufactures a position of its own.
+        carried = {e["fraction"] for e in emitted if e.get("fraction") is not None}
+        self.assertTrue(fake.rec["progress"])
+        self.assertTrue(set(fake.rec["progress"]) <= carried)
+        # Metrics come from build_result_context, never from the streamed stdout.
+        self.assertTrue(seen)
+        self.assertEqual(seen[0]["run_status"], "SUCCESS")
+        self.assertFalse(any("794.32" in text for text in fake.rec["infos"]))
+
+
+class TestHandoverFromHome(unittest.TestCase):
+    """Milestone C: a request handed over from Home is analysed, not executed."""
+
+    def setUp(self) -> None:
+        self._real_resolve = ui.resolve_workflow_intent_with_llm
+        self._real_context = ui.build_agent_workflow_context
+        self._real_catalog = ui.build_intent_catalog
+        self._real_build = ui.build_execution_plan
+        self._real_stream = ui.execute_plan_streaming
+        self._real_llm = ui.is_llm_configured
+        self.preview_calls: list[str] = []
+        self.exec_calls: list[dict] = []
+
+        def stub_resolve(request, **kwargs):
+            self.preview_calls.append(request)
+            return {
+                "source": "deterministic",
+                "llm_available": False,
+                "dataset": "MATR",
+                "task": "RUL prediction",
+                "requested_model": "batlinet",
+                "requested_model_name": None,
+                "needs_clarification": False,
+                "clarification_question": None,
+                "suggested_model_keys": [],
+                "user_facing_rationale": "",
+                "rejected": [],
+                "warnings": [],
+                "message": "Resolved dataset=MATR, task=RUL prediction.",
+            }
+
+        def stub_stream(plan, **kwargs):
+            self.exec_calls.append(plan)
+            raise AssertionError("handover must never execute")
+
+        ui.resolve_workflow_intent_with_llm = stub_resolve
+        ui.build_agent_workflow_context = lambda dataset, task, **kw: _MATR_CONTEXT
+        ui.build_intent_catalog = lambda **kw: _FAKE_CATALOG
+        ui.build_execution_plan = lambda d, t_, m, **kw: _ok_plan(m, epochs=kw.get("epochs"))
+        ui.execute_plan_streaming = stub_stream
+        ui.is_llm_configured = lambda: False
+
+    def tearDown(self) -> None:
+        ui.resolve_workflow_intent_with_llm = self._real_resolve
+        ui.build_agent_workflow_context = self._real_context
+        ui.build_intent_catalog = self._real_catalog
+        ui.build_execution_plan = self._real_build
+        ui.execute_plan_streaming = self._real_stream
+        ui.is_llm_configured = self._real_llm
+
+    def test_pending_request_is_analysed_once_and_never_run(self) -> None:
+        session = {
+            "agent_pending_request": "Use BatLiNet on MATR to predict battery lifetime.",
+            "gpu_inventory": _FAKE_GPU_INVENTORY,
+        }
+        _render(session)
+        self.assertEqual(
+            self.preview_calls, ["Use BatLiNet on MATR to predict battery lifetime."]
+        )
+        self.assertEqual(self.exec_calls, [])
+        # Consumed, so a rerun cannot re-analyse it.
+        self.assertNotIn("agent_pending_request", session)
+        self.assertEqual(session["agent_workflow_context"]["dataset"], "MATR")
+        self.assertEqual(
+            session["agent_original_request"],
+            "Use BatLiNet on MATR to predict battery lifetime.",
+        )
+
+    def test_no_pending_request_means_no_analysis(self) -> None:
+        session = {
+            "agent_original_request": "Use BatLiNet on MATR to predict battery lifetime.",
+            "gpu_inventory": _FAKE_GPU_INVENTORY,
+        }
+        _render(session)
+        self.assertEqual(self.preview_calls, [])
+        self.assertEqual(self.exec_calls, [])
+
+
+class TestLlmAssistedIntentInTheUi(unittest.TestCase):
+    """Milestone D: the page shows what was understood and what was refused."""
+
+    def test_offline_shortfall_is_stated_plainly(self) -> None:
+        fake = FakeStreamlit({})
+        original = ui.st
+        ui.st = fake
+        try:
+            ui._render_intent(
+                {
+                    "source": "deterministic_fallback",
+                    "llm_available": False,
+                    "user_facing_rationale": "",
+                    "warnings": [],
+                    "rejected": [],
+                    "needs_clarification": False,
+                    "clarification_question": None,
+                }
+            )
+        finally:
+            ui.st = original
+        joined = " ".join(fake.rec["captions"])
+        self.assertIn("advanced natural-language understanding is unavailable", joined)
+
+    def test_rejected_values_are_shown_not_hidden(self) -> None:
+        fake = FakeStreamlit({})
+        original = ui.st
+        ui.st = fake
+        try:
+            ui._render_intent(
+                {
+                    "source": "llm",
+                    "llm_available": True,
+                    "user_facing_rationale": "MATR has validated RUL configs.",
+                    "warnings": ["Backend-owned field(s) discarded."],
+                    "rejected": [
+                        {"field": "config_path", "value": "configs/fake.yaml",
+                         "kind": "forbidden_field"}
+                    ],
+                    "needs_clarification": True,
+                    "clarification_question": "Which dataset should I use?",
+                }
+            )
+        finally:
+            ui.st = original
+        self.assertIn("MATR has validated RUL configs.", " ".join(fake.rec["writes"]))
+        self.assertIn("Backend-owned field(s) discarded.", " ".join(fake.rec["warnings"]))
+        self.assertIn("config_path", " ".join(fake.rec["writes"]))
+        self.assertIn("Which dataset should I use?", " ".join(fake.rec["infos"]))
+
+    def test_blocked_model_is_reported_and_not_substituted(self) -> None:
+        fake = FakeStreamlit({})
+        original = ui.st
+        ui.st = fake
+        try:
+            ui._render_model_request(
+                {
+                    "requested": "PBT",
+                    "status": "blocked",
+                    "model_key": "PBT",
+                    "model_display": "PBT",
+                    "reason": "PBT is NEEDS_ASSETS for this dataset and task: provide assets.",
+                    "alternatives": ["cptransformer", "batlinet"],
+                    "requires_confirmation": True,
+                }
+            )
+        finally:
+            ui.st = original
+        self.assertIn("NEEDS_ASSETS", " ".join(fake.rec["warnings"]))
+        joined = " ".join(fake.rec["writes"])
+        self.assertIn("cptransformer", joined)
+        self.assertIn("nothing was substituted for you", joined)
+
+    def test_runnable_request_renders_no_warning(self) -> None:
+        fake = FakeStreamlit({})
+        original = ui.st
+        ui.st = fake
+        try:
+            ui._render_model_request(
+                {"requested": "batlinet", "status": "runnable", "model_key": "batlinet",
+                 "model_display": "BatLiNet", "reason": "", "alternatives": [],
+                 "requires_confirmation": False}
+            )
+        finally:
+            ui.st = original
+        self.assertEqual(fake.rec["warnings"], [])
+
+    def test_blocked_suggestions_are_never_offered_as_runnable(self) -> None:
+        fake = FakeStreamlit({})
+        original = ui.st
+        ui.st = fake
+        try:
+            ui._render_suggestions(
+                {"runnable": ["cptransformer"], "blocked": ["PBT"], "unknown": ["MegaNet"]}
+            )
+        finally:
+            ui.st = original
+        joined = " ".join(fake.rec["writes"])
+        self.assertIn("runnable now:** cptransformer", joined)
+        self.assertIn("blocked:** PBT", joined)
+        self.assertIn("these cannot be run", joined)
+
+    def test_analysis_stores_canonical_state_and_never_executes(self) -> None:
+        real_resolve = ui.resolve_workflow_intent_with_llm
+        real_context = ui.build_agent_workflow_context
+        real_catalog = ui.build_intent_catalog
+        real_llm = ui.is_llm_configured
+        real_stream = ui.execute_plan_streaming
+        executed: list = []
+
+        ui.resolve_workflow_intent_with_llm = lambda request, **kw: {
+            "source": "llm",
+            "llm_available": True,
+            "dataset": "MATR",
+            "task": "RUL prediction",
+            "requested_model": "PBT",
+            "requested_model_name": None,
+            "needs_clarification": False,
+            "clarification_question": None,
+            "suggested_model_keys": ["cptransformer", "PBT"],
+            "user_facing_rationale": "PBT was asked for but is blocked.",
+            "rejected": [],
+            "warnings": [],
+            "message": "ok",
+        }
+        ui.build_agent_workflow_context = lambda dataset, task, **kw: _MATR_CONTEXT
+        ui.build_intent_catalog = lambda **kw: _FAKE_CATALOG
+        ui.is_llm_configured = lambda: False
+        ui.execute_plan_streaming = lambda plan, **kw: executed.append(plan)
+
+        session: dict = {}
+        fake = FakeStreamlit(session)
+        original = ui.st
+        ui.st = fake
+        try:
+            ui._analyze_request("Use PBT on MATR to predict battery lifetime.")
+        finally:
+            ui.st = original
+            ui.resolve_workflow_intent_with_llm = real_resolve
+            ui.build_agent_workflow_context = real_context
+            ui.build_intent_catalog = real_catalog
+            ui.is_llm_configured = real_llm
+            ui.execute_plan_streaming = real_stream
+
+        self.assertEqual(executed, [])
+        self.assertEqual(session["agent_workflow_context"]["dataset"], "MATR")
+        self.assertEqual(session["agent_model_request"]["status"], "blocked")
+        # A blocked request must not preselect anything.
+        self.assertNotIn("agent_selected_model", session)
+        self.assertEqual(session["agent_suggestions"]["runnable"], ["cptransformer"])
+        self.assertEqual(session["agent_suggestions"]["blocked"], ["PBT"])
 
 
 class TestNoFrontendDuplication(unittest.TestCase):

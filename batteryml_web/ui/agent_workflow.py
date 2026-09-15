@@ -7,8 +7,11 @@ Boundary rules (milestone: agent web integration):
   ``agent.executor`` / ``agent.results`` / ``agent.result_agent``); nothing
   is re-derived here;
 * no subprocess, no shell strings, no stdout metric parsing, no metric
-  computation in this module — execution goes through ``execute_plan`` only,
-  and only from the explicit Run button inside :func:`render_agent_workflow`;
+  computation in this module — execution goes through
+  ``execute_plan_streaming`` only, and only from the explicit Run button
+  inside :func:`render_agent_workflow`. Live progress is rendered from the
+  structured events that function emits; the output is never a source of
+  metrics, and no percentage is drawn that the run did not report;
 * session state holds small JSON-serializable values only (request text,
   workflow context, selected model key, plan, execution result, result
   context, explanation) — never tensors, checkpoints or DataBundle objects.
@@ -22,30 +25,61 @@ Streamlit runtime.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
 import streamlit as st
 
+from ..agent.catalog import build_intent_catalog
 from ..agent.execution import build_execution_plan
-from ..agent.executor import execute_plan
-from ..agent.intent import resolve_workflow_intent
+from ..agent.llm_intent import (
+    filter_suggestions,
+    resolve_model_request,
+    resolve_workflow_intent_with_llm,
+)
+from ..agent.prompts import build_agent_workflow_context
 from ..agent.result_agent import explain_run_result
 from ..agent.results import METRIC_KEYS, SMOKE_RUN_WARNING, build_result_context
-from ..agent.workflow import guide_workflow, workflow_guidance_preview
+from ..agent.run_policy import (
+    SMOKE_EPOCHS,
+    SMOKE_NOTICE,
+    classify_execution_failure,
+    gpu_memory_advisory,
+    smoke_device_recommendation,
+    smoke_epochs_for,
+)
+from ..agent.streaming import (
+    HEARTBEAT_MESSAGE,
+    STAGE_FAILED,
+    execute_plan_streaming,
+)
+from ..agent.workflow import guide_workflow
+from ..core.device_inventory import (
+    device_choices_with_manual_gpu,
+    device_label,
+    inventory_rows,
+    query_gpu_inventory,
+)
 from .llm_state import is_llm_configured
 from .progress_utils import get_safe_runtime_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 RUN_BUTTON_LABEL = "Run"
-SMOKE_CHECKBOX_LABEL = (
-    "1-epoch smoke test — validates the workflow only; not benchmark performance."
-)
-SMOKE_EPOCHS = 1
-DEVICE_OPTIONS = ("cpu", "cuda:0")
+#: Exact wording milestone A requires wherever a smoke run is offered or shown.
+SMOKE_CHECKBOX_LABEL = SMOKE_NOTICE
 #: Raw stdout/stderr are display tails only; metrics never come from them.
 OUTPUT_TAIL_CHARS = 4000
+#: stderr carries the traceback, so it keeps a much larger tail than stdout
+#: (which is mostly tqdm progress lines).
+ERROR_TAIL_CHARS = 20000
+#: Minimum seconds between two live-progress repaints. The backend emits an
+#: event per tqdm update; repainting on every one would spend the run's time
+#: in Streamlit rather than in BatteryML.
+PROGRESS_REDRAW_INTERVAL_S = 0.25
+#: How many trailing output lines the live log shows while a run is going.
+LIVE_LOG_LINES = 12
 
 
 def _display_name(entry: dict[str, Any]) -> str:
@@ -79,8 +113,38 @@ def run_is_enabled(plan: dict[str, Any] | None) -> bool:
 
 
 def smoke_epochs_value(enabled: bool) -> int | None:
-    """The only execution override the UI may request: epochs=1 or nothing."""
-    return SMOKE_EPOCHS if enabled else None
+    """The only execution override the UI may request: epochs=1 or nothing.
+
+    Delegates to the backend policy so the smoke definition lives in exactly
+    one place (:mod:`batteryml_web.agent.run_policy`).
+    """
+    return smoke_epochs_for(enabled)
+
+
+def device_options(inventory: dict[str, Any] | None) -> list[str]:
+    """Selectable devices: cpu plus every GPU the backend actually enumerated.
+
+    Never a hardcoded GPU count. When enumeration failed, a single manual
+    ``cuda:0`` entry is kept so an explicit GPU choice remains possible, and
+    the caller shows the inventory error beside it.
+    """
+    return device_choices_with_manual_gpu(inventory)
+
+
+def default_device_index(
+    options: list[str], model_key: str, smoke: bool
+) -> tuple[int, str]:
+    """Index of the recommended default device, plus the reason to show.
+
+    The recommendation is advice only: the returned index is the *initial*
+    selection of an editable control, and any listed device may be chosen.
+    """
+    advice = smoke_device_recommendation(
+        model_key, smoke=smoke, available_devices=options
+    )
+    device = str(advice.get("device") or "")
+    index = options.index(device) if device in options else 0
+    return index, str(advice.get("reason") or "")
 
 
 def raw_only_notice(context: dict[str, Any]) -> str | None:
@@ -198,15 +262,92 @@ def _tail_text(text: Any, limit: int = OUTPUT_TAIL_CHARS) -> str:
 
 
 def _compact_execution_output(result: dict[str, Any]) -> dict[str, Any]:
-    """Trim raw stdout/stderr; session state keeps only small display tails."""
+    """Trim raw stdout/stderr; session state keeps only display tails.
+
+    stderr keeps the larger budget because a CUDA OOM traceback ends up
+    there and milestone A requires it to stay readable in the debug view.
+    """
     compacted = dict(result)
-    for key in ("stdout", "stderr"):
-        compacted[key] = _tail_text(compacted.get(key))
+    compacted["stdout"] = _tail_text(compacted.get("stdout"), OUTPUT_TAIL_CHARS)
+    compacted["stderr"] = _tail_text(compacted.get("stderr"), ERROR_TAIL_CHARS)
     return compacted
 
 
+def _render_intent(resolution: dict[str, Any] | None) -> None:
+    """Show how the request was understood, and what was refused.
+
+    Everything displayed here came back from the backend resolver as a
+    canonical identifier or as an explicit rejection; the LLM's prose is
+    shown as rationale only and decides nothing.
+    """
+    if not isinstance(resolution, dict):
+        return
+    if resolution.get("source") == "llm":
+        st.caption("Request interpreted by the LLM, then checked against the platform catalog.")
+    elif resolution.get("llm_available"):
+        st.caption("Request resolved by the deterministic resolver; no LLM call was needed.")
+    else:
+        st.caption(
+            "No LLM is configured, so advanced natural-language understanding is "
+            "unavailable. The deterministic resolver is being used; name the dataset "
+            "and the task explicitly if it cannot tell."
+        )
+    rationale = str(resolution.get("user_facing_rationale") or "")
+    if rationale:
+        st.write(rationale)
+    for warning in resolution.get("warnings", []):
+        st.warning(str(warning))
+    rejected = resolution.get("rejected") or []
+    if rejected:
+        with st.expander("Values the platform refused", expanded=False):
+            for item in rejected:
+                st.write(
+                    f"- {item.get('field')}: {item.get('value')!r} — {item.get('kind')}"
+                )
+    question = str(resolution.get("clarification_question") or "")
+    if resolution.get("needs_clarification") and question:
+        st.info(question)
+
+
+def _render_model_request(model_request: dict[str, Any] | None) -> None:
+    """Explain what happened to an explicitly requested model.
+
+    A blocked or unknown model is never swapped for another one: the
+    alternatives are listed, and the user selects one deliberately below.
+    """
+    if not isinstance(model_request, dict):
+        return
+    status = model_request.get("status")
+    if status in (None, "none", "runnable"):
+        return
+    alternatives = ", ".join(str(key) for key in model_request.get("alternatives", []))
+    st.warning(str(model_request.get("reason") or "The requested model is unavailable."))
+    if alternatives:
+        st.write(
+            f"Runnable alternatives: {alternatives}. Select one below to continue — "
+            "nothing was substituted for you."
+        )
+    else:
+        st.write("No model is runnable for this dataset and task right now.")
+
+
+def _render_suggestions(suggestions: dict[str, Any] | None) -> None:
+    """Show the agent's suggestions after the backend has filtered them."""
+    if not isinstance(suggestions, dict):
+        return
+    runnable = [str(key) for key in suggestions.get("runnable", [])]
+    blocked = [str(key) for key in suggestions.get("blocked", [])]
+    if runnable:
+        st.write(f"**Agent suggests (runnable now):** {', '.join(runnable)}")
+    if blocked:
+        st.write(
+            f"**Also mentioned, but blocked:** {', '.join(blocked)} — "
+            "these cannot be run; see the blocked models above for why."
+        )
+
+
 def _render_context(context: dict[str, Any]) -> None:
-    st.markdown("#### Workflow analysis")
+    st.subheader("Workflow analysis", anchor=False)
     cols = st.columns(3)
     cols[0].metric("Dataset", str(context.get("dataset") or "Unknown"))
     cols[1].metric("Task", str(context.get("task") or "Unknown"))
@@ -238,8 +379,36 @@ def _render_context(context: dict[str, Any]) -> None:
                 st.write(f"- {step}")
 
 
+def _gpu_inventory(refresh: bool = False) -> dict[str, Any]:
+    """Cached GPU inventory for this session.
+
+    ``nvidia-smi`` is queried once per session (and on an explicit refresh)
+    rather than on every Streamlit rerun. The value is a small
+    JSON-serializable dict from the backend; nothing here inspects the GPU
+    itself.
+    """
+    cached = st.session_state.get("gpu_inventory")
+    if refresh or not isinstance(cached, dict):
+        cached = query_gpu_inventory()
+        st.session_state["gpu_inventory"] = cached
+    return cached
+
+
+def _render_gpu_inventory(inventory: dict[str, Any]) -> None:
+    """Show what the machine actually reports; never a hardcoded GPU count."""
+    rows = inventory_rows(inventory)
+    if rows:
+        st.caption(
+            f"{len(rows)} CUDA device(s) reported by nvidia-smi. Free memory is a "
+            "snapshot of a shared machine."
+        )
+        st.dataframe(rows, hide_index=True, use_container_width=True)
+    elif inventory.get("error"):
+        st.caption(f"GPU inventory unavailable: {inventory['error']}")
+
+
 def _render_plan(plan: dict[str, Any], device: str, seed: int) -> None:
-    st.markdown("#### Execution plan")
+    st.subheader("Execution plan", anchor=False)
     rows = [
         {"Field": "Dataset", "Value": str(plan.get("dataset"))},
         {"Field": "Task", "Value": str(plan.get("task"))},
@@ -257,30 +426,133 @@ def _render_plan(plan: dict[str, Any], device: str, seed: int) -> None:
     if not run_is_enabled(plan):
         st.warning(str(plan.get("reason") or "The backend planner refused execution."))
     elif plan.get("epochs") == SMOKE_EPOCHS:
-        st.info(SMOKE_CHECKBOX_LABEL)
+        st.info(SMOKE_NOTICE)
 
 
-def _render_execution_status(result: dict[str, Any]) -> None:
-    st.markdown("#### Execution status")
+def progress_caption(
+    stage: str,
+    current: int | None,
+    total: int | None,
+    elapsed_s: float,
+) -> str:
+    """One status line: the stage, the observed counter, and elapsed time.
+
+    A counter appears only when the run itself reported one. There is no
+    fallback percentage: an unknown position is shown as the stage plus the
+    elapsed clock, never as an invented number.
+    """
+    parts = [str(stage or "Running")]
+    if isinstance(current, int) and isinstance(total, int) and total > 0:
+        parts.append(f"step {current}/{total}")
+    parts.append(f"elapsed {_format_elapsed(elapsed_s)}")
+    return " — ".join(parts)
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+class _LiveProgress:
+    """Renders backend progress events into three Streamlit placeholders.
+
+    Holds no execution logic: it only formats what
+    :func:`batteryml_web.agent.streaming.execute_plan_streaming` reports. It
+    never derives a percentage the run did not provide, and never reads a
+    metric out of the output — ``fraction`` is drawn only when the event
+    carries one.
+    """
+
+    def __init__(self, status_slot: Any, bar_slot: Any, log_slot: Any) -> None:
+        self._status = status_slot
+        self._bar = bar_slot
+        self._log = log_slot
+        self._started = time.monotonic()
+        self._last_draw = 0.0
+        self._stage = ""
+        self._lines: list[str] = []
+
+    def on_event(self, event: dict[str, Any]) -> None:
+        message = str(event.get("message") or "")
+        if event.get("type") in ("output", "training_progress") and message:
+            self._lines.append(message)
+            del self._lines[:-LIVE_LOG_LINES]
+
+        stage = str(event.get("stage") or "")
+        now = time.monotonic()
+        forced = (
+            event.get("type") == "completed"
+            or (stage and stage != self._stage and message != HEARTBEAT_MESSAGE)
+        )
+        if not forced and (now - self._last_draw) < PROGRESS_REDRAW_INTERVAL_S:
+            return
+        self._stage = stage
+        self._last_draw = now
+        self._draw(event)
+
+    def _draw(self, event: dict[str, Any]) -> None:
+        elapsed = time.monotonic() - self._started
+        caption = progress_caption(
+            str(event.get("stage") or ""),
+            event.get("current"),
+            event.get("total"),
+            elapsed,
+        )
+        if event.get("stage") == STAGE_FAILED:
+            self._status.error(caption)
+        else:
+            self._status.info(caption)
+        fraction = event.get("fraction")
+        # bool is an int subclass; True must never be read as 100%.
+        if isinstance(fraction, (int, float)) and not isinstance(fraction, bool):
+            self._bar.progress(min(max(float(fraction), 0.0), 1.0))
+        if self._lines:
+            self._log.code("\n".join(self._lines), language="text")
+
+
+def _render_execution_status(
+    result: dict[str, Any],
+    *,
+    device: str = "cpu",
+    inventory: dict[str, Any] | None = None,
+    smoke: bool = False,
+) -> None:
+    st.subheader("Execution status", anchor=False)
     st.write(f"**Started:** {'Yes' if result.get('started') else 'No'}")
     st.write(f"**Completed:** {'Yes' if result.get('completed') else 'No'}")
     st.write(f"**Success:** {bool(result.get('success'))}")
     st.write(f"**Return code:** {result.get('returncode', 'N/A')}")
-    if result.get("error"):
+
+    diagnosis = classify_execution_failure(
+        result, device=device, inventory=inventory, smoke=smoke
+    )
+    if diagnosis["kind"] != "none":
+        st.error(diagnosis["headline"])
+        for action in diagnosis["actions"]:
+            st.write(f"- {action}")
+        if diagnosis["evidence_line"]:
+            st.caption(f"From the run's own output: {diagnosis['evidence_line']}")
+    elif result.get("error"):
         st.error(str(result["error"]))
+
     with st.expander("Execution debug output", expanded=False):
         command = result.get("command")
         if command:
             st.caption("Exact argv executed (built by the backend planner):")
             st.code(" ".join(str(part) for part in command), language="bash")
+        if result.get("error"):
+            st.caption("Executor error")
+            st.text(str(result["error"]))
         st.caption("stdout")
         st.text(result.get("stdout") or "No stdout captured.")
-        st.caption("stderr")
+        st.caption("stderr (full traceback, as produced by the run)")
         st.text(result.get("stderr") or "No stderr captured.")
 
 
 def _render_result(result_context: dict[str, Any]) -> None:
-    st.markdown("#### Run result")
+    st.subheader("Run result", anchor=False)
     for warning in provenance_warnings(result_context):
         st.warning(f"Provenance not verified: {warning}")
     for warning in smoke_warnings(result_context):
@@ -311,14 +583,111 @@ def _render_result(result_context: dict[str, Any]) -> None:
                 st.caption(str(warning))
 
 
+def _resolve_intent(trimmed: str, catalog: dict[str, Any]) -> dict[str, Any]:
+    """Intent resolution for one request, LLM-assisted where configured.
+
+    Always returns the backend's structured result: canonical dataset, task
+    and model key (or None), never free prose the caller has to parse. The
+    LLM is consulted only when the deterministic resolver cannot answer, and
+    its output has already been checked against the canonical catalog before
+    it gets here.
+    """
+    if is_llm_configured():
+        return resolve_workflow_intent_with_llm(
+            trimmed,
+            base_url=st.session_state["llm_base_url"],
+            api_key=st.session_state["llm_api_key"],
+            model=st.session_state["llm_model"],
+            catalog=catalog,
+        )
+    return resolve_workflow_intent_with_llm(trimmed, catalog=catalog)
+
+
+def _analyze_request(trimmed: str) -> None:
+    """Resolve one request through the backend and store the result.
+
+    Analysis only: it resolves intent, reads readiness and builds the compact
+    workflow context, and optionally asks the LLM to explain it. Nothing is
+    executed here — execution needs the explicit Run button below.
+    """
+    st.session_state["agent_original_request"] = trimmed
+    for key in (
+        "agent_selected_model",
+        "agent_execution_plan",
+        "agent_execution_result",
+        "agent_result_context",
+        "agent_explanation",
+        "agent_run_signature",
+        "agent_model_request",
+        "agent_suggestions",
+    ):
+        st.session_state.pop(key, None)
+    if st.session_state.get("agent_model_choice") is not None:
+        st.session_state.pop("agent_model_choice", None)
+
+    # Built once: it scans the config registry and the dataset directories,
+    # and both the resolver and the model-request check need the same menu.
+    catalog = build_intent_catalog()
+    resolution = _resolve_intent(trimmed, catalog)
+    _store_json_state("agent_intent", resolution)
+
+    if not resolution.get("dataset") or not resolution.get("task"):
+        _store_json_state("agent_workflow_context", None)
+        st.session_state["agent_explanation"] = str(
+            resolution.get("clarification_question")
+            or resolution.get("user_facing_rationale")
+            or resolution.get("message")
+            or "The request could not be resolved to a dataset and a task."
+        )
+        return
+
+    context = build_agent_workflow_context(
+        str(resolution["dataset"]), str(resolution["task"])
+    )
+    _store_json_state("agent_workflow_context", context)
+
+    # What the request asked for, judged against the authoritative context.
+    model_request = resolve_model_request(
+        resolution.get("requested_model"), context, catalog
+    )
+    _store_json_state("agent_model_request", model_request)
+    if model_request.get("status") == "runnable" and model_request.get("model_key"):
+        st.session_state["agent_selected_model"] = str(model_request["model_key"])
+
+    _store_json_state(
+        "agent_suggestions",
+        filter_suggestions(list(resolution.get("suggested_model_keys") or []), context),
+    )
+
+    if not is_llm_configured():
+        return
+    try:
+        guidance = guide_workflow(
+            trimmed,
+            base_url=st.session_state["llm_base_url"],
+            api_key=st.session_state["llm_api_key"],
+            model=st.session_state["llm_model"],
+        )
+        st.session_state["agent_explanation"] = str(guidance.get("guidance") or "")
+    except Exception as exc:
+        st.session_state["agent_explanation"] = f"LLM guidance failed: {exc}"
+
+
 def render_agent_workflow() -> None:
     """Analyze -> select -> plan -> explicit Run -> structured result -> explain."""
-    st.markdown("## 🤖 Agent Workflow")
+    st.header("🤖 Agent Workflow", anchor=False)
     st.caption(
         "A natural-language request is resolved by the deterministic backend workflow; "
         "readiness, validation and metrics are authoritative. The optional LLM agent "
         "explains; it never triggers execution."
     )
+
+    # A request handed over from Home. Analysed once, on arrival, so the page
+    # opens on the backend's answer instead of an empty form. Popped first so
+    # a rerun cannot re-analyse it.
+    pending = st.session_state.pop("agent_pending_request", None)
+    if isinstance(pending, str) and pending.strip():
+        _analyze_request(pending.strip())
 
     request = st.text_area(
         "Workflow request",
@@ -331,53 +700,28 @@ def render_agent_workflow() -> None:
         if not str(request or "").strip():
             st.error("Enter a workflow request before analyzing.")
         else:
-            trimmed = str(request).strip()
-            preview = workflow_guidance_preview(trimmed)
-            st.session_state["agent_original_request"] = trimmed
-            for key in (
-                "agent_selected_model",
-                "agent_execution_plan",
-                "agent_execution_result",
-                "agent_result_context",
-                "agent_explanation",
-            ):
-                st.session_state.pop(key, None)
-            if st.session_state.get("agent_model_choice") is not None:
-                st.session_state.pop("agent_model_choice", None)
-            if preview.get("workflow_context") is None:
-                intent = resolve_workflow_intent(trimmed)
-                _store_json_state("agent_workflow_context", None)
-                st.session_state["agent_explanation"] = str(intent.get("message"))
-            else:
-                _store_json_state("agent_workflow_context", preview["workflow_context"])
-                if is_llm_configured():
-                    try:
-                        guidance = guide_workflow(
-                            trimmed,
-                            base_url=st.session_state["llm_base_url"],
-                            api_key=st.session_state["llm_api_key"],
-                            model=st.session_state["llm_model"],
-                        )
-                        st.session_state["agent_explanation"] = str(guidance.get("guidance") or "")
-                    except Exception as exc:
-                        st.session_state["agent_explanation"] = f"LLM guidance failed: {exc}"
+            _analyze_request(str(request).strip())
             st.rerun()
 
     context = st.session_state.get("agent_workflow_context")
     if not isinstance(context, dict):
+        _render_intent(st.session_state.get("agent_intent"))
         st.info("Enter a request and press Analyze to load the backend workflow state.")
         if st.session_state.get("agent_explanation"):
             st.write(st.session_state["agent_explanation"])
         return
 
+    _render_intent(st.session_state.get("agent_intent"))
     _render_context(context)
+    _render_model_request(st.session_state.get("agent_model_request"))
+    _render_suggestions(st.session_state.get("agent_suggestions"))
 
     options = runnable_model_keys(context)
     plan: dict[str, Any] | None = None
     smoke = False
-    device = st.session_state.get("agent_device", DEVICE_OPTIONS[0])
-    if device not in DEVICE_OPTIONS:
-        device = DEVICE_OPTIONS[0]
+    inventory = _gpu_inventory()
+    devices = device_options(inventory)
+    device = devices[0]
     seed = 0
 
     if options:
@@ -394,14 +738,31 @@ def render_agent_workflow() -> None:
         )
         st.session_state["agent_selected_model"] = str(selected_key)
 
+        # Smoke mode first: it is what makes CPU the recommended default for
+        # the models whose smoke run must not compete for GPU memory.
+        smoke = st.checkbox(SMOKE_CHECKBOX_LABEL, key="agent_smoke_mode")
+
+        st.markdown("**Device**")
+        _render_gpu_inventory(inventory)
+        default_index, device_reason = default_device_index(
+            devices, str(selected_key), smoke
+        )
+        if device_reason:
+            st.info(device_reason)
+        # The widget key encodes (model, smoke) so that switching model or
+        # toggling smoke re-applies the backend's recommended default instead
+        # of silently keeping a device chosen for a different combination.
         device = st.selectbox(
             "Device",
-            list(DEVICE_OPTIONS),
-            key="agent_device_select",
+            devices,
+            index=default_index,
+            format_func=lambda name: device_label(name, inventory),
+            key=f"agent_device_select_{selected_key}_{int(bool(smoke))}",
         )
         st.session_state["agent_device"] = str(device)
-
-        smoke = st.checkbox(SMOKE_CHECKBOX_LABEL, key="agent_smoke_mode")
+        advisory = gpu_memory_advisory(str(device), inventory)
+        if advisory:
+            st.warning(advisory)
 
         plan = build_execution_plan(
             str(context.get("dataset")),
@@ -445,8 +806,18 @@ def render_agent_workflow() -> None:
             use_container_width=True,
             key="agent_run",
         ):
-            with st.spinner("Executing the validated plan (explicit user action)..."):
-                result = execute_plan(plan, repo_root=REPO_ROOT, env=get_safe_runtime_env())
+            st.caption("Executing the validated plan (explicit user action).")
+            progress = _LiveProgress(st.empty(), st.empty(), st.empty())
+            result = execute_plan_streaming(
+                plan,
+                on_event=progress.on_event,
+                repo_root=REPO_ROOT,
+                env=get_safe_runtime_env(),
+            )
+            # Provenance for the failure diagnosis only; neither field is read
+            # back by the executor or by build_result_context.
+            result["device"] = str(device)
+            result["smoke"] = bool(smoke)
             workspace = result.get("workspace")
             if result.get("success") and workspace:
                 result_context = build_result_context(
@@ -467,7 +838,12 @@ def render_agent_workflow() -> None:
             st.rerun()
 
     if isinstance(execution_result, dict):
-        _render_execution_status(execution_result)
+        _render_execution_status(
+            execution_result,
+            device=str(execution_result.get("device") or device),
+            inventory=inventory,
+            smoke=bool(execution_result.get("smoke", smoke)),
+        )
 
     if isinstance(result_context, dict):
         _render_result(result_context)
