@@ -27,12 +27,20 @@ NAV_STEPS = [
         "step_no": 2,
     },
     {
+        "key": "agent_workflow",
+        "label": "Agent Workflow",
+        "emoji": "🤖",
+        "description": "Analyze a request, plan, run explicitly, and review verified results",
+        "group": "workflow",
+        "step_no": 3,
+    },
+    {
         "key": "review_results",
         "label": "Review Results",
         "emoji": "📈",
         "description": "Review metrics, predictions, logs, files, and reports",
         "group": "workflow",
-        "step_no": 3,
+        "step_no": 4,
     },
 ]
 

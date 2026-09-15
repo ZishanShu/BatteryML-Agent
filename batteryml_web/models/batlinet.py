@@ -865,12 +865,12 @@ class BatLiNetRULPredictor(NNModel):
             for start in range(
                 0,
                 n,
-                self.batch_size,
+                self.train_batch_size,
             ):
                 indices = order[
                     start:
                     start
-                    + self.batch_size
+                    + self.train_batch_size
                 ]
 
                 x = features[
@@ -986,12 +986,12 @@ class BatLiNetRULPredictor(NNModel):
         for start in range(
             0,
             len(target_features),
-            self.batch_size,
+            self.test_batch_size,
         ):
             x = target_features[
                 start:
                 start
-                + self.batch_size
+                + self.test_batch_size
             ]
 
             (

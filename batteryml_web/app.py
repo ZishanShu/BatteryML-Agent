@@ -13,6 +13,7 @@ import streamlit as st
 import torch
 
 from batteryml_web.agent.llm_client import run_llm_prompt, save_llm_output, test_llm_connection
+from batteryml_web.ui.agent_workflow import render_agent_workflow
 from batteryml_web.core.custom_uploads import (
     ALLOWED_CUSTOM_SOURCE_FORMATS,
     build_uploaded_dataset_manifest,
@@ -27,6 +28,8 @@ from batteryml_web.core.results_reader import find_result_files, load_metrics, l
 from batteryml_web.ui.llm_state import ensure_llm_state_defaults, get_llm_status, is_llm_configured, refresh_llm_status_from_config, set_llm_settings
 from batteryml_web.ui.progress_utils import get_safe_runtime_env, run_command_with_progress
 from batteryml_web.ui.workflow_sidebar import NAV_STEPS, get_current_step_index, render_sidebar_workflow, set_current_step
+from batteryml_web.core.readiness import assess_dataset
+from batteryml_web.core.config_registry import get_config_registry
 
 st.set_page_config(
     page_title="BatteryML Protocol Platform",
@@ -531,33 +534,79 @@ def _dataset_label(entry: dict[str, Any]) -> str:
 
 
 def _dataset_display_map() -> dict[str, dict[str, Any]]:
-    return {entry["name"]: entry for entry in _dataset_manifest_entries() if entry.get("name")}
+    display: dict[str, dict[str, Any]] = {}
+    for entry in _dataset_manifest_entries():
+        name = entry.get("name")
+        if name and name not in display:
+            display[name] = entry
+    return display
 
 
 def _dataset_card(name: str) -> dict[str, Any]:
+    """UI dataset metadata backed by the authoritative readiness layer."""
     entry = _dataset_display_map().get(name, {})
-    path = Path(entry.get("path", f"data/raw/{name}"))
+    readiness = assess_dataset(name)
+
+    raw_path = Path(readiness.raw_path)
+    processed_path = Path(readiness.processed_path)
+
+    # Preserve the manifest path for display/catalog purposes only.
+    manifest_path = Path(
+        entry.get(
+            "path",
+            readiness.raw_path,
+        )
+    )
+
     file_count = entry.get("file_count")
     if file_count is None:
-        file_count = sum(1 for p in path.rglob("*") if p.is_file()) if path.exists() else 0
+        if raw_path.is_file():
+            file_count = 1
+        elif raw_path.is_dir():
+            file_count = sum(
+                1 for p in raw_path.rglob("*") if p.is_file()
+            )
+        else:
+            file_count = 0
+
     return {
         "name": entry.get("name", name),
         "source": entry.get("source", "-"),
         "battery_family": entry.get("battery_family", "-"),
         "version": entry.get("version", "-"),
-        "path": path,
+        "path": manifest_path,
+        "raw_path": raw_path,
+        "processed_path": processed_path,
         "file_count": file_count,
         "size": entry.get("size", "-"),
-        "status": entry.get("status", "missing"),
-        "raw_exists": path.exists(),
-        "processed_exists": str(path).startswith(str(REPO_ROOT / "data" / "processed")) and path.exists(),
-        "ready": path.exists(),
+        "status": readiness.status.value,
+        "raw_exists": readiness.raw_available,
+        "raw_files": (
+            1
+            if raw_path.is_file()
+            else sum(1 for p in raw_path.rglob("*") if p.is_file())
+            if raw_path.is_dir()
+            else 0
+        ),
+        "processed_exists": readiness.processed_available,
+        "processed_files": readiness.processed_sample_count,
+        "ready": readiness.status.value == "READY",
+        "preprocessing_supported": readiness.preprocessing_supported,
+        "readiness_reason": readiness.reason,
+        "recommended_action": readiness.recommended_action,
     }
-
 
 def _ui_dataset_options() -> list[str]:
     entries = _dataset_manifest_entries()
-    return [entry["name"] for entry in entries if entry.get("name")]
+
+    # Preserve manifest order while removing duplicate dataset names.
+    return list(
+        dict.fromkeys(
+            entry["name"]
+            for entry in entries
+            if entry.get("name")
+        )
+    )
 
 
 def _ui_dataset_label(name: str) -> str:
@@ -570,19 +619,30 @@ def _ui_dataset_label(name: str) -> str:
 
 
 def _current_dataset_status(name: str) -> str:
-    entry = _dataset_display_map().get(name, {})
-    source = entry.get("source", "")
-    if source == "BatteryLife/v12":
-        return "Raw/index available, training config not yet registered"
-    if entry.get("status") == "present":
+    info = _dataset_card(name)
+    status = str(info.get("status", "MISSING"))
+    if status == "READY":
         return "Ready"
+    if status == "RAW_ONLY":
+        return "Raw available, preprocessing required"
+    if status == "INCOMPLETE_PROCESSED":
+        return "Processed incomplete, preprocessing required"
     return "Missing"
 
 
 def _render_status_card(info: dict[str, Any]) -> None:
-    ready = info["ready"]
-    status_class = "ready" if ready else "warning" if info["status"] == "present" else "missing"
-    label = "Ready" if ready else "Index available" if info["status"] == "present" else "Missing"
+    ready = bool(info.get("ready"))
+    status = str(info.get("status", "MISSING"))
+    raw_exists = bool(info.get("raw_exists", False))
+    if ready:
+        status_class = "ready"
+        label = "Ready"
+    elif status in ("RAW_ONLY", "INCOMPLETE_PROCESSED") or raw_exists:
+        status_class = "warning"
+        label = "Preprocessing required" if status != "INCOMPLETE_PROCESSED" else "Processed incomplete"
+    else:
+        status_class = "missing"
+        label = "Missing"
     st.markdown(
         f"""
         <div class="dataset-card {status_class}">
@@ -687,19 +747,89 @@ def render_prepare_data_page():
         st.write(f"**Dataset readiness:** {_current_dataset_status(ds)}")
         st.write(f"**Raw path:** `{raw_path}`")
         st.write(f"**Processed path:** `{processed_path}`")
-        st.code("\n".join(["python batteryml_web/core/run_batteryml_cli.py preprocess", ds, str(raw_path), str(processed_path)]), language="bash")
+
         if not info["raw_exists"]:
             st.error("Raw data missing")
-            st.button("Run preprocessing", disabled=True, use_container_width=True, key="prep_run_disabled")
+            st.button(
+                "Run preprocessing",
+                disabled=True,
+                use_container_width=True,
+                key="prep_run_disabled",
+            )
+
+        elif not info.get("preprocessing_supported", False):
+            st.warning(
+                info.get(
+                    "readiness_reason",
+                    "Raw data are present, but this source is not yet wired "
+                    "to the BatteryML preprocessing route.",
+                )
+            )
+            st.info(
+                "This raw source is available locally, but automatic "
+                "preprocessing is not enabled for this source yet."
+            )
+            st.button(
+                "Run preprocessing",
+                disabled=True,
+                use_container_width=True,
+                key="prep_run_unsupported",
+            )
+
         else:
-            btn_label = "Re-run preprocessing" if info["processed_exists"] else "Run preprocessing"
-            if st.button(btn_label, use_container_width=True, key="prep_run"):
-                log_path = (_project_root() or Path("runs/web_projects/default")) / "logs" / f"preprocess_{ds}.log"
-                result = run_command_with_progress(command=[sys.executable, "batteryml_web/core/run_batteryml_cli.py", "preprocess", ds, str(raw_path), str(processed_path)], cwd=REPO_ROOT, log_path=log_path, steps=[(5, "Initialize"), (20, "Check raw data"), (40, "Start preprocessing"), (80, "Write outputs"), (100, "Done")])
-                st.session_state["last_run_status"] = "success" if result["success"] else "failed"
+            command = [
+                sys.executable,
+                "batteryml_web/core/run_batteryml_cli.py",
+                "preprocess",
+                ds,
+                str(raw_path),
+                str(processed_path),
+            ]
+
+            st.code(
+                " ".join(command),
+                language="bash",
+            )
+
+            btn_label = (
+                "Re-run preprocessing"
+                if info["processed_exists"]
+                else "Run preprocessing"
+            )
+
+            if st.button(
+                btn_label,
+                use_container_width=True,
+                key="prep_run",
+            ):
+                log_path = (
+                    _project_root()
+                    or Path("runs/web_projects/default")
+                ) / "logs" / f"preprocess_{ds}.log"
+
+                result = run_command_with_progress(
+                    command=command,
+                    cwd=REPO_ROOT,
+                    log_path=log_path,
+                    steps=[
+                        (5, "Initialize"),
+                        (20, "Check raw data"),
+                        (40, "Start preprocessing"),
+                        (80, "Write outputs"),
+                        (100, "Done"),
+                    ],
+                )
+
+                st.session_state["last_run_status"] = (
+                    "success" if result["success"] else "failed"
+                )
                 st.session_state["last_run_time"] = result["elapsed"]
                 st.session_state["last_run_code"] = result["return_code"]
-                st.session_state["last_preprocess_log"] = Path(result["log_path"]).read_text(encoding="utf-8") if Path(result["log_path"]).exists() else ""
+                st.session_state["last_preprocess_log"] = (
+                    Path(result["log_path"]).read_text(encoding="utf-8")
+                    if Path(result["log_path"]).exists()
+                    else ""
+                )
         if st.session_state.get("last_preprocess_log"):
             with st.expander("Latest preprocessing log", expanded=False):
                 st.text_area("Log", value=st.session_state["last_preprocess_log"], height=260, key="prep_log_view")
@@ -838,7 +968,7 @@ def _discover_run_configs() -> dict[tuple[str, str, str], list[Path]]:
     registry = get_config_registry(str(REPO_ROOT))
     config_map: dict[tuple[str, str, str], list[Path]] = {}
     for entry in registry.entries:
-        config_map.setdefault((entry.dataset, entry.task, entry.model), []).append(entry.config_path)
+        config_map.setdefault((entry.dataset, entry.task, entry.model_key), []).append(entry.config_path)
     for key in list(config_map.keys()):
         config_map[key] = sorted(config_map[key], key=lambda p: p.as_posix())
     return config_map
@@ -1072,7 +1202,7 @@ def render_run_model_page():
             st.session_state["selected_dataset"] = ds
             task_choice = st.radio("Task", tasks, index=0 if st.session_state.get("selected_task", "RUL") == "RUL" else 1, key="run_task_radio", horizontal=True)
             st.session_state["selected_task"] = task_choice
-            available_models = sorted({entry.model for entry in get_config_registry(str(REPO_ROOT)).get_entries(ds, task_choice)})
+            available_models = sorted({entry.model_key for entry in get_config_registry(str(REPO_ROOT)).get_entries(ds, task_choice)})
             if not available_models:
                 st.warning("No configured model is available for this dataset/task. Please add a valid YAML config.")
                 available_models = []
@@ -1473,6 +1603,8 @@ elif current_step == "prepare_data":
     render_prepare_data_page()
 elif current_step == "run_model":
     render_run_model_page()
+elif current_step == "agent_workflow":
+    render_agent_workflow()
 elif current_step == "review_results":
     render_review_results_page()
 else:
