@@ -268,7 +268,7 @@ def _compact_execution_output(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _render_context(context: dict[str, Any]) -> None:
-    st.markdown("#### Workflow analysis")
+    st.subheader("Workflow analysis", anchor=False)
     cols = st.columns(3)
     cols[0].metric("Dataset", str(context.get("dataset") or "Unknown"))
     cols[1].metric("Task", str(context.get("task") or "Unknown"))
@@ -329,7 +329,7 @@ def _render_gpu_inventory(inventory: dict[str, Any]) -> None:
 
 
 def _render_plan(plan: dict[str, Any], device: str, seed: int) -> None:
-    st.markdown("#### Execution plan")
+    st.subheader("Execution plan", anchor=False)
     rows = [
         {"Field": "Dataset", "Value": str(plan.get("dataset"))},
         {"Field": "Task", "Value": str(plan.get("task"))},
@@ -439,7 +439,7 @@ def _render_execution_status(
     inventory: dict[str, Any] | None = None,
     smoke: bool = False,
 ) -> None:
-    st.markdown("#### Execution status")
+    st.subheader("Execution status", anchor=False)
     st.write(f"**Started:** {'Yes' if result.get('started') else 'No'}")
     st.write(f"**Completed:** {'Yes' if result.get('completed') else 'No'}")
     st.write(f"**Success:** {bool(result.get('success'))}")
@@ -472,7 +472,7 @@ def _render_execution_status(
 
 
 def _render_result(result_context: dict[str, Any]) -> None:
-    st.markdown("#### Run result")
+    st.subheader("Run result", anchor=False)
     for warning in provenance_warnings(result_context):
         st.warning(f"Provenance not verified: {warning}")
     for warning in smoke_warnings(result_context):
@@ -503,14 +503,61 @@ def _render_result(result_context: dict[str, Any]) -> None:
                 st.caption(str(warning))
 
 
+def _analyze_request(trimmed: str) -> None:
+    """Resolve one request through the backend and store the result.
+
+    Analysis only: it reads readiness and builds the compact workflow
+    context, and optionally asks the LLM to explain it. Nothing is executed
+    here — execution needs the explicit Run button below.
+    """
+    preview = workflow_guidance_preview(trimmed)
+    st.session_state["agent_original_request"] = trimmed
+    for key in (
+        "agent_selected_model",
+        "agent_execution_plan",
+        "agent_execution_result",
+        "agent_result_context",
+        "agent_explanation",
+        "agent_run_signature",
+    ):
+        st.session_state.pop(key, None)
+    if st.session_state.get("agent_model_choice") is not None:
+        st.session_state.pop("agent_model_choice", None)
+    if preview.get("workflow_context") is None:
+        intent = resolve_workflow_intent(trimmed)
+        _store_json_state("agent_workflow_context", None)
+        st.session_state["agent_explanation"] = str(intent.get("message"))
+        return
+    _store_json_state("agent_workflow_context", preview["workflow_context"])
+    if not is_llm_configured():
+        return
+    try:
+        guidance = guide_workflow(
+            trimmed,
+            base_url=st.session_state["llm_base_url"],
+            api_key=st.session_state["llm_api_key"],
+            model=st.session_state["llm_model"],
+        )
+        st.session_state["agent_explanation"] = str(guidance.get("guidance") or "")
+    except Exception as exc:
+        st.session_state["agent_explanation"] = f"LLM guidance failed: {exc}"
+
+
 def render_agent_workflow() -> None:
     """Analyze -> select -> plan -> explicit Run -> structured result -> explain."""
-    st.markdown("## 🤖 Agent Workflow")
+    st.header("🤖 Agent Workflow", anchor=False)
     st.caption(
         "A natural-language request is resolved by the deterministic backend workflow; "
         "readiness, validation and metrics are authoritative. The optional LLM agent "
         "explains; it never triggers execution."
     )
+
+    # A request handed over from Home. Analysed once, on arrival, so the page
+    # opens on the backend's answer instead of an empty form. Popped first so
+    # a rerun cannot re-analyse it.
+    pending = st.session_state.pop("agent_pending_request", None)
+    if isinstance(pending, str) and pending.strip():
+        _analyze_request(pending.strip())
 
     request = st.text_area(
         "Workflow request",
@@ -523,36 +570,7 @@ def render_agent_workflow() -> None:
         if not str(request or "").strip():
             st.error("Enter a workflow request before analyzing.")
         else:
-            trimmed = str(request).strip()
-            preview = workflow_guidance_preview(trimmed)
-            st.session_state["agent_original_request"] = trimmed
-            for key in (
-                "agent_selected_model",
-                "agent_execution_plan",
-                "agent_execution_result",
-                "agent_result_context",
-                "agent_explanation",
-            ):
-                st.session_state.pop(key, None)
-            if st.session_state.get("agent_model_choice") is not None:
-                st.session_state.pop("agent_model_choice", None)
-            if preview.get("workflow_context") is None:
-                intent = resolve_workflow_intent(trimmed)
-                _store_json_state("agent_workflow_context", None)
-                st.session_state["agent_explanation"] = str(intent.get("message"))
-            else:
-                _store_json_state("agent_workflow_context", preview["workflow_context"])
-                if is_llm_configured():
-                    try:
-                        guidance = guide_workflow(
-                            trimmed,
-                            base_url=st.session_state["llm_base_url"],
-                            api_key=st.session_state["llm_api_key"],
-                            model=st.session_state["llm_model"],
-                        )
-                        st.session_state["agent_explanation"] = str(guidance.get("guidance") or "")
-                    except Exception as exc:
-                        st.session_state["agent_explanation"] = f"LLM guidance failed: {exc}"
+            _analyze_request(str(request).strip())
             st.rerun()
 
     context = st.session_state.get("agent_workflow_context")

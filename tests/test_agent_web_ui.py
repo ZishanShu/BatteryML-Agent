@@ -866,6 +866,64 @@ class TestLiveProgressRendering(unittest.TestCase):
         self.assertFalse(any("794.32" in text for text in fake.rec["infos"]))
 
 
+class TestHandoverFromHome(unittest.TestCase):
+    """Milestone C: a request handed over from Home is analysed, not executed."""
+
+    def setUp(self) -> None:
+        self._real_preview = ui.workflow_guidance_preview
+        self._real_build = ui.build_execution_plan
+        self._real_stream = ui.execute_plan_streaming
+        self._real_llm = ui.is_llm_configured
+        self.preview_calls: list[str] = []
+        self.exec_calls: list[dict] = []
+
+        def stub_preview(request, **kwargs):
+            self.preview_calls.append(request)
+            return {"workflow_context": _MATR_CONTEXT}
+
+        def stub_stream(plan, **kwargs):
+            self.exec_calls.append(plan)
+            raise AssertionError("handover must never execute")
+
+        ui.workflow_guidance_preview = stub_preview
+        ui.build_execution_plan = lambda d, t_, m, **kw: _ok_plan(m, epochs=kw.get("epochs"))
+        ui.execute_plan_streaming = stub_stream
+        ui.is_llm_configured = lambda: False
+
+    def tearDown(self) -> None:
+        ui.workflow_guidance_preview = self._real_preview
+        ui.build_execution_plan = self._real_build
+        ui.execute_plan_streaming = self._real_stream
+        ui.is_llm_configured = self._real_llm
+
+    def test_pending_request_is_analysed_once_and_never_run(self) -> None:
+        session = {
+            "agent_pending_request": "Use BatLiNet on MATR to predict battery lifetime.",
+            "gpu_inventory": _FAKE_GPU_INVENTORY,
+        }
+        _render(session)
+        self.assertEqual(
+            self.preview_calls, ["Use BatLiNet on MATR to predict battery lifetime."]
+        )
+        self.assertEqual(self.exec_calls, [])
+        # Consumed, so a rerun cannot re-analyse it.
+        self.assertNotIn("agent_pending_request", session)
+        self.assertEqual(session["agent_workflow_context"]["dataset"], "MATR")
+        self.assertEqual(
+            session["agent_original_request"],
+            "Use BatLiNet on MATR to predict battery lifetime.",
+        )
+
+    def test_no_pending_request_means_no_analysis(self) -> None:
+        session = {
+            "agent_original_request": "Use BatLiNet on MATR to predict battery lifetime.",
+            "gpu_inventory": _FAKE_GPU_INVENTORY,
+        }
+        _render(session)
+        self.assertEqual(self.preview_calls, [])
+        self.assertEqual(self.exec_calls, [])
+
+
 class TestNoFrontendDuplication(unittest.TestCase):
     """The UI module must not reimplement what the backend owns."""
 

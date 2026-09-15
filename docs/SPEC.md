@@ -107,6 +107,31 @@ started here.
 
 ---
 
+## UI — entry points and feedback
+
+Rationale for the group: the platform has two legitimate ways in — the
+deterministic quick start a reviewer follows with no API key (Route B), and
+the natural-language agent (Route A). Presenting the agent as "step 3 of 4"
+made it look like a mandatory stage of the manual route, and buried the
+product's main entry point inside a sequence. These requirements fix where
+each route is offered, not what either one does.
+
+| ID | Requirement | Status | Implementation |
+| --- | --- | --- | --- |
+| `UI-01` | Home offers Quick Start **and** the Agent Workflow at the same visual hierarchy: a free-text request ("Describe what you want to do...", placeholder "Use CPTransformer on MATR to predict battery lifetime.") and an **Analyze with Agent** button. Quick Start's behaviour is unchanged. | `IMPLEMENTED-STATIC` | `batteryml_web/app.py` (`render_home_agent_entry`) |
+| `UI-02` | Home records the request in session state and navigates; it resolves no intent, reads no readiness, builds no plan and executes nothing. The Agent Workflow page analyses the handed-over request once on arrival through the existing backend; execution still requires the explicit Run button there. | `IMPLEMENTED-STATIC` | `batteryml_web/app.py`, `batteryml_web/ui/agent_workflow.py` (`_analyze_request`) |
+| `UI-03` | Page and section headings use native Streamlit primitives with `anchor=False`, so no heading anchor, link icon or raw markup is exposed in the rendered page. | `IMPLEMENTED-STATIC` | `batteryml_web/app.py`, `batteryml_web/ui/agent_workflow.py` |
+| `UI-04` | The sidebar shows the Agent Workflow as an alternative intelligent entry point in its own block, not as a numbered step of the protocol workflow. The manual route stays numbered 1–3 and remains fully usable with no LLM. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/workflow_sidebar.py` |
+| `UI-05` | Creating a project shows an explicit success state naming the project and its workspace, drawn from the directory that was actually created. Project filesystem semantics are unchanged. | `IMPLEMENTED-STATIC` | `batteryml_web/app.py` (`_ensure_project`, `_render_project_created_notice`) |
+
+The tests for this group are `tests/test_web_navigation.py` (source- and
+AST-level, so Home's boundary is checked without importing torch or
+Streamlit) and the handover class in `tests/test_agent_web_ui.py`. Nothing
+here may be marked `VERIFIED` from this environment: no Streamlit page has
+been rendered in it.
+
+---
+
 ## Amendments
 
 Record here any requirement found to be wrong or impossible, with the proposed
