@@ -187,6 +187,16 @@ to look at eight idle GPUs needs the reasoning, not just the absence.
 
 ---
 
+## Where the moving parts are described
+
+`docs/AGENT_WORKFLOW.md` walks the whole path from a sentence to a validated
+run, says which module owns which decision, and carries the command block the
+user runs on the server to turn any of these rows into `VERIFIED`.
+`docs/GPU_MULTI_GPU_AUDIT.md` carries the device and parallelism audit behind
+the `GPU` group.
+
+---
+
 ## Amendments
 
 Record here any requirement found to be wrong or impossible, with the proposed

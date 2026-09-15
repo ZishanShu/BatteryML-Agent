@@ -505,7 +505,8 @@ class _LiveProgress:
         else:
             self._status.info(caption)
         fraction = event.get("fraction")
-        if isinstance(fraction, (int, float)):
+        # bool is an int subclass; True must never be read as 100%.
+        if isinstance(fraction, (int, float)) and not isinstance(fraction, bool):
             self._bar.progress(min(max(float(fraction), 0.0), 1.0))
         if self._lines:
             self._log.code("\n".join(self._lines), language="text")

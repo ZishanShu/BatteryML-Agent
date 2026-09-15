@@ -21,7 +21,6 @@ except for the optional GPU inventory the caller passes in.
 
 from __future__ import annotations
 
-import re
 from typing import Any, Dict, List, Optional
 
 #: The only epoch count a smoke run uses. ``--epochs 1`` is validated by

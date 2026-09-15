@@ -406,8 +406,15 @@ def render_home_agent_entry() -> None:
                 "agent_execution_result",
                 "agent_result_context",
                 "agent_explanation",
+                "agent_intent",
+                "agent_model_request",
+                "agent_suggestions",
                 "agent_model_choice",
                 "agent_run_signature",
+                # The Agent Workflow page's own text box, so it shows this
+                # request rather than one typed there on an earlier visit.
+                # Safe to delete here: that widget is not rendered on Home.
+                "agent_request_input",
             ):
                 st.session_state.pop(key, None)
             set_current_step("agent_workflow")
