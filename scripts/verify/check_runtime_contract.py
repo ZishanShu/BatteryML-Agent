@@ -10,6 +10,10 @@ the web layer relies on at run time still behave as specified:
   no config is written or mutated anywhere in the planner or the policy;
 * BatLiNet's smoke run recommends CPU, and the required smoke sentence is
   the one the UI shows;
+* a device string is a single torch device — a multi-GPU form such as
+  ``"cuda:0,1"`` is refused at the planner boundary, and no DataParallel,
+  DDP or torchrun path is exposed anywhere in the web layer
+  (``docs/GPU_MULTI_GPU_AUDIT.md`` says why);
 * a CUDA out-of-memory failure is recognised, is never retried, and no
   metric is ever produced from a failed run;
 * the streaming executor stays Streamlit-independent, recognises the real
@@ -120,6 +124,57 @@ def _device_inventory_problems(module: Any) -> list[str]:
             "device_choices_with_manual_gpu must keep one manual GPU entry so an "
             "explicit GPU choice stays possible when enumeration fails."
         )
+    return problems
+
+
+#: Names that would mean a multi-GPU execution path exists. The audit in
+#: docs/GPU_MULTI_GPU_AUDIT.md concludes there is none and that none may be
+#: advertised; this list keeps a fake one from appearing by accident.
+_MULTI_GPU_TOKENS = (
+    "DataParallel",
+    "DistributedDataParallel",
+    "init_process_group",
+    "torchrun",
+    "nproc_per_node",
+)
+
+
+def _device_validation_problems(device_module: Any, execution: Any) -> list[str]:
+    """One torch device per run, enforced before the wrapper is invoked."""
+    problems: list[str] = []
+    for good in ("cpu", "cuda", "cuda:0", "cuda:7", "mps"):
+        try:
+            device_module.validate_device(good)
+        except ValueError as exc:
+            problems.append(f"validate_device rejected the valid device {good!r}: {exc}")
+    for bad in ("cuda:0,1", "cuda:0,cuda:1", "", "gpu", "cuda:x"):
+        try:
+            device_module.validate_device(bad)
+        except ValueError:
+            continue
+        problems.append(
+            f"validate_device accepted {bad!r}; BatteryML passes --device straight to "
+            ".to(device), which takes exactly one device."
+        )
+
+    source = inspect.getsource(execution)
+    if "validate_device(" not in source:
+        problems.append(
+            "build_execution_plan no longer validates the device; a multi-device "
+            "string would reach the CLI and fail inside a started run."
+        )
+
+    web_root = repo_root() / "batteryml_web"
+    for path in sorted(web_root.rglob("*.py")):
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        for token in _MULTI_GPU_TOKENS:
+            # The audit document may name them; the code may not use them.
+            if f"{token}(" in text:
+                problems.append(
+                    f"{path.relative_to(repo_root()).as_posix()} uses {token}; the web "
+                    "layer must not expose a multi-GPU run (see "
+                    "docs/GPU_MULTI_GPU_AUDIT.md)."
+                )
     return problems
 
 
@@ -311,6 +366,7 @@ def check(output_dir: Path | None = None) -> CheckResult:
 
     problems: list[str] = []
     problems.extend(_device_inventory_problems(device_module))
+    problems.extend(_device_validation_problems(device_module, execution_module))
     problems.extend(_smoke_policy_problems(policy_module, execution_module))
     problems.extend(_failure_problems(policy_module, executor_module))
     problems.extend(_streaming_problems(streaming_module))
@@ -359,8 +415,9 @@ def check(output_dir: Path | None = None) -> CheckResult:
         PASS,
         "Device enumeration is argv-based and count-agnostic; a smoke run is "
         "--epochs 1 on the formal config with no config written; BatLiNet smoke "
-        "recommends CPU; CUDA OOM is recognised, never retried and yields no "
-        f"metric; streaming progress is parsed, never fabricated. {gpu_note}.",
+        "recommends CPU; a device is a single torch device and no multi-GPU path "
+        "is exposed; CUDA OOM is recognised, never retried and yields no metric; "
+        f"streaming progress is parsed, never fabricated. {gpu_note}.",
         evidence,
         artifacts,
     )

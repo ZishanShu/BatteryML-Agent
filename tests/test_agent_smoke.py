@@ -179,6 +179,58 @@ class TestDeviceChoices(unittest.TestCase):
         self.assertEqual(rows[0]["Free (MiB)"], "unknown")
 
 
+class TestDeviceValidation(unittest.TestCase):
+    """One torch device per run; no multi-GPU string is ever accepted."""
+
+    def test_single_devices_pass_through(self) -> None:
+        for good in ("cpu", "cuda", "cuda:0", "cuda:7", "mps", " cuda:3 "):
+            with self.subTest(device=good):
+                self.assertEqual(di.validate_device(good), good.strip())
+
+    def test_multi_device_strings_are_refused_with_the_reason(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            di.validate_device("cuda:0,1")
+        message = str(ctx.exception)
+        self.assertIn("more than one device", message)
+        self.assertIn("GPU_MULTI_GPU_AUDIT", message)
+
+    def test_other_nonsense_is_refused(self) -> None:
+        for bad in ("", "   ", "gpu", "cuda:x", "cuda:-1", "cuda: 0"):
+            with self.subTest(device=bad):
+                with self.assertRaises(ValueError):
+                    di.validate_device(bad)
+
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    def test_the_planner_refuses_a_multi_gpu_device(self) -> None:
+        with self.assertRaises(ValueError):
+            build_execution_plan(
+                "MATR", "RUL prediction", "batlinet", device="cuda:0,1", epochs=1
+            )
+
+    def test_no_multi_gpu_machinery_is_exposed_by_the_web_layer(self) -> None:
+        """The audit concludes there is none; nothing may advertise one."""
+        web_root = REPO_ROOT / "batteryml_web"
+        offenders: list[str] = []
+        for path in sorted(web_root.rglob("*.py")):
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            for token in (
+                "DataParallel(",
+                "DistributedDataParallel(",
+                "init_process_group(",
+                "torchrun",
+                "nproc_per_node",
+            ):
+                if token in text:
+                    offenders.append(f"{path.name}: {token}")
+        self.assertEqual(offenders, [])
+
+    def test_the_audit_document_exists_and_states_the_verdict(self) -> None:
+        audit = (REPO_ROOT / "docs" / "GPU_MULTI_GPU_AUDIT.md").read_text(encoding="utf-8")
+        self.assertIn("Multi-GPU is not implemented", audit)
+        self.assertIn("DataBundle.to(device)", audit)
+        self.assertIn("What a real implementation would require", audit)
+
+
 class TestSmokePolicy(unittest.TestCase):
     def test_smoke_epochs_is_one_or_none(self) -> None:
         self.assertEqual(smoke_epochs_for(True), 1)

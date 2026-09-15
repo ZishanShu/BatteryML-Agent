@@ -27,6 +27,7 @@ as a guarantee.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from typing import Any, Callable, Dict, List, Optional
 
@@ -293,3 +294,43 @@ def inventory_rows(inventory: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def _display_mib(value: Any) -> str:
     return str(value) if isinstance(value, int) else "unknown"
+
+
+#: Device strings BatteryML can actually be given. ``bin/batteryml.py run
+#: --device`` is forwarded unchanged to ``DataBundle.to(device)`` and
+#: ``model.to(device)``, both of which take exactly one torch device.
+_DEVICE_RE = re.compile(r"^(cpu|mps|cuda|cuda:\d+)$")
+
+
+def validate_device(device: str) -> str:
+    """Return ``device`` unchanged, or raise naming what is wrong with it.
+
+    Accepts ``cpu``, ``mps``, ``cuda`` and ``cuda:<index>`` — the forms a
+    single ``torch.device`` understands.
+
+    A multi-device string such as ``"cuda:0,1"`` is rejected explicitly,
+    with the reason: it is not a torch device, and accepting it would
+    advertise a multi-GPU capability the platform does not have. See
+    ``docs/GPU_MULTI_GPU_AUDIT.md`` — neither DataParallel nor DDP would
+    help here anyway, because ``DataBundle.to(device)`` places the whole
+    dataset on one device.
+    """
+    name = str(device or "").strip()
+    if not name:
+        raise ValueError(
+            "device is empty. Use 'cpu', 'cuda', 'cuda:<index>' or 'mps'."
+        )
+    if "," in name:
+        raise ValueError(
+            f"device {name!r} names more than one device. BatteryML passes "
+            "--device straight to torch's .to(device), which takes exactly one "
+            "device, so a comma-separated value is not a valid GPU selection "
+            "and this platform exposes no multi-GPU run. Select a single GPU "
+            "('cuda:0', 'cuda:3', ...) or 'cpu'; see docs/GPU_MULTI_GPU_AUDIT.md."
+        )
+    if not _DEVICE_RE.match(name):
+        raise ValueError(
+            f"device {name!r} is not a device BatteryML accepts. Use 'cpu', "
+            "'cuda', 'cuda:<index>' or 'mps'."
+        )
+    return name

@@ -167,6 +167,26 @@ from it.
 
 ---
 
+## GPU — devices and parallelism
+
+Rationale for the group: the development server has eight GPUs, which makes
+two mistakes tempting. The first is hardcoding "8". The second is offering a
+multi-GPU run that does not exist, on the theory that 8 × 2 GB free adds up
+to 16 GB. The audit behind this group is `docs/GPU_MULTI_GPU_AUDIT.md`.
+
+| ID | Requirement | Status | Implementation |
+| --- | --- | --- | --- |
+| `GPU-01` | The machine's GPUs are enumerated at runtime — index, name, total/used/free memory — and any single one may be selected. The count is discovered from the output, never assumed; unknown memory is shown as unknown. | `IMPLEMENTED-STATIC` | `batteryml_web/core/device_inventory.py` (see also `EXEC-04`) |
+| `GPU-02` | A run is sent to exactly one torch device. `cpu`, `cuda`, `cuda:<index>` and `mps` are accepted; a multi-device string such as `cuda:0,1` is refused at the planner boundary with the reason, rather than failing inside a run that has already started. | `IMPLEMENTED-STATIC` | `batteryml_web/core/device_inventory.py` (`validate_device`), `batteryml_web/agent/execution.py` |
+| `GPU-03` | No multi-GPU Run option is exposed while none exists. The web layer contains no `DataParallel`, `DistributedDataParallel`, `init_process_group` or `torchrun` path, and the DEV-01 check fails if one appears. | `IMPLEMENTED-STATIC` | `scripts/verify/check_runtime_contract.py`, `tests/test_agent_smoke.py` |
+| `GPU-04` | The reason multi-GPU is absent is written down, with the code it follows from and the work a real implementation would take: `DataBundle.to(device)` places the whole dataset on one device, so neither DataParallel nor DDP relieves the per-GPU memory limit; BatLiNet's inter-cell support sampling has no defined distributed semantics; DDP changes effective batch size and determinism. | `IMPLEMENTED-STATIC` | `docs/GPU_MULTI_GPU_AUDIT.md` |
+
+`GPU-04` is a documentation requirement on purpose: the decision *not* to
+build something is the part of an audit that gets lost, and the next person
+to look at eight idle GPUs needs the reasoning, not just the absence.
+
+---
+
 ## Amendments
 
 Record here any requirement found to be wrong or impossible, with the proposed

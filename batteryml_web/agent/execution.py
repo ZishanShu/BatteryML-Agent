@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..core.device_inventory import validate_device
 from .intent import resolve_workflow_intent
 from .prompts import build_agent_workflow_context
 
@@ -186,7 +187,10 @@ def build_execution_plan(
             output must never be passed here as authority.
         repo_root: forwarded to the readiness layer when the context is
             built inside this call.
-        device / seed / workspace: CLI run parameters (informational only).
+        device / seed / workspace: CLI run parameters. ``device`` must be a
+            single torch device (``cpu``, ``cuda``, ``cuda:<index>``,
+            ``mps``); a multi-device string is refused, because BatteryML
+            forwards this value straight to ``.to(device)``.
         workflow_context: optional prebuilt compact context (test seam for
             mocked READY state). When omitted it is built from
             ``(dataset, task)``; only its ``validated_config`` values may
@@ -210,6 +214,10 @@ def build_execution_plan(
     if not str(model or "").strip():
         raise ValueError("build_execution_plan: model is empty.")
     epochs_value = _validate_epochs(epochs)
+    # A single torch device, always. "cuda:0,1" is refused here rather than
+    # handed to the CLI, where .to(device) would fail deep inside a run; see
+    # docs/GPU_MULTI_GPU_AUDIT.md for why no multi-GPU form is accepted.
+    device_value = validate_device(device)
 
     from ..core.config_validator import load_and_validate_config_file
 
@@ -298,7 +306,7 @@ def build_execution_plan(
             "--train",
             "--eval",
             "--device",
-            str(device),
+            device_value,
             "--seed",
             str(seed),
         ]
