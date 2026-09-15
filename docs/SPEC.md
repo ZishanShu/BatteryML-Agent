@@ -36,7 +36,7 @@ everything is done.
 | Namespace | What it identifies | Where it lives |
 | --- | --- | --- |
 | `VIZ-nn`, and future feature prefixes | a **requirement** — something the platform must do | this file |
-| `ENV-01`, `DATA-01`, `CFG-01`, `VAL-01`, `SPLIT-01`, `REG-01`, `EXT-01`, `CLI-01`, `FIG-01` | a **check** — something the verification harness establishes | `docs/VERIFY.md` |
+| `ENV-01`, `DATA-01`, `CFG-01`, `VAL-01`, `SPLIT-01`, `REG-01`, `EXT-01`, `CLI-01`, `FIG-01`, `DEV-01` | a **check** — something the verification harness establishes | `docs/VERIFY.md` |
 
 They are the same shape, so keep the prefixes disjoint: the figure *requirements*
 are `VIZ-01`…, and the figure *check* that verifies them is `FIG-01`. Nothing is
@@ -75,6 +75,32 @@ cells; a per-cell error chart shows whether one outlier carries the RMSE. The
 * No requirement in this group may be marked `VERIFIED` from this environment:
   it has no numpy, no matplotlib and no torch, so no figure has ever been drawn
   here. The command block that would verify them is in `docs/VISUALIZATION.md`.
+
+---
+
+## EXEC — execution runtime (smoke runs, devices, failures)
+
+Rationale for the group: the platform's one irreversible action is starting a
+BatteryML run. Everything about *how* that run is started — which device, how
+many epochs, what happens when it fails — must be decided by the backend and
+displayed honestly, because this is exactly where a plausible-looking shortcut
+(a retried OOM, a mutated config, a fabricated percentage) would silently
+change what the manuscript reports.
+
+| ID | Requirement | Status | Implementation |
+| --- | --- | --- | --- |
+| `EXEC-01` | A smoke run is one epoch of the model's **own formal config**. The only override is the planner's `--epochs 1`; no config file is written, copied or mutated, and no batch size, support size or learning rate is touched. A smoke run therefore exercises the same code path a benchmark run does. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/run_policy.py` (`SMOKE_EPOCHS`, `smoke_epochs_for`), `batteryml_web/agent/execution.py` (`build_execution_plan`) |
+| `EXEC-02` | Every surface that offers or reports a smoke run shows the sentence "1-epoch smoke test — workflow validation only; not benchmark performance." A smoke metric is never presented as benchmark performance. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/run_policy.py` (`SMOKE_NOTICE`), `batteryml_web/ui/agent_workflow.py` |
+| `EXEC-03` | BatLiNet's smoke run defaults to and recommends CPU, with the reason stated. An explicit GPU choice is always honoured; the recommendation never selects a device on the user's behalf. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/run_policy.py` (`SMOKE_CPU_RECOMMENDED_MODELS`, `smoke_device_recommendation`) |
+| `EXEC-04` | Selectable devices are enumerated from the machine (`nvidia-smi`), never from a hardcoded GPU count, and each is shown with its observed free/total memory. Unknown memory is displayed as unknown, never as zero. When enumeration fails, an explicit GPU choice remains possible and the enumeration error is shown beside it. | `IMPLEMENTED-STATIC` | `batteryml_web/core/device_inventory.py`, `batteryml_web/ui/agent_workflow.py` (`device_options`) |
+| `EXEC-05` | A failed run is never retried — not on another GPU, not on the same one. A CUDA out-of-memory failure is named as a shared-memory condition, states the CPU-smoke and larger-GPU alternatives, quotes the run's own error line, and leaves the full stdout/stderr (traceback included) available for inspection. No metric is ever derived from a failed run. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/run_policy.py` (`classify_execution_failure`), `batteryml_web/agent/executor.py` |
+
+The check that establishes `EXEC-01`…`EXEC-05` is `DEV-01`
+(`scripts/verify/check_runtime_contract.py`); the unit tests are
+`tests/test_agent_smoke.py` and the milestone-A classes in
+`tests/test_agent_web_ui.py`. None of them may be marked `VERIFIED` from this
+environment: it has no torch, no GPU and no Streamlit, so no run has ever
+started here.
 
 ---
 

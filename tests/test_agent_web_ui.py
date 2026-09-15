@@ -33,7 +33,23 @@ if str(REPO_ROOT) not in sys.path:
 
 from tests.test_readiness import REGISTRIES_AVAILABLE  # noqa: E402
 from batteryml_web.agent.results import SMOKE_RUN_WARNING  # noqa: E402
+from batteryml_web.agent.run_policy import SMOKE_NOTICE  # noqa: E402
+from batteryml_web.core import device_inventory as di  # noqa: E402
 from batteryml_web.ui import agent_workflow as ui  # noqa: E402
+
+#: A fixed two-GPU inventory. Seeded into session state by every render test
+#: so the UI never shells out to nvidia-smi during the suite and the device
+#: control is deterministic wherever the tests run.
+_FAKE_GPU_INVENTORY = {
+    "source": "nvidia-smi",
+    "available": True,
+    "device_count": 2,
+    "devices": di.parse_nvidia_smi_gpu_csv(
+        "0, NVIDIA GeForce RTX 3090, 24576, 22500, 2076\n"
+        "1, NVIDIA GeForce RTX 3090, 24576, 14000, 10576\n"
+    ),
+    "error": None,
+}
 
 
 class _Rerun(Exception):
@@ -451,6 +467,7 @@ class TestRenderBoundaries(unittest.TestCase):
         return {
             "agent_workflow_context": context,
             "agent_original_request": "Use CPTransformer on MATR to predict battery lifetime.",
+            "gpu_inventory": _FAKE_GPU_INVENTORY,
         }
 
     def test_analyze_never_executes_and_plan_is_per_selection(self) -> None:
@@ -563,6 +580,139 @@ class TestRenderBoundaries(unittest.TestCase):
         stored = session.get("agent_execution_result")
         if stored is not None:  # rerun happens before store in some flows
             self.assertLessEqual(len(stored.get("stdout", "")), ui.OUTPUT_TAIL_CHARS + 64)
+
+
+class TestSmokeAndDeviceSelection(unittest.TestCase):
+    """Milestone A: smoke wording, device inventory, and the CPU default."""
+
+    def test_smoke_label_is_the_required_sentence(self) -> None:
+        self.assertEqual(ui.SMOKE_CHECKBOX_LABEL, SMOKE_NOTICE)
+        self.assertEqual(
+            ui.SMOKE_CHECKBOX_LABEL,
+            "1-epoch smoke test — workflow validation only; not benchmark performance.",
+        )
+
+    def test_device_options_follow_the_inventory_not_a_constant(self) -> None:
+        self.assertEqual(
+            ui.device_options(_FAKE_GPU_INVENTORY), ["cpu", "cuda:0", "cuda:1"]
+        )
+        eight = {
+            "devices": di.parse_nvidia_smi_gpu_csv(
+                "".join(f"{i}, RTX 3090, 24576, 22000, 2576\n" for i in range(8))
+            )
+        }
+        self.assertEqual(len(ui.device_options(eight)), 9)
+        # Unknown inventory still allows an explicit GPU choice.
+        self.assertEqual(
+            ui.device_options(di.empty_inventory("no nvidia-smi")), ["cpu", "cuda:0"]
+        )
+
+    def test_batlinet_smoke_defaults_to_cpu_and_explains_why(self) -> None:
+        options = ["cpu", "cuda:0", "cuda:1"]
+        index, reason = ui.default_device_index(options, "batlinet", True)
+        self.assertEqual(options[index], "cpu")
+        self.assertIn("CPU", reason)
+        # No recommendation text for the ordinary cases.
+        self.assertEqual(ui.default_device_index(options, "batlinet", False)[1], "")
+        self.assertEqual(ui.default_device_index(options, "cptransformer", True)[1], "")
+
+    def test_no_hardcoded_gpu_count_in_the_ui_module(self) -> None:
+        source = Path(ui.__file__).read_text(encoding="utf-8")
+        for forbidden in ("cuda:1", "cuda:2", "cuda:3", "cuda:7", "range(8)"):
+            self.assertNotIn(forbidden, source)
+
+
+class TestBatLiNetSmokeRender(unittest.TestCase):
+    """The rendered BatLiNet smoke flow: CPU default, epochs=1, no auto-run."""
+
+    def setUp(self) -> None:
+        self._plan_calls: list[dict[str, Any]] = []
+        self._exec_calls: list[dict] = []
+        self._real_build = ui.build_execution_plan
+        self._real_execute = ui.execute_plan
+        self._real_llm = ui.is_llm_configured
+
+        def stub_build(dataset, task, model, **kwargs):
+            self._plan_calls.append({"dataset": dataset, "task": task, "model": model, **kwargs})
+            return _ok_plan(model, epochs=kwargs.get("epochs"))
+
+        def stub_execute(plan, **kwargs):
+            self._exec_calls.append(plan)
+            raise AssertionError("render must not execute without an explicit Run click")
+
+        ui.build_execution_plan = stub_build
+        ui.execute_plan = stub_execute
+        ui.is_llm_configured = lambda: False
+
+    def tearDown(self) -> None:
+        ui.build_execution_plan = self._real_build
+        ui.execute_plan = self._real_execute
+        ui.is_llm_configured = self._real_llm
+
+    def _batlinet_session(self) -> dict:
+        return {
+            "agent_workflow_context": _MATR_CONTEXT,
+            "agent_original_request": "Use BatLiNet on MATR to predict battery lifetime.",
+            "agent_selected_model": "batlinet",
+            "gpu_inventory": _FAKE_GPU_INVENTORY,
+        }
+
+    def test_smoke_render_uses_cpu_and_epochs_one(self) -> None:
+        session = self._batlinet_session()
+        fake = _render(session, checkboxes={ui.SMOKE_CHECKBOX_LABEL: True})
+        self.assertEqual(self._exec_calls, [])
+        call = self._plan_calls[-1]
+        self.assertEqual(call["model"], "batlinet")
+        self.assertEqual(call["epochs"], 1)
+        self.assertEqual(call["device"], "cpu")
+        # The device control lists every enumerated GPU and defaults to cpu.
+        device_box = [
+            box for box in fake.rec["selectboxes"] if box["label"] == "Device"
+        ]
+        self.assertEqual(device_box[0]["options"], ["cpu", "cuda:0", "cuda:1"])
+        joined = " ".join(fake.rec["infos"])
+        self.assertIn(SMOKE_NOTICE, joined)
+
+    def test_non_smoke_render_leaves_the_config_schedule_alone(self) -> None:
+        session = self._batlinet_session()
+        _render(session, checkboxes={ui.SMOKE_CHECKBOX_LABEL: False})
+        self.assertIsNone(self._plan_calls[-1]["epochs"])
+
+    def test_gpu_inventory_is_displayed_not_invented(self) -> None:
+        fake = _render(self._batlinet_session())
+        rows = [row for frame in fake.rec["dataframes"] if isinstance(frame, list) for row in frame]
+        gpu_rows = [row for row in rows if isinstance(row, dict) and "GPU" in row]
+        self.assertEqual([row["Device"] for row in gpu_rows], ["cuda:0", "cuda:1"])
+        self.assertEqual(gpu_rows[0]["Free (MiB)"], "2076")
+
+    def test_cuda_oom_result_shows_actionable_message_and_keeps_stderr(self) -> None:
+        session = self._batlinet_session()
+        session["agent_execution_result"] = {
+            "started": True,
+            "completed": True,
+            "success": False,
+            "returncode": 1,
+            "command": ["python", "batteryml_web/core/run_batteryml_cli.py", "run"],
+            "workspace": "runs/agent_matr_batlinet_smoke",
+            "stdout": "",
+            "stderr": "Traceback...\ntorch.cuda.OutOfMemoryError: CUDA out of memory.",
+            "error": "wrapper exited with returncode 1",
+            "device": "cuda:0",
+            "smoke": True,
+            "artifacts": {},
+            "dry_run": False,
+        }
+        fake = _render(session)
+        errors = " ".join(fake.rec["errors"])
+        self.assertIn("CUDA out of memory on cuda:0", errors)
+        actions = " ".join(fake.rec["writes"])
+        self.assertIn("CPU", actions)
+        self.assertIn("cuda:1", actions)  # only the GPU with more free memory
+        self.assertIn("never moves a failed run", actions)
+        # The raw traceback is still displayed verbatim.
+        self.assertTrue(any("OutOfMemoryError" in w for w in fake.rec["writes"]))
+        # No metrics for a failed run.
+        self.assertFalse(any(label in {"RMSE", "MAE", "MAPE"} for label, _ in fake.rec["metrics"]))
 
 
 class TestNoFrontendDuplication(unittest.TestCase):

@@ -52,6 +52,10 @@ CHECKS: tuple[tuple[str, str, str, bool], ...] = (
     ("SPLIT-01", "split_requirements", "check_split_requirements", True),
     ("REG-01", "registry_integrity", "check_registry_integrity", True),
     ("EXT-01", "extension_contract", "extension_contract", True),
+    # Device/smoke/failure contract the web run path depends on. Pure static
+    # inspection plus a GPU snapshot recorded as evidence; never a GPU
+    # requirement.
+    ("DEV-01", "runtime_contract", "check_runtime_contract", True),
     # Last: the only check that actually renders anything, so it is the slowest
     # and the one most likely to be skipped for a missing package.
     ("FIG-01", "figure_contract", "check_figure_contract", True),

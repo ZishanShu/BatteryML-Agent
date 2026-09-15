@@ -1,6 +1,6 @@
 # `scripts/verify/` — the verification harness
 
-Six independent checks that inspect the repository, the environment and the
+Independent checks that inspect the repository, the environment and the
 filesystem. They are the cheap half of the verification loop described in
 `CLAUDE.md` §0: they establish what can be established without running the
 pipeline, so that the expensive half — the user running the real thing on the
@@ -64,6 +64,7 @@ preprocessing).
 | `VAL-01` | `validator_contract` | Runs the real `config_validator.validate_config` over every run config and reports which the execution gate would refuse. Structure only (`require_data=False`), so it needs no data and writes nothing. | `validator_contract.json` |
 | `SPLIT-01` | `split_requirements` | For each of the eight presets, which processed datasets it requires and which are missing — derived from two independent sources and cross-checked. | `split_requirements.json` |
 | `REG-01` | `registry_integrity` | Every registered name resolves and is unique; the `batteryml_web/models/` extension point is self-consistent; every `input_type` the CLI advertises has a preprocessor; per-model origin, task and device support. | `registry_integrity.json` |
+| `DEV-01` | `runtime_contract` | The run-time contract the web layer depends on: device enumeration goes through an argv list with `shell=False` and derives the GPU count from `nvidia-smi` rather than a constant; a smoke run is exactly `--epochs 1` on the model's own formal config, with no config written or mutated; BatLiNet's smoke run recommends CPU; a CUDA OOM is recognised, never retried, and yields no metric. The machine's real GPU snapshot is recorded as evidence — its absence is never a failure. | `runtime_contract.json` |
 | `FIG-01` | `figure_contract` | Every contracted figure has a unique id, an existing builder in `batteryml_web/viz/figures.py`, a filename that is safe and unique, and a dispatch branch in the viz CLI. Each is then rendered twice to memory and the two byte strings compared, which is what establishes the determinism `CLAUDE.md` §8 requires. Audits `figure_manifest.json` against the files on disk when one is present. | `figure_contract.json` |
 
 `run_all` additionally writes `verification_report.json` (the full structured

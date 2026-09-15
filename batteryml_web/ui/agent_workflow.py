@@ -32,20 +32,34 @@ from ..agent.executor import execute_plan
 from ..agent.intent import resolve_workflow_intent
 from ..agent.result_agent import explain_run_result
 from ..agent.results import METRIC_KEYS, SMOKE_RUN_WARNING, build_result_context
+from ..agent.run_policy import (
+    SMOKE_EPOCHS,
+    SMOKE_NOTICE,
+    classify_execution_failure,
+    gpu_memory_advisory,
+    smoke_device_recommendation,
+    smoke_epochs_for,
+)
 from ..agent.workflow import guide_workflow, workflow_guidance_preview
+from ..core.device_inventory import (
+    device_choices_with_manual_gpu,
+    device_label,
+    inventory_rows,
+    query_gpu_inventory,
+)
 from .llm_state import is_llm_configured
 from .progress_utils import get_safe_runtime_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 RUN_BUTTON_LABEL = "Run"
-SMOKE_CHECKBOX_LABEL = (
-    "1-epoch smoke test — validates the workflow only; not benchmark performance."
-)
-SMOKE_EPOCHS = 1
-DEVICE_OPTIONS = ("cpu", "cuda:0")
+#: Exact wording milestone A requires wherever a smoke run is offered or shown.
+SMOKE_CHECKBOX_LABEL = SMOKE_NOTICE
 #: Raw stdout/stderr are display tails only; metrics never come from them.
 OUTPUT_TAIL_CHARS = 4000
+#: stderr carries the traceback, so it keeps a much larger tail than stdout
+#: (which is mostly tqdm progress lines).
+ERROR_TAIL_CHARS = 20000
 
 
 def _display_name(entry: dict[str, Any]) -> str:
@@ -79,8 +93,38 @@ def run_is_enabled(plan: dict[str, Any] | None) -> bool:
 
 
 def smoke_epochs_value(enabled: bool) -> int | None:
-    """The only execution override the UI may request: epochs=1 or nothing."""
-    return SMOKE_EPOCHS if enabled else None
+    """The only execution override the UI may request: epochs=1 or nothing.
+
+    Delegates to the backend policy so the smoke definition lives in exactly
+    one place (:mod:`batteryml_web.agent.run_policy`).
+    """
+    return smoke_epochs_for(enabled)
+
+
+def device_options(inventory: dict[str, Any] | None) -> list[str]:
+    """Selectable devices: cpu plus every GPU the backend actually enumerated.
+
+    Never a hardcoded GPU count. When enumeration failed, a single manual
+    ``cuda:0`` entry is kept so an explicit GPU choice remains possible, and
+    the caller shows the inventory error beside it.
+    """
+    return device_choices_with_manual_gpu(inventory)
+
+
+def default_device_index(
+    options: list[str], model_key: str, smoke: bool
+) -> tuple[int, str]:
+    """Index of the recommended default device, plus the reason to show.
+
+    The recommendation is advice only: the returned index is the *initial*
+    selection of an editable control, and any listed device may be chosen.
+    """
+    advice = smoke_device_recommendation(
+        model_key, smoke=smoke, available_devices=options
+    )
+    device = str(advice.get("device") or "")
+    index = options.index(device) if device in options else 0
+    return index, str(advice.get("reason") or "")
 
 
 def raw_only_notice(context: dict[str, Any]) -> str | None:
@@ -198,10 +242,14 @@ def _tail_text(text: Any, limit: int = OUTPUT_TAIL_CHARS) -> str:
 
 
 def _compact_execution_output(result: dict[str, Any]) -> dict[str, Any]:
-    """Trim raw stdout/stderr; session state keeps only small display tails."""
+    """Trim raw stdout/stderr; session state keeps only display tails.
+
+    stderr keeps the larger budget because a CUDA OOM traceback ends up
+    there and milestone A requires it to stay readable in the debug view.
+    """
     compacted = dict(result)
-    for key in ("stdout", "stderr"):
-        compacted[key] = _tail_text(compacted.get(key))
+    compacted["stdout"] = _tail_text(compacted.get("stdout"), OUTPUT_TAIL_CHARS)
+    compacted["stderr"] = _tail_text(compacted.get("stderr"), ERROR_TAIL_CHARS)
     return compacted
 
 
@@ -238,6 +286,34 @@ def _render_context(context: dict[str, Any]) -> None:
                 st.write(f"- {step}")
 
 
+def _gpu_inventory(refresh: bool = False) -> dict[str, Any]:
+    """Cached GPU inventory for this session.
+
+    ``nvidia-smi`` is queried once per session (and on an explicit refresh)
+    rather than on every Streamlit rerun. The value is a small
+    JSON-serializable dict from the backend; nothing here inspects the GPU
+    itself.
+    """
+    cached = st.session_state.get("gpu_inventory")
+    if refresh or not isinstance(cached, dict):
+        cached = query_gpu_inventory()
+        st.session_state["gpu_inventory"] = cached
+    return cached
+
+
+def _render_gpu_inventory(inventory: dict[str, Any]) -> None:
+    """Show what the machine actually reports; never a hardcoded GPU count."""
+    rows = inventory_rows(inventory)
+    if rows:
+        st.caption(
+            f"{len(rows)} CUDA device(s) reported by nvidia-smi. Free memory is a "
+            "snapshot of a shared machine."
+        )
+        st.dataframe(rows, hide_index=True, use_container_width=True)
+    elif inventory.get("error"):
+        st.caption(f"GPU inventory unavailable: {inventory['error']}")
+
+
 def _render_plan(plan: dict[str, Any], device: str, seed: int) -> None:
     st.markdown("#### Execution plan")
     rows = [
@@ -257,25 +333,45 @@ def _render_plan(plan: dict[str, Any], device: str, seed: int) -> None:
     if not run_is_enabled(plan):
         st.warning(str(plan.get("reason") or "The backend planner refused execution."))
     elif plan.get("epochs") == SMOKE_EPOCHS:
-        st.info(SMOKE_CHECKBOX_LABEL)
+        st.info(SMOKE_NOTICE)
 
 
-def _render_execution_status(result: dict[str, Any]) -> None:
+def _render_execution_status(
+    result: dict[str, Any],
+    *,
+    device: str = "cpu",
+    inventory: dict[str, Any] | None = None,
+    smoke: bool = False,
+) -> None:
     st.markdown("#### Execution status")
     st.write(f"**Started:** {'Yes' if result.get('started') else 'No'}")
     st.write(f"**Completed:** {'Yes' if result.get('completed') else 'No'}")
     st.write(f"**Success:** {bool(result.get('success'))}")
     st.write(f"**Return code:** {result.get('returncode', 'N/A')}")
-    if result.get("error"):
+
+    diagnosis = classify_execution_failure(
+        result, device=device, inventory=inventory, smoke=smoke
+    )
+    if diagnosis["kind"] != "none":
+        st.error(diagnosis["headline"])
+        for action in diagnosis["actions"]:
+            st.write(f"- {action}")
+        if diagnosis["evidence_line"]:
+            st.caption(f"From the run's own output: {diagnosis['evidence_line']}")
+    elif result.get("error"):
         st.error(str(result["error"]))
+
     with st.expander("Execution debug output", expanded=False):
         command = result.get("command")
         if command:
             st.caption("Exact argv executed (built by the backend planner):")
             st.code(" ".join(str(part) for part in command), language="bash")
+        if result.get("error"):
+            st.caption("Executor error")
+            st.text(str(result["error"]))
         st.caption("stdout")
         st.text(result.get("stdout") or "No stdout captured.")
-        st.caption("stderr")
+        st.caption("stderr (full traceback, as produced by the run)")
         st.text(result.get("stderr") or "No stderr captured.")
 
 
@@ -375,9 +471,9 @@ def render_agent_workflow() -> None:
     options = runnable_model_keys(context)
     plan: dict[str, Any] | None = None
     smoke = False
-    device = st.session_state.get("agent_device", DEVICE_OPTIONS[0])
-    if device not in DEVICE_OPTIONS:
-        device = DEVICE_OPTIONS[0]
+    inventory = _gpu_inventory()
+    devices = device_options(inventory)
+    device = devices[0]
     seed = 0
 
     if options:
@@ -394,14 +490,31 @@ def render_agent_workflow() -> None:
         )
         st.session_state["agent_selected_model"] = str(selected_key)
 
+        # Smoke mode first: it is what makes CPU the recommended default for
+        # the models whose smoke run must not compete for GPU memory.
+        smoke = st.checkbox(SMOKE_CHECKBOX_LABEL, key="agent_smoke_mode")
+
+        st.markdown("**Device**")
+        _render_gpu_inventory(inventory)
+        default_index, device_reason = default_device_index(
+            devices, str(selected_key), smoke
+        )
+        if device_reason:
+            st.info(device_reason)
+        # The widget key encodes (model, smoke) so that switching model or
+        # toggling smoke re-applies the backend's recommended default instead
+        # of silently keeping a device chosen for a different combination.
         device = st.selectbox(
             "Device",
-            list(DEVICE_OPTIONS),
-            key="agent_device_select",
+            devices,
+            index=default_index,
+            format_func=lambda name: device_label(name, inventory),
+            key=f"agent_device_select_{selected_key}_{int(bool(smoke))}",
         )
         st.session_state["agent_device"] = str(device)
-
-        smoke = st.checkbox(SMOKE_CHECKBOX_LABEL, key="agent_smoke_mode")
+        advisory = gpu_memory_advisory(str(device), inventory)
+        if advisory:
+            st.warning(advisory)
 
         plan = build_execution_plan(
             str(context.get("dataset")),
@@ -447,6 +560,10 @@ def render_agent_workflow() -> None:
         ):
             with st.spinner("Executing the validated plan (explicit user action)..."):
                 result = execute_plan(plan, repo_root=REPO_ROOT, env=get_safe_runtime_env())
+            # Provenance for the failure diagnosis only; neither field is read
+            # back by the executor or by build_result_context.
+            result["device"] = str(device)
+            result["smoke"] = bool(smoke)
             workspace = result.get("workspace")
             if result.get("success") and workspace:
                 result_context = build_result_context(
@@ -467,7 +584,12 @@ def render_agent_workflow() -> None:
             st.rerun()
 
     if isinstance(execution_result, dict):
-        _render_execution_status(execution_result)
+        _render_execution_status(
+            execution_result,
+            device=str(execution_result.get("device") or device),
+            inventory=inventory,
+            smoke=bool(execution_result.get("smoke", smoke)),
+        )
 
     if isinstance(result_context, dict):
         _render_result(result_context)
