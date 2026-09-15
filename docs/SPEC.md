@@ -36,7 +36,7 @@ everything is done.
 | Namespace | What it identifies | Where it lives |
 | --- | --- | --- |
 | `VIZ-nn`, and future feature prefixes | a **requirement** — something the platform must do | this file |
-| `ENV-01`, `DATA-01`, `CFG-01`, `VAL-01`, `SPLIT-01`, `REG-01`, `EXT-01`, `CLI-01`, `FIG-01`, `DEV-01` | a **check** — something the verification harness establishes | `docs/VERIFY.md` |
+| `ENV-01`, `DATA-01`, `CFG-01`, `VAL-01`, `SPLIT-01`, `REG-01`, `EXT-01`, `CLI-01`, `FIG-01`, `DEV-01`, `INTENT-01` | a **check** — something the verification harness establishes | `docs/VERIFY.md` |
 
 They are the same shape, so keep the prefixes disjoint: the figure *requirements*
 are `VIZ-01`…, and the figure *check* that verifies them is `FIG-01`. Nothing is
@@ -129,6 +129,41 @@ AST-level, so Home's boundary is checked without importing torch or
 Streamlit) and the handover class in `tests/test_agent_web_ui.py`. Nothing
 here may be marked `VERIFIED` from this environment: no Streamlit page has
 been rendered in it.
+
+---
+
+## INTENT — understanding the request
+
+Rationale for the group: the deterministic phrase table is precise and
+rigid. It cannot read "Can you run a model for cycle aging on the MATR
+cells?", an informal model name, or mixed Chinese/English. An LLM can — and
+an LLM can also confidently name a dataset, a model or a config file that
+does not exist. These requirements put the LLM where it helps (reading the
+sentence) and keep every identifier it produces subject to the backend.
+
+The order is fixed and must not be shortened:
+
+    LLM interpretation -> structured candidate intent -> canonical catalog
+    -> readiness -> validator -> user confirmation -> execution
+
+| ID | Requirement | Status | Implementation |
+| --- | --- | --- | --- |
+| `INTENT-01` | The catalog offered to the LLM is built from the live backend — `ConfigRegistry` for models and their dataset/task coverage, the platform dataset list plus `list_dataset_readiness` for datasets, the three canonical task labels, and `readiness.EXTERNAL_MODELS` for external runners. No second, hand-maintained catalog exists, and no config path ever appears in it. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/catalog.py` |
+| `INTENT-02` | The LLM is asked for structured JSON only: dataset, task, requested_model, needs_clarification, clarification_question, suggested_model_keys, user_facing_rationale. Hidden reasoning is never requested; the rationale is short, user-facing and length-capped. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/llm_intent.py` (`SYSTEM_PROMPT`, `build_intent_prompt`) |
+| `INTENT-03` | Every identifier the LLM returns is resolved against the catalog before use. An unknown dataset, task or model key becomes `None` and is recorded under `rejected`; a config path, command, device, epoch count or metric is discarded and reported. A reply that is not valid JSON, or not an object, is discarded whole. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/llm_intent.py` (`validate_llm_intent`, `extract_json_object`) |
+| `INTENT-04` | The deterministic resolver stays the fast path — a request it fully resolves costs no LLM call — and the fallback: when no LLM is configured, or the call or parse fails, its answer is returned and the page says plainly that advanced natural-language understanding is unavailable. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/llm_intent.py` (`resolve_workflow_intent_with_llm`), `batteryml_web/ui/agent_workflow.py` (`_render_intent`) |
+| `INTENT-05` | Recommendations are filtered by readiness, not by the LLM. A suggestion that is not runnable for the resolved dataset and task is separated out and may be *mentioned* with its backend reason (PBT, NEEDS_ASSETS) but never offered as runnable. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/llm_intent.py` (`filter_suggestions`) |
+| `INTENT-06` | A requested model that is blocked, or that is unknown to the catalog, is never silently replaced. The reason is stated, runnable alternatives are listed, `requires_confirmation` is set, and the user selects a replacement explicitly. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/llm_intent.py` (`resolve_model_request`), `batteryml_web/ui/agent_workflow.py` (`_render_model_request`) |
+| `INTENT-07` | An unresolved dataset or task produces one concise clarification question. An explicit request is never defaulted to MATR. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/llm_intent.py`, `batteryml_web/agent/intent.py` |
+| `INTENT-08` | Common Chinese and mixed-language phrasings resolve, in the **offline** route as well: the task phrase table carries the Chinese spellings, so "帮我用 MATR 做电池寿命预测" resolves to MATR + RUL prediction with no API key. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/intent.py`, `batteryml_web/agent/catalog.py` (`TASK_ALIASES`) |
+| `INTENT-09` | Free-form LLM prose can never trigger a run. The intent layer imports no executor, calls no planner, and touches neither `subprocess` nor the filesystem; the canonical identifiers it produces still go through `build_agent_workflow_context`, `build_execution_plan`, the validator and the explicit Run button. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/llm_intent.py`, `scripts/verify/check_intent_catalog.py` |
+
+The check that establishes this group is `INTENT-01`
+(`scripts/verify/check_intent_catalog.py`); the unit tests are
+`tests/test_llm_intent.py` (45 cases, every LLM answer stubbed) and the
+LLM-intent class in `tests/test_agent_web_ui.py`. Nothing here may be
+marked `VERIFIED` from this environment: no LLM endpoint has been called
+from it.
 
 ---
 

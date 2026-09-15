@@ -16,6 +16,10 @@ from ..core.readiness import TASK_RUL, TASK_SOH, TASK_TRAJECTORY
 
 #: Dataset names recognized in free text, longest first so "mich_exp" wins
 #: over "mich". Matching is case-insensitive on word boundaries.
+#:
+#: Dataset names are Latin in every language the platform supports, so a
+#: mixed Chinese/English request such as "用 MATR 数据集预测电池寿命" resolves
+#: its dataset here unchanged; only the task phrases needed translating.
 KNOWN_DATASETS: List[str] = [
     "MICH_EXP",
     "MATR",
@@ -33,10 +37,21 @@ _TRAJECTORY_PHRASES: List[str] = [
     "future capacity trajectory",
     "capacity trajectory",
     "trajectory",
+    # Chinese. Listed here, not in a separate resolver, so the offline route
+    # (no API key, CLAUDE.md §1 Route B) understands the same phrases the
+    # LLM-assisted route does. Longest first: 容量衰减轨迹 must win over 轨迹.
+    "未来容量衰减轨迹",
+    "容量衰减轨迹",
+    "衰减轨迹",
+    "退化轨迹",
+    "容量轨迹",
 ]
 
 _SOH_PHRASES: List[str] = [
     "state of health",
+    "健康状态",
+    "健康度",
+    "荷电健康",
 ]
 
 _RUL_PHRASES: List[str] = [
@@ -45,6 +60,13 @@ _RUL_PHRASES: List[str] = [
     "battery lifetime",
     "battery life",
     "lifetime",
+    "剩余使用寿命",
+    "剩余寿命",
+    "电池寿命",
+    "循环寿命",
+    "使用寿命",
+    "寿命预测",
+    "寿命",
 ]
 
 _SOH_TOKEN = re.compile(r"\bsoh\b")
@@ -56,6 +78,13 @@ def _dataset_patterns() -> List[tuple[str, "re.Pattern[str]"]]:
         (name, re.compile(r"\b" + re.escape(name.lower().replace("_", r"[\s_\-]?")) + r"\b"))
         for name in KNOWN_DATASETS
     ]
+
+
+#: Task phrase tables, ordered longest-match-first within each family so a
+#: specific phrase cannot be shadowed by a shorter one it contains.
+_TRAJECTORY_PHRASES.sort(key=len, reverse=True)
+_SOH_PHRASES.sort(key=len, reverse=True)
+_RUL_PHRASES.sort(key=len, reverse=True)
 
 
 def resolve_dataset(text: str) -> Optional[str]:

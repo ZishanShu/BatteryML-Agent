@@ -31,8 +31,14 @@ from typing import Any
 
 import streamlit as st
 
+from ..agent.catalog import build_intent_catalog
 from ..agent.execution import build_execution_plan
-from ..agent.intent import resolve_workflow_intent
+from ..agent.llm_intent import (
+    filter_suggestions,
+    resolve_model_request,
+    resolve_workflow_intent_with_llm,
+)
+from ..agent.prompts import build_agent_workflow_context
 from ..agent.result_agent import explain_run_result
 from ..agent.results import METRIC_KEYS, SMOKE_RUN_WARNING, build_result_context
 from ..agent.run_policy import (
@@ -48,7 +54,7 @@ from ..agent.streaming import (
     STAGE_FAILED,
     execute_plan_streaming,
 )
-from ..agent.workflow import guide_workflow, workflow_guidance_preview
+from ..agent.workflow import guide_workflow
 from ..core.device_inventory import (
     device_choices_with_manual_gpu,
     device_label,
@@ -265,6 +271,79 @@ def _compact_execution_output(result: dict[str, Any]) -> dict[str, Any]:
     compacted["stdout"] = _tail_text(compacted.get("stdout"), OUTPUT_TAIL_CHARS)
     compacted["stderr"] = _tail_text(compacted.get("stderr"), ERROR_TAIL_CHARS)
     return compacted
+
+
+def _render_intent(resolution: dict[str, Any] | None) -> None:
+    """Show how the request was understood, and what was refused.
+
+    Everything displayed here came back from the backend resolver as a
+    canonical identifier or as an explicit rejection; the LLM's prose is
+    shown as rationale only and decides nothing.
+    """
+    if not isinstance(resolution, dict):
+        return
+    if resolution.get("source") == "llm":
+        st.caption("Request interpreted by the LLM, then checked against the platform catalog.")
+    elif resolution.get("llm_available"):
+        st.caption("Request resolved by the deterministic resolver; no LLM call was needed.")
+    else:
+        st.caption(
+            "No LLM is configured, so advanced natural-language understanding is "
+            "unavailable. The deterministic resolver is being used; name the dataset "
+            "and the task explicitly if it cannot tell."
+        )
+    rationale = str(resolution.get("user_facing_rationale") or "")
+    if rationale:
+        st.write(rationale)
+    for warning in resolution.get("warnings", []):
+        st.warning(str(warning))
+    rejected = resolution.get("rejected") or []
+    if rejected:
+        with st.expander("Values the platform refused", expanded=False):
+            for item in rejected:
+                st.write(
+                    f"- {item.get('field')}: {item.get('value')!r} — {item.get('kind')}"
+                )
+    question = str(resolution.get("clarification_question") or "")
+    if resolution.get("needs_clarification") and question:
+        st.info(question)
+
+
+def _render_model_request(model_request: dict[str, Any] | None) -> None:
+    """Explain what happened to an explicitly requested model.
+
+    A blocked or unknown model is never swapped for another one: the
+    alternatives are listed, and the user selects one deliberately below.
+    """
+    if not isinstance(model_request, dict):
+        return
+    status = model_request.get("status")
+    if status in (None, "none", "runnable"):
+        return
+    alternatives = ", ".join(str(key) for key in model_request.get("alternatives", []))
+    st.warning(str(model_request.get("reason") or "The requested model is unavailable."))
+    if alternatives:
+        st.write(
+            f"Runnable alternatives: {alternatives}. Select one below to continue — "
+            "nothing was substituted for you."
+        )
+    else:
+        st.write("No model is runnable for this dataset and task right now.")
+
+
+def _render_suggestions(suggestions: dict[str, Any] | None) -> None:
+    """Show the agent's suggestions after the backend has filtered them."""
+    if not isinstance(suggestions, dict):
+        return
+    runnable = [str(key) for key in suggestions.get("runnable", [])]
+    blocked = [str(key) for key in suggestions.get("blocked", [])]
+    if runnable:
+        st.write(f"**Agent suggests (runnable now):** {', '.join(runnable)}")
+    if blocked:
+        st.write(
+            f"**Also mentioned, but blocked:** {', '.join(blocked)} — "
+            "these cannot be run; see the blocked models above for why."
+        )
 
 
 def _render_context(context: dict[str, Any]) -> None:
@@ -503,14 +582,33 @@ def _render_result(result_context: dict[str, Any]) -> None:
                 st.caption(str(warning))
 
 
+def _resolve_intent(trimmed: str, catalog: dict[str, Any]) -> dict[str, Any]:
+    """Intent resolution for one request, LLM-assisted where configured.
+
+    Always returns the backend's structured result: canonical dataset, task
+    and model key (or None), never free prose the caller has to parse. The
+    LLM is consulted only when the deterministic resolver cannot answer, and
+    its output has already been checked against the canonical catalog before
+    it gets here.
+    """
+    if is_llm_configured():
+        return resolve_workflow_intent_with_llm(
+            trimmed,
+            base_url=st.session_state["llm_base_url"],
+            api_key=st.session_state["llm_api_key"],
+            model=st.session_state["llm_model"],
+            catalog=catalog,
+        )
+    return resolve_workflow_intent_with_llm(trimmed, catalog=catalog)
+
+
 def _analyze_request(trimmed: str) -> None:
     """Resolve one request through the backend and store the result.
 
-    Analysis only: it reads readiness and builds the compact workflow
-    context, and optionally asks the LLM to explain it. Nothing is executed
-    here — execution needs the explicit Run button below.
+    Analysis only: it resolves intent, reads readiness and builds the compact
+    workflow context, and optionally asks the LLM to explain it. Nothing is
+    executed here — execution needs the explicit Run button below.
     """
-    preview = workflow_guidance_preview(trimmed)
     st.session_state["agent_original_request"] = trimmed
     for key in (
         "agent_selected_model",
@@ -519,16 +617,47 @@ def _analyze_request(trimmed: str) -> None:
         "agent_result_context",
         "agent_explanation",
         "agent_run_signature",
+        "agent_model_request",
+        "agent_suggestions",
     ):
         st.session_state.pop(key, None)
     if st.session_state.get("agent_model_choice") is not None:
         st.session_state.pop("agent_model_choice", None)
-    if preview.get("workflow_context") is None:
-        intent = resolve_workflow_intent(trimmed)
+
+    # Built once: it scans the config registry and the dataset directories,
+    # and both the resolver and the model-request check need the same menu.
+    catalog = build_intent_catalog()
+    resolution = _resolve_intent(trimmed, catalog)
+    _store_json_state("agent_intent", resolution)
+
+    if not resolution.get("dataset") or not resolution.get("task"):
         _store_json_state("agent_workflow_context", None)
-        st.session_state["agent_explanation"] = str(intent.get("message"))
+        st.session_state["agent_explanation"] = str(
+            resolution.get("clarification_question")
+            or resolution.get("user_facing_rationale")
+            or resolution.get("message")
+            or "The request could not be resolved to a dataset and a task."
+        )
         return
-    _store_json_state("agent_workflow_context", preview["workflow_context"])
+
+    context = build_agent_workflow_context(
+        str(resolution["dataset"]), str(resolution["task"])
+    )
+    _store_json_state("agent_workflow_context", context)
+
+    # What the request asked for, judged against the authoritative context.
+    model_request = resolve_model_request(
+        resolution.get("requested_model"), context, catalog
+    )
+    _store_json_state("agent_model_request", model_request)
+    if model_request.get("status") == "runnable" and model_request.get("model_key"):
+        st.session_state["agent_selected_model"] = str(model_request["model_key"])
+
+    _store_json_state(
+        "agent_suggestions",
+        filter_suggestions(list(resolution.get("suggested_model_keys") or []), context),
+    )
+
     if not is_llm_configured():
         return
     try:
@@ -575,12 +704,16 @@ def render_agent_workflow() -> None:
 
     context = st.session_state.get("agent_workflow_context")
     if not isinstance(context, dict):
+        _render_intent(st.session_state.get("agent_intent"))
         st.info("Enter a request and press Analyze to load the backend workflow state.")
         if st.session_state.get("agent_explanation"):
             st.write(st.session_state["agent_explanation"])
         return
 
+    _render_intent(st.session_state.get("agent_intent"))
     _render_context(context)
+    _render_model_request(st.session_state.get("agent_model_request"))
+    _render_suggestions(st.session_state.get("agent_suggestions"))
 
     options = runnable_model_keys(context)
     plan: dict[str, Any] | None = None

@@ -45,8 +45,13 @@ def _registry_tables() -> Tuple[Dict[str, str], Dict[str, str], Any]:
     return MODEL_CLASS_KEYS, normalized_aliases, normalize_model_token
 
 
-def _canonical_model_key(token: str) -> str:
-    """Fold a requested model token onto a canonical key using existing aliases."""
+def canonical_model_key(token: str) -> str:
+    """Fold a requested model token onto a canonical key using existing aliases.
+
+    Public because the catalog and the LLM-intent layer must fold names the
+    same way this planner does; a second, parallel folding table is exactly
+    the kind of drift CLAUDE.md §3 forbids.
+    """
     _, normalized_aliases, normalize_model_token = _registry_tables()
     from ..core.config_registry import MODEL_CLASS_KEYS
 
@@ -91,7 +96,7 @@ def find_model_entry(
     """
     if not str(requested or "").strip():
         raise ValueError("find_model_entry: requested model is empty.")
-    canonical = _canonical_model_key(str(requested))
+    canonical = canonical_model_key(str(requested))
     runnable = {str(e.get("model")): e for e in workflow_context.get("runnable_models", [])}
     blocked = {str(e.get("model")): e for e in workflow_context.get("blocked_models", [])}
     if canonical in runnable:
@@ -101,7 +106,7 @@ def find_model_entry(
     for side, entries in (("runnable", runnable), ("blocked", blocked)):
         for key, entry in entries.items():
             for alias in _aliases_for_entry(key, entry.get("model_display")):
-                if _canonical_model_key(alias) == canonical:
+                if canonical_model_key(alias) == canonical:
                     return entry, side
     lowered = str(requested).strip().lower()
     for side, entries in (("runnable", runnable), ("blocked", blocked)):

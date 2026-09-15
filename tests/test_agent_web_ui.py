@@ -197,6 +197,21 @@ class FakeStreamlit:
         raise _Rerun()
 
 
+#: A catalog stub large enough for the model-request resolution the UI does.
+_FAKE_CATALOG = {
+    "datasets": [{"dataset": "MATR", "aliases": ["MATR", "matr"], "status": "READY",
+                  "preprocessing_supported": True}],
+    "tasks": [{"task": "RUL prediction", "aliases": ["RUL"]}],
+    "models": [
+        {"model_key": "cptransformer", "model_display": "CPTransformer", "aliases": ["cptransformer"],
+         "datasets": ["MATR"], "tasks": ["RUL prediction"], "has_validated_config": True, "external": False},
+        {"model_key": "batlinet", "model_display": "BatLiNet", "aliases": ["batlinet"],
+         "datasets": ["MATR"], "tasks": ["RUL prediction"], "has_validated_config": True, "external": False},
+        {"model_key": "PBT", "model_display": "PBT", "aliases": ["PBT", "pbt"],
+         "datasets": [], "tasks": ["RUL prediction"], "has_validated_config": False, "external": True},
+    ],
+}
+
 _MATR_CONTEXT = {
     "dataset": "MATR",
     "dataset_status": "READY",
@@ -870,28 +885,48 @@ class TestHandoverFromHome(unittest.TestCase):
     """Milestone C: a request handed over from Home is analysed, not executed."""
 
     def setUp(self) -> None:
-        self._real_preview = ui.workflow_guidance_preview
+        self._real_resolve = ui.resolve_workflow_intent_with_llm
+        self._real_context = ui.build_agent_workflow_context
+        self._real_catalog = ui.build_intent_catalog
         self._real_build = ui.build_execution_plan
         self._real_stream = ui.execute_plan_streaming
         self._real_llm = ui.is_llm_configured
         self.preview_calls: list[str] = []
         self.exec_calls: list[dict] = []
 
-        def stub_preview(request, **kwargs):
+        def stub_resolve(request, **kwargs):
             self.preview_calls.append(request)
-            return {"workflow_context": _MATR_CONTEXT}
+            return {
+                "source": "deterministic",
+                "llm_available": False,
+                "dataset": "MATR",
+                "task": "RUL prediction",
+                "requested_model": "batlinet",
+                "requested_model_name": None,
+                "needs_clarification": False,
+                "clarification_question": None,
+                "suggested_model_keys": [],
+                "user_facing_rationale": "",
+                "rejected": [],
+                "warnings": [],
+                "message": "Resolved dataset=MATR, task=RUL prediction.",
+            }
 
         def stub_stream(plan, **kwargs):
             self.exec_calls.append(plan)
             raise AssertionError("handover must never execute")
 
-        ui.workflow_guidance_preview = stub_preview
+        ui.resolve_workflow_intent_with_llm = stub_resolve
+        ui.build_agent_workflow_context = lambda dataset, task, **kw: _MATR_CONTEXT
+        ui.build_intent_catalog = lambda **kw: _FAKE_CATALOG
         ui.build_execution_plan = lambda d, t_, m, **kw: _ok_plan(m, epochs=kw.get("epochs"))
         ui.execute_plan_streaming = stub_stream
         ui.is_llm_configured = lambda: False
 
     def tearDown(self) -> None:
-        ui.workflow_guidance_preview = self._real_preview
+        ui.resolve_workflow_intent_with_llm = self._real_resolve
+        ui.build_agent_workflow_context = self._real_context
+        ui.build_intent_catalog = self._real_catalog
         ui.build_execution_plan = self._real_build
         ui.execute_plan_streaming = self._real_stream
         ui.is_llm_configured = self._real_llm
@@ -922,6 +957,159 @@ class TestHandoverFromHome(unittest.TestCase):
         _render(session)
         self.assertEqual(self.preview_calls, [])
         self.assertEqual(self.exec_calls, [])
+
+
+class TestLlmAssistedIntentInTheUi(unittest.TestCase):
+    """Milestone D: the page shows what was understood and what was refused."""
+
+    def test_offline_shortfall_is_stated_plainly(self) -> None:
+        fake = FakeStreamlit({})
+        original = ui.st
+        ui.st = fake
+        try:
+            ui._render_intent(
+                {
+                    "source": "deterministic_fallback",
+                    "llm_available": False,
+                    "user_facing_rationale": "",
+                    "warnings": [],
+                    "rejected": [],
+                    "needs_clarification": False,
+                    "clarification_question": None,
+                }
+            )
+        finally:
+            ui.st = original
+        joined = " ".join(fake.rec["captions"])
+        self.assertIn("advanced natural-language understanding is unavailable", joined)
+
+    def test_rejected_values_are_shown_not_hidden(self) -> None:
+        fake = FakeStreamlit({})
+        original = ui.st
+        ui.st = fake
+        try:
+            ui._render_intent(
+                {
+                    "source": "llm",
+                    "llm_available": True,
+                    "user_facing_rationale": "MATR has validated RUL configs.",
+                    "warnings": ["Backend-owned field(s) discarded."],
+                    "rejected": [
+                        {"field": "config_path", "value": "configs/fake.yaml",
+                         "kind": "forbidden_field"}
+                    ],
+                    "needs_clarification": True,
+                    "clarification_question": "Which dataset should I use?",
+                }
+            )
+        finally:
+            ui.st = original
+        self.assertIn("MATR has validated RUL configs.", " ".join(fake.rec["writes"]))
+        self.assertIn("Backend-owned field(s) discarded.", " ".join(fake.rec["warnings"]))
+        self.assertIn("config_path", " ".join(fake.rec["writes"]))
+        self.assertIn("Which dataset should I use?", " ".join(fake.rec["infos"]))
+
+    def test_blocked_model_is_reported_and_not_substituted(self) -> None:
+        fake = FakeStreamlit({})
+        original = ui.st
+        ui.st = fake
+        try:
+            ui._render_model_request(
+                {
+                    "requested": "PBT",
+                    "status": "blocked",
+                    "model_key": "PBT",
+                    "model_display": "PBT",
+                    "reason": "PBT is NEEDS_ASSETS for this dataset and task: provide assets.",
+                    "alternatives": ["cptransformer", "batlinet"],
+                    "requires_confirmation": True,
+                }
+            )
+        finally:
+            ui.st = original
+        self.assertIn("NEEDS_ASSETS", " ".join(fake.rec["warnings"]))
+        joined = " ".join(fake.rec["writes"])
+        self.assertIn("cptransformer", joined)
+        self.assertIn("nothing was substituted for you", joined)
+
+    def test_runnable_request_renders_no_warning(self) -> None:
+        fake = FakeStreamlit({})
+        original = ui.st
+        ui.st = fake
+        try:
+            ui._render_model_request(
+                {"requested": "batlinet", "status": "runnable", "model_key": "batlinet",
+                 "model_display": "BatLiNet", "reason": "", "alternatives": [],
+                 "requires_confirmation": False}
+            )
+        finally:
+            ui.st = original
+        self.assertEqual(fake.rec["warnings"], [])
+
+    def test_blocked_suggestions_are_never_offered_as_runnable(self) -> None:
+        fake = FakeStreamlit({})
+        original = ui.st
+        ui.st = fake
+        try:
+            ui._render_suggestions(
+                {"runnable": ["cptransformer"], "blocked": ["PBT"], "unknown": ["MegaNet"]}
+            )
+        finally:
+            ui.st = original
+        joined = " ".join(fake.rec["writes"])
+        self.assertIn("runnable now:** cptransformer", joined)
+        self.assertIn("blocked:** PBT", joined)
+        self.assertIn("these cannot be run", joined)
+
+    def test_analysis_stores_canonical_state_and_never_executes(self) -> None:
+        real_resolve = ui.resolve_workflow_intent_with_llm
+        real_context = ui.build_agent_workflow_context
+        real_catalog = ui.build_intent_catalog
+        real_llm = ui.is_llm_configured
+        real_stream = ui.execute_plan_streaming
+        executed: list = []
+
+        ui.resolve_workflow_intent_with_llm = lambda request, **kw: {
+            "source": "llm",
+            "llm_available": True,
+            "dataset": "MATR",
+            "task": "RUL prediction",
+            "requested_model": "PBT",
+            "requested_model_name": None,
+            "needs_clarification": False,
+            "clarification_question": None,
+            "suggested_model_keys": ["cptransformer", "PBT"],
+            "user_facing_rationale": "PBT was asked for but is blocked.",
+            "rejected": [],
+            "warnings": [],
+            "message": "ok",
+        }
+        ui.build_agent_workflow_context = lambda dataset, task, **kw: _MATR_CONTEXT
+        ui.build_intent_catalog = lambda **kw: _FAKE_CATALOG
+        ui.is_llm_configured = lambda: False
+        ui.execute_plan_streaming = lambda plan, **kw: executed.append(plan)
+
+        session: dict = {}
+        fake = FakeStreamlit(session)
+        original = ui.st
+        ui.st = fake
+        try:
+            ui._analyze_request("Use PBT on MATR to predict battery lifetime.")
+        finally:
+            ui.st = original
+            ui.resolve_workflow_intent_with_llm = real_resolve
+            ui.build_agent_workflow_context = real_context
+            ui.build_intent_catalog = real_catalog
+            ui.is_llm_configured = real_llm
+            ui.execute_plan_streaming = real_stream
+
+        self.assertEqual(executed, [])
+        self.assertEqual(session["agent_workflow_context"]["dataset"], "MATR")
+        self.assertEqual(session["agent_model_request"]["status"], "blocked")
+        # A blocked request must not preselect anything.
+        self.assertNotIn("agent_selected_model", session)
+        self.assertEqual(session["agent_suggestions"]["runnable"], ["cptransformer"])
+        self.assertEqual(session["agent_suggestions"]["blocked"], ["PBT"])
 
 
 class TestNoFrontendDuplication(unittest.TestCase):
