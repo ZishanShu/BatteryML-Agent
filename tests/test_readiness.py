@@ -38,18 +38,35 @@ from batteryml_web.core.readiness import (  # noqa: E402
 )
 
 
-def _batteryml_registries_available() -> bool:
-    """Whether the live registries can be read in this environment."""
+def _registry_status_reason() -> str | None:
+    """Why the live registries cannot be read here, or None when they can.
+
+    The reason matters: "batteryml is not importable" and "batteryml imports
+    but the extension models have no source checked out" are different
+    problems with different fixes, and a skip message that names the wrong
+    one sends the reader after the wrong thing.
+    """
     try:
         from batteryml_web.core.config_validator import registry_status
 
         registries, error = registry_status()
-        return error is None and "MODELS" in registries
-    except Exception:
-        return False
+        if error is not None:
+            return str(error)
+        if "MODELS" not in registries:
+            return "the MODELS registry is absent from registry_status()."
+        return None
+    except Exception as exc:  # noqa: BLE001 - reported as the skip reason
+        return f"{type(exc).__name__}: {exc}"
 
 
-REGISTRIES_AVAILABLE = _batteryml_registries_available()
+REGISTRY_SKIP_REASON = _registry_status_reason()
+REGISTRIES_AVAILABLE = REGISTRY_SKIP_REASON is None
+
+#: What ``skipUnless`` prints, naming the actual blocker.
+REGISTRY_SKIP_MESSAGE = (
+    "the BatteryML registries cannot be read here: "
+    f"{(REGISTRY_SKIP_REASON or '')[:300]}"
+)
 
 
 class _TempRoots:
@@ -148,7 +165,7 @@ class TestDatasetReadiness(unittest.TestCase):
 class TestRegistryModelReadiness(unittest.TestCase):
     """CPTransformer and BatLiNet must stay READY and registered (regression)."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_cptransformer_ready(self) -> None:
         report = assess_registry_model("cptransformer", dataset="MATR", task="RUL prediction")
 
@@ -158,7 +175,7 @@ class TestRegistryModelReadiness(unittest.TestCase):
         self.assertEqual(report.missing, ())
         self.assertTrue(any("configs/external/cptransformer" in p for p in report.config_paths))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_batlinet_ready(self) -> None:
         report = assess_registry_model("batlinet", dataset="MATR", task="RUL prediction")
 
@@ -167,7 +184,7 @@ class TestRegistryModelReadiness(unittest.TestCase):
         self.assertIs(report.status, ModelStatus.READY)
         self.assertEqual(report.missing, ())
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_required_classes_registered(self) -> None:
         from batteryml_web.core.config_validator import registry_status
 
@@ -178,7 +195,7 @@ class TestRegistryModelReadiness(unittest.TestCase):
         self.assertIn("BatteryLifeCycleCurveFeatureExtractor", registries["FEATURE_EXTRACTORS"])
         self.assertIn("BatLiNetFeatureExtractor", registries["FEATURE_EXTRACTORS"])
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_matr_external_configs_pass_validator(self) -> None:
         from batteryml_web.core.config_validator import load_and_validate_config_file
 
@@ -192,7 +209,7 @@ class TestRegistryModelReadiness(unittest.TestCase):
                 f"{config} rejected by the execution gate: {report['errors']}",
             )
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_model_without_configs_is_unregistered(self) -> None:
         report = assess_registry_model("definitely_not_a_model_key")
 
@@ -201,7 +218,7 @@ class TestRegistryModelReadiness(unittest.TestCase):
         self.assertIs(report.status, ModelStatus.UNREGISTERED)
         self.assertTrue(report.missing)
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_assess_model_resolves_aliases(self) -> None:
         for name, expected in (("XGBoost", "xgb"), ("CPTransformerRULPredictor", "cptransformer")):
             report = assess_model(name, dataset="MATR")
@@ -222,6 +239,18 @@ class TestExternalModelReadiness(unittest.TestCase):
         self.assertEqual(report.task, "RUL prediction")
 
     def test_batterymformer_real_repo_missing_data(self) -> None:
+        # The name says it: this case is "the checkout is here, the data is
+        # not". Where third_party/BatteryMFormer is absent (it is gitignored,
+        # so most checkouts do not have it) the readiness layer correctly
+        # reports the source files and the prompt-embedding pickle as missing
+        # too, and the assertion below does not apply. Skipping states that;
+        # weakening the assertion would hide a real regression on a machine
+        # that does have the checkout.
+        if not (REPO_ROOT / "third_party" / "BatteryMFormer").is_dir():
+            self.skipTest(
+                "third_party/BatteryMFormer is not checked out here, so the "
+                "'repo present, data missing' case cannot be observed."
+            )
         report = assess_external_model("BatteryMFormer", check_environment=False)
 
         self.assertTrue(report.registered)
@@ -344,7 +373,7 @@ class TestExternalModelReadiness(unittest.TestCase):
 class TestWorkflowContext(unittest.TestCase):
     """The agent-facing context for the primary worked case and the trajectory task."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_matr_rul_context(self) -> None:
         context = get_workflow_context("MATR", "RUL prediction")
 
@@ -361,7 +390,7 @@ class TestWorkflowContext(unittest.TestCase):
         self.assertNotIn("BatteryMFormer", available_keys)
         self.assertTrue(context["recommended_next_steps"])
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_trajectory_task_reports_batterymformer_blocked(self) -> None:
         context = get_workflow_context("MATR", "Degradation trajectory forecasting")
 
@@ -373,7 +402,7 @@ class TestWorkflowContext(unittest.TestCase):
         steps = " ".join(context["recommended_next_steps"])
         self.assertIn("trajectory", steps.lower())
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_raw_only_dataset_requests_preprocessing_first(self) -> None:
         context = get_workflow_context("CALCE", "RUL prediction")
 
@@ -381,14 +410,14 @@ class TestWorkflowContext(unittest.TestCase):
         steps = " ".join(context["recommended_next_steps"])
         self.assertIn("preprocess", steps.lower())
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_default_dataset_is_matr_and_task_prefixes_are_folded(self) -> None:
         context = get_workflow_context()
         self.assertEqual(context["dataset"]["dataset"], "MATR")
         self.assertEqual(get_workflow_context("MATR", "RUL")["task"], "RUL prediction")
         self.assertEqual(get_workflow_context("MATR", "soh")["task"], "SOH estimation")
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_missing_dataset_reports_missing_state(self) -> None:
         context = get_workflow_context("__READINESS_TEST_MISSING_DATASET__", "RUL prediction")
 
@@ -404,7 +433,7 @@ class TestWorkflowContext(unittest.TestCase):
 class TestFullModelList(unittest.TestCase):
     """list_model_readiness must never present a blocked model as runnable."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_every_model_has_consistent_status_and_action(self) -> None:
         reports = list_model_readiness()
 

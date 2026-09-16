@@ -20,7 +20,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tests.test_readiness import REGISTRIES_AVAILABLE  # noqa: E402
+from tests.test_readiness import (  # noqa: E402
+    REGISTRIES_AVAILABLE,
+    REGISTRY_SKIP_MESSAGE,
+)
 from batteryml_web.agent.execution import (  # noqa: E402
     WRAPPER,
     build_execution_plan,
@@ -32,7 +35,7 @@ from batteryml_web.agent.execution import (  # noqa: E402
 class TestRunnablePlans(unittest.TestCase):
     """CPTransformer / BatLiNet on MATR: validated config, plan, no run."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_cptransformer_matr_plan(self) -> None:
         plan = plan_for_request("Use CPTransformer on MATR to predict battery lifetime.")
 
@@ -59,7 +62,7 @@ class TestRunnablePlans(unittest.TestCase):
         self.assertIn("--workspace", command)
         self.assertNotIn("--config", command)
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_batlinet_matr_plan(self) -> None:
         plan = plan_for_request("Use BatLiNet on MATR to predict battery lifetime.")
 
@@ -72,7 +75,7 @@ class TestRunnablePlans(unittest.TestCase):
         self.assertTrue(plan["can_execute"])
         self.assertIsInstance(plan["command"], list)
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_model_alias_resolution(self) -> None:
         from batteryml_web.agent.prompts import build_agent_workflow_context
 
@@ -85,7 +88,7 @@ class TestRunnablePlans(unittest.TestCase):
 class TestBlockedPlans(unittest.TestCase):
     """Blocked models and datasets never yield an executable plan."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_pbt_blocked(self) -> None:
         plan = plan_for_request("Use PBT on MATR to predict battery lifetime.")
 
@@ -95,7 +98,7 @@ class TestBlockedPlans(unittest.TestCase):
         self.assertIsNone(plan["config_path"])
         self.assertTrue(plan["command"] in (None, []))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_batterymformer_trajectory_blocked(self) -> None:
         plan = plan_for_request("Forecast the degradation trajectory for MATR with BatteryMFormer.")
 
@@ -106,7 +109,7 @@ class TestBlockedPlans(unittest.TestCase):
         self.assertIsNone(plan["config_path"])
         self.assertTrue(plan["command"] in (None, []))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_mich_raw_only_blocked(self) -> None:
         plan = plan_for_request("Use XGBoost on MICH to predict battery lifetime.")
 
@@ -116,7 +119,7 @@ class TestBlockedPlans(unittest.TestCase):
         self.assertIsNone(plan["command"])
         self.assertNotIn("data/raw/MICH", str(plan))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_unknown_model_cannot_execute(self) -> None:
         plan = build_execution_plan("MATR", "RUL prediction", "definitely_not_a_model")
 
@@ -124,7 +127,7 @@ class TestBlockedPlans(unittest.TestCase):
         self.assertIsNone(plan["config_path"])
         self.assertTrue(plan["command"] in (None, []))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_plan_never_invents_config_paths(self) -> None:
         from batteryml_web.agent.prompts import build_agent_workflow_context
 

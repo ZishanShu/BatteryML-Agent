@@ -22,7 +22,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tests.test_readiness import REGISTRIES_AVAILABLE  # noqa: E402
+from tests.test_readiness import (  # noqa: E402
+    REGISTRIES_AVAILABLE,
+    REGISTRY_SKIP_MESSAGE,
+)
 from batteryml_web.agent.prompts import build_agent_workflow_context  # noqa: E402
 
 
@@ -37,7 +40,7 @@ def _blocked_names(context: dict) -> set[str]:
 class TestMatrRulAgentContext(unittest.TestCase):
     """The primary case: MATR lifetime prediction must offer CP/BatLiNet."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_matr_rul_has_cptransformer_and_batlinet_runnable(self) -> None:
         context = build_agent_workflow_context("MATR", "RUL prediction")
 
@@ -48,7 +51,7 @@ class TestMatrRulAgentContext(unittest.TestCase):
         self.assertIn("cptransformer", runnable)
         self.assertIn("batlinet", runnable)
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_pbt_blocked_not_runnable(self) -> None:
         context = build_agent_workflow_context("MATR", "RUL prediction")
 
@@ -59,7 +62,7 @@ class TestMatrRulAgentContext(unittest.TestCase):
         self.assertTrue(blocked["PBT"]["missing"])
         self.assertTrue(blocked["PBT"]["recommended_action"])
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_batterymformer_absent_from_rul_recommendations(self) -> None:
         context = build_agent_workflow_context("MATR", "RUL prediction")
 
@@ -68,7 +71,7 @@ class TestMatrRulAgentContext(unittest.TestCase):
         text = " ".join(context["recommended_next_steps"]).lower()
         self.assertNotIn("batterymformer", text)
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_no_fabricated_config_paths(self) -> None:
         context = build_agent_workflow_context("MATR", "RUL prediction")
 
@@ -85,7 +88,7 @@ class TestMatrRulAgentContext(unittest.TestCase):
         for item in context["runnable_models"]:
             self.assertEqual(item["status"], "READY")
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_matr_supports_preprocessing_command(self) -> None:
         context = build_agent_workflow_context("MATR", "RUL prediction")
 
@@ -100,7 +103,7 @@ class TestMatrRulAgentContext(unittest.TestCase):
 class TestMichBlockedAgentContext(unittest.TestCase):
     """MICH is RAW_ONLY via an unwired v11 archive: never emit a command."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_mich_rul_reports_raw_only_and_no_executable_command(self) -> None:
         context = build_agent_workflow_context("MICH", "RUL prediction")
 
@@ -113,7 +116,7 @@ class TestMichBlockedAgentContext(unittest.TestCase):
         self.assertIn("not yet wired", steps)
         self.assertIn("BatteryML-compatible", steps)
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_mich_blocked_models_carry_reasons(self) -> None:
         context = build_agent_workflow_context("MICH", "RUL prediction")
 
@@ -125,7 +128,7 @@ class TestMichBlockedAgentContext(unittest.TestCase):
 class TestRepoRootForwarding(unittest.TestCase):
     """repo_root must reach the readiness layer, never be silently dropped."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_repo_root_is_actually_used(self) -> None:
         import tempfile
 
@@ -153,7 +156,7 @@ class TestRepoRootForwarding(unittest.TestCase):
 class TestTrajectoryAgentContext(unittest.TestCase):
     """Trajectory forecasting exposes BatteryMFormer semantics, not RUL models."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_trajectory_exposes_batterymformer_blocked(self) -> None:
         context = build_agent_workflow_context("MATR", "Degradation trajectory forecasting")
 

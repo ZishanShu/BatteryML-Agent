@@ -191,8 +191,6 @@ def discover_artifacts(
     repo_root: str | Path | None = None,
 ) -> Dict[str, List[str]]:
     """List real result files under ``workspace``; never invents paths."""
-    from ..core.results_reader import find_result_files
-
     root = Path(repo_root) if repo_root is not None else _repo_root()
     resolved = (
         Path(workspace)
@@ -201,6 +199,11 @@ def discover_artifacts(
     )
     if not resolved.is_dir():
         return _empty_artifacts()
+    # Imported here rather than at the top of the function so that a missing
+    # workspace needs no pandas: there is nothing to read, so nothing heavy
+    # should be imported to say so.
+    from ..core.results_reader import find_result_files
+
     found = find_result_files(resolved, resolved)
     artifacts = _empty_artifacts()
     for key in (

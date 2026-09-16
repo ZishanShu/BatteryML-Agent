@@ -1,0 +1,23 @@
+# Streamlit configuration for the BatteryML Protocol Platform.
+#
+# The platform is used through localhost or a forwarded port, by battery
+# scientists rather than by the people developing it. Streamlit's default
+# toolbar offers "Clear cache", "Rerun", "Record a screencast" and the
+# developer keyboard shortcuts, none of which mean anything to that user and
+# one of which (Clear cache) can throw away work mid-run.
+#
+# toolbarMode = "viewer" hides the developer entries and keeps the ordinary
+# menu. It is a supported Streamlit option (client.toolbarMode, available
+# since Streamlit 1.18); an older build ignores an unknown option with a
+# warning rather than failing to start. No JavaScript is injected to
+# intercept keystrokes: that would be fragile, invisible to the next reader,
+# and would fight the framework instead of configuring it.
+#
+# Nothing here changes what the platform computes.
+
+[client]
+toolbarMode = "viewer"
+showErrorDetails = true
+
+[browser]
+gatherUsageStats = false

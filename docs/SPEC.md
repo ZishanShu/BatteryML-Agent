@@ -36,7 +36,7 @@ everything is done.
 | Namespace | What it identifies | Where it lives |
 | --- | --- | --- |
 | `VIZ-nn`, and future feature prefixes | a **requirement** — something the platform must do | this file |
-| `ENV-01`, `DATA-01`, `CFG-01`, `VAL-01`, `SPLIT-01`, `REG-01`, `EXT-01`, `CLI-01`, `FIG-01` | a **check** — something the verification harness establishes | `docs/VERIFY.md` |
+| `ENV-01`, `DATA-01`, `CFG-01`, `VAL-01`, `SPLIT-01`, `REG-01`, `EXT-01`, `CLI-01`, `FIG-01`, `DEV-01`, `INTENT-01` | a **check** — something the verification harness establishes | `docs/VERIFY.md` |
 
 They are the same shape, so keep the prefixes disjoint: the figure *requirements*
 are `VIZ-01`…, and the figure *check* that verifies them is `FIG-01`. Nothing is
@@ -75,6 +75,144 @@ cells; a per-cell error chart shows whether one outlier carries the RMSE. The
 * No requirement in this group may be marked `VERIFIED` from this environment:
   it has no numpy, no matplotlib and no torch, so no figure has ever been drawn
   here. The command block that would verify them is in `docs/VISUALIZATION.md`.
+
+---
+
+## EXEC — execution runtime (smoke runs, devices, failures)
+
+Rationale for the group: the platform's one irreversible action is starting a
+BatteryML run. Everything about *how* that run is started — which device, how
+many epochs, what happens when it fails — must be decided by the backend and
+displayed honestly, because this is exactly where a plausible-looking shortcut
+(a retried OOM, a mutated config, a fabricated percentage) would silently
+change what the manuscript reports.
+
+| ID | Requirement | Status | Implementation |
+| --- | --- | --- | --- |
+| `EXEC-01` | A smoke run is one epoch of the model's **own formal config**. The only override is the planner's `--epochs 1`; no config file is written, copied or mutated, and no batch size, support size or learning rate is touched. A smoke run therefore exercises the same code path a benchmark run does. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/run_policy.py` (`SMOKE_EPOCHS`, `smoke_epochs_for`), `batteryml_web/agent/execution.py` (`build_execution_plan`) |
+| `EXEC-02` | Every surface that offers or reports a smoke run shows the sentence "1-epoch smoke test — workflow validation only; not benchmark performance." A smoke metric is never presented as benchmark performance. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/run_policy.py` (`SMOKE_NOTICE`), `batteryml_web/ui/agent_workflow.py` |
+| `EXEC-03` | BatLiNet's smoke run defaults to and recommends CPU, with the reason stated. An explicit GPU choice is always honoured; the recommendation never selects a device on the user's behalf. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/run_policy.py` (`SMOKE_CPU_RECOMMENDED_MODELS`, `smoke_device_recommendation`) |
+| `EXEC-04` | Selectable devices are enumerated from the machine (`nvidia-smi`), never from a hardcoded GPU count, and each is shown with its observed free/total memory. Unknown memory is displayed as unknown, never as zero. When enumeration fails, an explicit GPU choice remains possible and the enumeration error is shown beside it. | `IMPLEMENTED-STATIC` | `batteryml_web/core/device_inventory.py`, `batteryml_web/ui/agent_workflow.py` (`device_options`) |
+| `EXEC-05` | A failed run is never retried — not on another GPU, not on the same one. A CUDA out-of-memory failure is named as a shared-memory condition, states the CPU-smoke and larger-GPU alternatives, quotes the run's own error line, and leaves the full stdout/stderr (traceback included) available for inspection. No metric is ever derived from a failed run. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/run_policy.py` (`classify_execution_failure`), `batteryml_web/agent/executor.py` |
+| `EXEC-06` | A run reports progress while it runs. The backend executes the same validated plan through `subprocess.Popen` (argv list, `shell=False`) and emits structured events — `stage` / `training_progress` / `output` / `completed` — on the caller's own thread. The executor stays Streamlit-independent; the page renders the events and holds no execution logic. stdout and stderr are preserved in full, carriage returns included, so a tqdm bar and a traceback both survive. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/streaming.py`, `batteryml_web/ui/agent_workflow.py` (`_LiveProgress`) |
+| `EXEC-07` | A percentage is displayed only where the run itself printed a counter. The real tqdm lines the installed models emit are recognised (`Training <Model>: …`, and the upstream `Traning: …` typo in `batteryml/models/nn_model.py`), tqdm's stderr carriage returns included. Where no counter exists, a stage name and an elapsed clock are shown and **no** bar is drawn. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/streaming.py` (`parse_progress_line`, `classify_stage`), `batteryml_web/ui/agent_workflow.py` (`progress_caption`) |
+| `EXEC-08` | Progress output is never a source of scientific truth. Metrics come only from `build_result_context`, which reads BatteryML's own saved `scores`. A failed run ends at stage `Failed` with its return code and stderr intact and no metric of any kind. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/streaming.py`, `batteryml_web/agent/results.py` |
+
+The check that establishes `EXEC-01`…`EXEC-08` is `DEV-01`
+(`scripts/verify/check_runtime_contract.py`); the unit tests are
+`tests/test_agent_smoke.py`, `tests/test_agent_streaming.py` and the
+milestone-A/B classes in `tests/test_agent_web_ui.py`. None of them may be marked `VERIFIED` from this
+environment: it has no torch, no GPU and no Streamlit, so no run has ever
+started here.
+
+---
+
+## UI — entry points and feedback
+
+Rationale for the group: the platform has two legitimate ways in — the
+deterministic quick start a reviewer follows with no API key (Route B), and
+the natural-language agent (Route A). Presenting the agent as "step 3 of 4"
+made it look like a mandatory stage of the manual route, and buried the
+product's main entry point inside a sequence. These requirements fix where
+each route is offered, not what either one does.
+
+| ID | Requirement | Status | Implementation |
+| --- | --- | --- | --- |
+| `UI-01` | Home offers Quick Start **and** the Agent Workflow at the same visual hierarchy: a free-text request ("Describe what you want to do...", placeholder "Use CPTransformer on MATR to predict battery lifetime.") and an **Analyze with Agent** button. Quick Start's behaviour is unchanged. | `IMPLEMENTED-STATIC` | `batteryml_web/app.py` (`render_home_agent_entry`) |
+| `UI-02` | Home records the request in session state and navigates; it resolves no intent, reads no readiness, builds no plan and executes nothing. The Agent Workflow page analyses the handed-over request once on arrival through the existing backend; execution still requires the explicit Run button there. | `IMPLEMENTED-STATIC` | `batteryml_web/app.py`, `batteryml_web/ui/agent_workflow.py` (`_analyze_request`) |
+| `UI-03` | Page and section headings use native Streamlit primitives with `anchor=False`, so no heading anchor, link icon or raw markup is exposed in the rendered page. | `IMPLEMENTED-STATIC` | `batteryml_web/app.py`, `batteryml_web/ui/agent_workflow.py` |
+| `UI-04` | The sidebar shows the Agent Workflow as an alternative intelligent entry point in its own block, not as a numbered step of the protocol workflow. The manual route stays numbered 1–3 and remains fully usable with no LLM. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/workflow_sidebar.py` |
+| `UI-05` | Creating a project confirms what was created — the project name and its workspace, drawn from the directory that was actually created — and the confirmation itself is transient (see `UI-09`). Project filesystem semantics are unchanged. | `IMPLEMENTED-STATIC` | `batteryml_web/app.py` (`_ensure_project`, `_render_project_created_notice`) |
+| `UI-06` | The Agent Workflow entry is written exactly `Agent Workflow` wherever it appears — Home, sidebar, page heading, navigation buttons. No emoji, no caret, no numbering, and no copy explaining that it is an alternative route: one destination, one name. Quick Start and Agent Workflow remain equal primary Home entries. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/workflow_sidebar.py` (`nav_label`), `batteryml_web/app.py`, `batteryml_web/ui/agent_workflow.py` |
+| `UI-07` | The request is supplied through two tabs: **Describe request** (free text) and **Examples** (clickable). Examples are built from the backend catalog and, where readiness is known, name a model that is actually runnable — no model name is written into the UI. Clicking one fills the request field and reruns; it never analyses and never executes. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/catalog.py` (`build_example_requests`), `batteryml_web/ui/agent_workflow.py` (`_render_examples`) |
+| `UI-08` | The Streamlit developer toolbar is not offered to end users: `client.toolbarMode = "viewer"` in `.streamlit/config.toml`. Configured, not scripted — no JavaScript intercepts keystrokes. | `IMPLEMENTED-STATIC` | `.streamlit/config.toml` |
+| `UI-09` | Success is transient and failure is persistent. An ordinary successful action reports through one `st.toast`, emitted once per occurrence; Streamlit reruns do not repeat it, and a signature keyed on the action's *subject* keeps a device or checkbox change from toasting. Failures stay on the page as `st.error` / `st.warning`, and a failure is never rendered in a success box. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/feedback.py` |
+
+The tests for this group are `tests/test_web_navigation.py` (source- and
+AST-level, so Home's boundary is checked without importing torch or
+Streamlit), `tests/test_ui_feedback.py`, and the handover, request-tab and
+feedback classes in `tests/test_agent_web_ui.py`. Nothing here may be marked
+`VERIFIED` from this environment: no Streamlit page has been rendered in it,
+and `UI-08` in particular can only be confirmed by looking at the running
+app's toolbar.
+
+---
+
+## INTENT — understanding the request
+
+Rationale for the group: the deterministic phrase table is precise and
+rigid. It cannot read "Can you run a model for cycle aging on the MATR
+cells?", an informal model name, or mixed Chinese/English. An LLM can — and
+an LLM can also confidently name a dataset, a model or a config file that
+does not exist. These requirements put the LLM where it helps (reading the
+sentence) and keep every identifier it produces subject to the backend.
+
+The order is fixed and must not be shortened:
+
+    LLM interpretation -> structured candidate intent -> canonical catalog
+    -> readiness -> validator -> user confirmation -> execution
+
+| ID | Requirement | Status | Implementation |
+| --- | --- | --- | --- |
+| `INTENT-01` | The catalog offered to the LLM is built from the live backend — `ConfigRegistry` for models and their dataset/task coverage, the platform dataset list plus `list_dataset_readiness` for datasets, the three canonical task labels, and `readiness.EXTERNAL_MODELS` for external runners. No second, hand-maintained catalog exists, and no config path ever appears in it. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/catalog.py` |
+| `INTENT-02` | The LLM is asked for structured JSON only: dataset, task, requested_model, needs_clarification, clarification_question, suggested_model_keys, user_facing_rationale. Hidden reasoning is never requested; the rationale is short, user-facing and length-capped. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/llm_intent.py` (`SYSTEM_PROMPT`, `build_intent_prompt`) |
+| `INTENT-03` | Every identifier the LLM returns is resolved against the catalog before use. An unknown dataset, task or model key becomes `None` and is recorded under `rejected`; a config path, command, device, epoch count or metric is discarded and reported. A reply that is not valid JSON, or not an object, is discarded whole. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/llm_intent.py` (`validate_llm_intent`, `extract_json_object`) |
+| `INTENT-04` | The deterministic resolver stays the fast path — a request it fully resolves costs no LLM call — and the fallback: when no LLM is configured, or the call or parse fails, its answer is returned and the page says plainly that advanced natural-language understanding is unavailable. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/llm_intent.py` (`resolve_workflow_intent_with_llm`), `batteryml_web/ui/agent_workflow.py` (`_render_intent`) |
+| `INTENT-05` | Recommendations are filtered by readiness, not by the LLM. A suggestion that is not runnable for the resolved dataset and task is separated out and may be *mentioned* with its backend reason (PBT, NEEDS_ASSETS) but never offered as runnable. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/llm_intent.py` (`filter_suggestions`) |
+| `INTENT-06` | A requested model that is blocked, or that is unknown to the catalog, is never silently replaced. The reason is stated, runnable alternatives are listed, `requires_confirmation` is set, and the user selects a replacement explicitly. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/llm_intent.py` (`resolve_model_request`), `batteryml_web/ui/agent_workflow.py` (`_render_model_request`) |
+| `INTENT-07` | An unresolved dataset or task produces one concise clarification question. An explicit request is never defaulted to MATR. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/llm_intent.py`, `batteryml_web/agent/intent.py` |
+| `INTENT-08` | Common Chinese and mixed-language phrasings resolve, in the **offline** route as well: the task phrase table carries the Chinese spellings, so "帮我用 MATR 做电池寿命预测" resolves to MATR + RUL prediction with no API key. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/intent.py`, `batteryml_web/agent/catalog.py` (`TASK_ALIASES`) |
+| `INTENT-09` | Free-form LLM prose can never trigger a run. The intent layer imports no executor, calls no planner, and touches neither `subprocess` nor the filesystem; the canonical identifiers it produces still go through `build_agent_workflow_context`, `build_execution_plan`, the validator and the explicit Run button. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/llm_intent.py`, `scripts/verify/check_intent_catalog.py` |
+| `INTENT-10` | A request that asks *which* model to use is recognised as a recommendation request — in English and in Chinese, deterministically, so the offline route behaves the same way. When an LLM is configured such a request reaches it even though the dataset and task already resolve, because choosing among runnable models is a judgement the phrase table cannot make. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/intent.py` (`detect_recommendation_request`), `batteryml_web/agent/llm_intent.py` |
+| `INTENT-11` | The model section answers the request instead of listing the platform. A named runnable model is shown alone; a named blocked model is shown with its exact status and blockers, then runnable alternatives; an unregistered name is reported as such with the closest runnable models; a recommendation shows at most three, drawn from the agent's suggestions only where readiness keeps them. The full runnable and blocked catalogues live behind expanders. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/recommendation.py`, `batteryml_web/ui/agent_workflow.py` (`_render_model_presentation`) |
+| `INTENT-12` | Nothing is ever substituted for a model the user asked for. Where the request named something blocked or unregistered, no model is preselected: the control opens on an empty choice and no plan exists — and therefore no Run — until the user selects one deliberately. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/recommendation.py` (`selectbox_options`, `NO_SELECTION`), `batteryml_web/ui/agent_workflow.py` |
+| `INTENT-13` | No model name is written into recommendation logic. The presentation layer reads the readiness context and the catalog it is given, cannot consult readiness itself, and so cannot overrule it. `DEV`/`INTENT-01` fails if a model name appears there. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/recommendation.py`, `scripts/verify/check_intent_catalog.py` |
+
+The check that establishes this group is `INTENT-01`
+(`scripts/verify/check_intent_catalog.py`); the unit tests are
+`tests/test_llm_intent.py` (57 cases, every LLM answer stubbed),
+`tests/test_model_presentation.py` (22 cases) and the LLM-intent class in
+`tests/test_agent_web_ui.py`. Nothing here may be
+marked `VERIFIED` from this environment: no LLM endpoint has been called
+from it.
+
+---
+
+## GPU — devices and parallelism
+
+Rationale for the group: the development server has eight GPUs, which makes
+two mistakes tempting. The first is hardcoding "8". The second is offering a
+multi-GPU run that does not exist, on the theory that 8 × 2 GB free adds up
+to 16 GB. The audit behind this group is `docs/GPU_MULTI_GPU_AUDIT.md`.
+
+| ID | Requirement | Status | Implementation |
+| --- | --- | --- | --- |
+| `GPU-01` | The machine's GPUs are enumerated at runtime — index, name, total/used/free memory — and any single one may be selected. The count is discovered from the output, never assumed; unknown memory is shown as unknown. | `IMPLEMENTED-STATIC` | `batteryml_web/core/device_inventory.py` (see also `EXEC-04`) |
+| `GPU-02` | A run is sent to exactly one torch device. `cpu`, `cuda`, `cuda:<index>` and `mps` are accepted; a multi-device string such as `cuda:0,1` is refused at the planner boundary with the reason, rather than failing inside a run that has already started. | `IMPLEMENTED-STATIC` | `batteryml_web/core/device_inventory.py` (`validate_device`), `batteryml_web/agent/execution.py` |
+| `GPU-03` | No multi-GPU Run option is exposed while none exists. The web layer contains no `DataParallel`, `DistributedDataParallel`, `init_process_group` or `torchrun` path, and the DEV-01 check fails if one appears. | `IMPLEMENTED-STATIC` | `scripts/verify/check_runtime_contract.py`, `tests/test_agent_smoke.py` |
+| `GPU-04` | The reason multi-GPU is absent is written down, with the code it follows from and the work a real implementation would take: `DataBundle.to(device)` places the whole dataset on one device, so neither DataParallel nor DDP relieves the per-GPU memory limit; BatLiNet's inter-cell support sampling has no defined distributed semantics; DDP changes effective batch size and determinism. | `IMPLEMENTED-STATIC` | `docs/GPU_MULTI_GPU_AUDIT.md` |
+| `GPU-05` | Device selection is a structure — `{"mode": "cpu" \| "single_gpu" \| "multi_gpu", "gpu_ids": [...]}` — separate from the `--device` string BatteryML receives. CPU and one GPU produce a device string; a multi-GPU selection produces none, so `"cuda:0,1"` cannot be constructed. | `IMPLEMENTED-STATIC` | `batteryml_web/core/device_inventory.py` (`build_device_selection`, `device_string_for_selection`) |
+| `GPU-06` | The page offers CPU, one GPU or several through a multiselect (no GPU ticked = CPU), and shows each device's index, name, total/used/free memory and utilization. Single-GPU and CPU behaviour is unchanged. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/agent_workflow.py`, `batteryml_web/core/device_inventory.py` |
+| `GPU-07` | Whether a multi-GPU selection may execute is a backend capability (`supports_multi_gpu`, `multi_gpu_strategy`), and no model carries it today. A multi-GPU selection for a model without it disables Run with "This model/runtime does not yet support multi-GPU execution." — and the selection is never quietly reduced to a single GPU. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/run_policy.py` (`multi_gpu_capability`, `execution_blockers`) |
+
+`GPU-05`…`GPU-07` prepare for a real multi-GPU implementation without
+claiming one: the selection shape and the capability gate are what a DDP
+milestone would fill in, and `DEV-01` fails if a model is registered as
+capable while no DDP path exists.
+
+`GPU-04` is a documentation requirement on purpose: the decision *not* to
+build something is the part of an audit that gets lost, and the next person
+to look at eight idle GPUs needs the reasoning, not just the absence.
+
+---
+
+## Where the moving parts are described
+
+`docs/AGENT_WORKFLOW.md` walks the whole path from a sentence to a validated
+run, says which module owns which decision, and carries the command block the
+user runs on the server to turn any of these rows into `VERIFIED`.
+`docs/GPU_MULTI_GPU_AUDIT.md` carries the device and parallelism audit behind
+the `GPU` group.
 
 ---
 
