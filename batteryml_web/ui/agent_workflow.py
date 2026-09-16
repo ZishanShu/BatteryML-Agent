@@ -7,11 +7,18 @@ Boundary rules (milestone: agent web integration):
   ``agent.executor`` / ``agent.results`` / ``agent.result_agent``); nothing
   is re-derived here;
 * no subprocess, no shell strings, no stdout metric parsing, no metric
-  computation in this module — execution goes through
-  ``execute_plan_streaming`` only, and only from the explicit Run button
-  inside :func:`render_agent_workflow`. Live progress is rendered from the
-  structured events that function emits; the output is never a source of
+  computation in this module. The explicit Run button hands the validated
+  plan to :class:`batteryml_web.core.run_manager.RunManager`, which executes
+  it through ``execute_plan_streaming`` on its own thread. The page then
+  only *polls* that run's structured state, which is what leaves it free to
+  draw a Cancel button that can actually be clicked. Live progress is
+  rendered from the events the run reported; the output is never a source of
   metrics, and no percentage is drawn that the run did not report;
+* a run has an identity (``core/run_identity.py``) and a persisted record
+  (``core/run_manifest.py``). The page reads history back from those files
+  rather than from session state, so a refresh or a restart does not lose
+  it, and a run that cannot be proven alive is reported INTERRUPTED rather
+  than left claiming to be running;
 * session state holds small JSON-serializable values only (request text,
   workflow context, selected model key, plan, execution result, result
   context, explanation) — never tensors, checkpoints or DataBundle objects.
@@ -88,8 +95,13 @@ from ..core.device_inventory import (
     query_gpu_inventory,
     selection_from_devices,
 )
+from ..core import run_manifest as rm
+from ..core.run_manifest import write_manifest
+from ..core.run_identity import new_run_id
+from ..core.run_manager import CANCELLED_MESSAGE, get_run_manager
 from ..core.project_context import (
     agent_workspace,
+    run_workspace,
     display_path,
     resolve_project,
 )
@@ -115,6 +127,20 @@ from .progress_utils import get_safe_runtime_env
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 RUN_BUTTON_LABEL = "Run"
+CANCEL_BUTTON_LABEL = "Cancel run"
+
+#: Session key holding the run id reserved for the *prepared* plan. It is
+#: minted once a runnable plan exists, so the page can show which run it is
+#: about to create, and consumed when Run is pressed. Nothing is written to
+#: disk until then: a reservation that is never used names no execution.
+PENDING_RUN_ID_KEY = "agent_pending_run_id"
+
+#: Session key holding the id of the run this page is currently watching.
+ACTIVE_RUN_KEY = "agent_active_run_id"
+
+#: How often the progress fragment re-draws while a run is in flight. A
+#: polled refresh, not a rerun loop: the script is not re-executed whole.
+PROGRESS_POLL_SECONDS = 2.0
 #: Label of the one request control. There are no tabs: an example gallery
 #: was a second way to do the same thing, and the page now offers one.
 REQUEST_LABEL = "Workflow request"
@@ -897,6 +923,253 @@ def accept_suggestion(suggestion: str, current_request: str) -> bool:
     return bool(str(suggestion or "").strip()) and not str(current_request or "").strip()
 
 
+def _reserved_run_id(
+    *,
+    dataset: str,
+    model: str,
+    seed: Any,
+    device: str,
+    smoke: bool,
+) -> str:
+    """The id reserved for the currently prepared plan.
+
+    Kept stable while the plan is unchanged, so the page does not appear to
+    renumber the run on every rerun, and re-minted when any part of the plan
+    that identifies the experiment changes. Reserving is not creating: no
+    directory and no manifest exist until Run is pressed.
+    """
+    subject = json.dumps(
+        [dataset, model, str(seed), device, bool(smoke)], sort_keys=True
+    )
+    if st.session_state.get("agent_pending_run_subject") != subject:
+        st.session_state["agent_pending_run_subject"] = subject
+        st.session_state[PENDING_RUN_ID_KEY] = new_run_id(
+            dataset=dataset, model=model, seed=seed
+        )
+    return str(st.session_state[PENDING_RUN_ID_KEY])
+
+
+def _launch_run(
+    *,
+    run_id: str,
+    plan: dict[str, Any],
+    project: dict[str, Any],
+    run_context: dict[str, Any],
+) -> None:
+    """Create the run on disk, then start it in the background.
+
+    Order matters: the manifest is written *before* anything executes, so a
+    crash between the two leaves a PLANNED run on disk rather than a silent
+    gap. The page then returns immediately — the job runs on the manager's
+    own thread, which is what keeps Cancel clickable.
+    """
+    workspace = str(plan.get("command_workspace") or run_context.get("workspace") or "")
+    if not workspace:
+        workspace = str(_workspace_from_plan_command(plan) or "")
+    run_dir = REPO_ROOT / workspace if workspace else None
+    if run_dir is None:
+        st.error(
+            "The validated plan carries no workspace, so there is nowhere to "
+            "record this run. Rebuild the plan before running."
+        )
+        return
+
+    manifest = rm.build_manifest(
+        run_id=run_id,
+        project=str(project.get("name") or ""),
+        workspace=workspace,
+        dataset=plan.get("dataset"),
+        task=plan.get("task"),
+        model_key=plan.get("model"),
+        model_display=plan.get("model_display"),
+        config_path=plan.get("config_path"),
+        seed=run_context.get("seed"),
+        epochs=plan.get("epochs"),
+        device=run_context.get("device"),
+        device_selection=st.session_state.get("agent_device_selection") or {},
+        smoke=bool(run_context.get("smoke")),
+        command=plan.get("command") or [],
+        git_commit=_git_commit(),
+    )
+    write_manifest(run_dir, manifest)
+
+    get_run_manager().start(
+        run_id=run_id,
+        run_dir=run_dir,
+        plan=plan,
+        repo_root=REPO_ROOT,
+        env=get_safe_runtime_env(),
+    )
+    st.session_state[ACTIVE_RUN_KEY] = run_id
+
+
+def _workspace_from_plan_command(plan: dict[str, Any]) -> str | None:
+    """The ``--workspace`` value in the plan's own argv."""
+    command = plan.get("command")
+    if not isinstance(command, (list, tuple)):
+        return None
+    parts = [str(part) for part in command]
+    if "--workspace" not in parts:
+        return None
+    index = parts.index("--workspace")
+    return parts[index + 1] if index + 1 < len(parts) else None
+
+
+def _git_commit() -> str | None:
+    """The repository commit, read from .git without shelling out.
+
+    Returns None when it cannot be read; a run that cannot state its commit
+    says so rather than carrying a plausible-looking wrong one.
+    """
+    head = REPO_ROOT / ".git" / "HEAD"
+    try:
+        text = head.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if text.startswith("ref:"):
+        ref = (REPO_ROOT / ".git" / text.split(" ", 1)[1].strip())
+        try:
+            return ref.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            return None
+    return text or None
+
+
+def _finish_active_run(run_id: str, snapshot: dict[str, Any], *, smoke: bool) -> None:
+    """Move a finished background run into the page's result state.
+
+    A result context is built **only** for a run that completed. A cancelled
+    or failed run has measured nothing, so none is built and no metric is
+    offered for it.
+    """
+    manager = get_run_manager()
+    handle = manager.get(run_id)
+    result = dict(getattr(handle, "result", None) or {})
+    status = str(snapshot.get("status") or "")
+    result_context = None
+    if status == rm.STATUS_COMPLETED and result.get("success"):
+        workspace = result.get("workspace")
+        plan = st.session_state.get("agent_execution_plan") or {}
+        if workspace:
+            result_context = build_result_context(
+                workspace,
+                dataset=plan.get("dataset"),
+                task=plan.get("task"),
+                model=plan.get("model"),
+                config_path=plan.get("config_path"),
+                run_status="SUCCESS",
+                execution_result=result,
+                smoke_run=smoke,
+            )
+            metrics = (result_context or {}).get("metrics") or {}
+            if metrics:
+                try:
+                    rm.update_manifest(
+                        handle.run_dir, {"metrics": dict(metrics)},
+                        enforce_transition=False,
+                    )
+                except (FileNotFoundError, ValueError):
+                    pass
+    _store_json_state("agent_execution_result", _compact_execution_output(result))
+    _store_json_state("agent_result_context", result_context)
+    st.session_state["agent_run_serial"] = (
+        int(st.session_state.get("agent_run_serial", 0)) + 1
+    )
+    st.session_state["last_run_status"] = status.lower()
+    st.session_state["last_run_code"] = result.get("returncode")
+    st.session_state.pop(ACTIVE_RUN_KEY, None)
+    manager.forget(run_id)
+
+
+def _render_active_run(
+    run_id: str,
+    *,
+    plan: dict[str, Any],
+    smoke: bool,
+    device: str,
+) -> None:
+    """Status, live progress and a working Cancel for the run in flight.
+
+    The refresh is a fragment on a timer, not a rerun loop: only this block
+    re-executes, on a fixed interval, so the rest of the page (and the user's
+    typing) is untouched and the server is not spun.
+    """
+    manager = get_run_manager()
+    snapshot = manager.snapshot(run_id)
+    if snapshot is None:
+        # The manager has no memory of this run — this process did not start
+        # it, or it was already reaped. Say so rather than showing a spinner
+        # forever; Run History below still has the persisted truth.
+        st.warning(
+            f"Run {run_id} is no longer tracked by this server process. Its "
+            "recorded state is in Run History below."
+        )
+        st.session_state.pop(ACTIVE_RUN_KEY, None)
+        return
+
+    if snapshot.get("finished"):
+        _finish_active_run(run_id, snapshot, smoke=smoke)
+        st.rerun()
+        return
+
+    st.caption(f"Run {run_id} is executing (started by an explicit user action).")
+
+    @st.fragment(run_every=PROGRESS_POLL_SECONDS)
+    def _live() -> None:
+        current = manager.snapshot(run_id)
+        if current is None:
+            return
+        event = current.get("event") or {}
+        elapsed = float(current.get("elapsed_s") or 0.0)
+        timer = _progress_timer(run_id)
+        timer.observe(event.get("current"), event.get("total"), elapsed)
+        eta = timer.eta_seconds()
+        has_counter = isinstance(event.get("current"), int) and isinstance(
+            event.get("total"), int
+        )
+        st.caption(
+            progress_caption(
+                str(event.get("stage") or ""),
+                event.get("current"),
+                event.get("total"),
+                elapsed,
+                eta_s=eta,
+                estimating=has_counter and eta is None,
+            )
+        )
+        fraction = event.get("fraction")
+        if isinstance(fraction, (int, float)):
+            # Drawn only when the run itself reported a counter.
+            st.progress(min(max(float(fraction), 0.0), 1.0))
+        tail = current.get("tail") or []
+        if tail:
+            st.code("\n".join(str(line) for line in tail[-LIVE_LOG_LINES:]), language="text")
+        if current.get("finished"):
+            st.rerun()
+
+    _live()
+
+    if st.session_state.get(f"cancelling_{run_id}"):
+        st.warning("Cancelling this run…")
+    if st.button(
+        CANCEL_BUTTON_LABEL,
+        key=f"agent_cancel_{run_id}",
+        use_container_width=True,
+    ):
+        st.session_state[f"cancelling_{run_id}"] = True
+        # Terminates this run's process group and nothing else.
+        manager.cancel(run_id)
+        st.rerun()
+
+
+def _progress_timer(run_id: str) -> EpochTimer:
+    """One ETA estimator per run, kept across fragment redraws."""
+    timers = st.session_state.setdefault("_agent_progress_timers", {})
+    if run_id not in timers:
+        timers[run_id] = EpochTimer()
+    return timers[run_id]
+
+
 def render_agent_workflow() -> None:
     """Analyze -> select -> plan -> explicit Run -> structured result -> explain."""
     st.header("Agent Workflow", anchor=False)
@@ -1097,6 +1370,18 @@ def render_agent_workflow() -> None:
         else:
             device = str(device_value)
             st.session_state["agent_device"] = device
+            # The run this page is about to create. Reserved (not created):
+            # minting happens once a runnable plan exists so the id can be
+            # shown before Run, and the directory and manifest appear only
+            # when Run is pressed. Pressing Run consumes it, so a second run
+            # of the identical plan gets a different id.
+            pending_run_id = _reserved_run_id(
+                dataset=str(context.get("dataset")),
+                model=str(selected_key),
+                seed=seed,
+                device=device,
+                smoke=smoke,
+            )
             plan = build_execution_plan(
                 str(context.get("dataset")),
                 str(context.get("task")),
@@ -1104,8 +1389,15 @@ def render_agent_workflow() -> None:
                 workflow_context=context,
                 device=device,
                 seed=seed,
-                workspace=agent_workspace(
-                    project, str(context.get("dataset")), str(selected_key), smoke=smoke
+                # The run-specific directory, so the plan the user reviews is
+                # exactly the plan that executes, and two runs of the same
+                # model cannot overwrite each other.
+                workspace=run_workspace(
+                    project,
+                    str(context.get("dataset")),
+                    str(selected_key),
+                    pending_run_id,
+                    smoke=smoke,
                 ),
                 epochs=smoke_epochs_value(smoke),
             )
@@ -1117,6 +1409,7 @@ def render_agent_workflow() -> None:
                 seed=seed,
                 smoke=smoke,
             )
+            run_context["run_id"] = pending_run_id
             _store_json_state("agent_run_context", run_context)
             if run_is_enabled(plan):
                 # Keyed on the plan's subject, not on the device or the smoke
@@ -1151,46 +1444,28 @@ def render_agent_workflow() -> None:
             st.session_state.pop("agent_result_context", None)
             execution_result = None
             result_context = None
-        if st.button(
+        active_run_id = st.session_state.get(ACTIVE_RUN_KEY)
+        if active_run_id:
+            # A run this page started is in flight (or has just ended). The
+            # script is not blocked on it, so Cancel below is a live control.
+            _render_active_run(str(active_run_id), plan=plan, smoke=smoke, device=device)
+        elif st.button(
             RUN_BUTTON_LABEL,
             disabled=not run_is_enabled(plan),
             use_container_width=True,
             key="agent_run",
         ):
-            st.caption("Executing the validated plan (explicit user action).")
-            progress = _LiveProgress(st.empty(), st.empty(), st.empty())
-            result = execute_plan_streaming(
-                plan,
-                on_event=progress.on_event,
-                repo_root=REPO_ROOT,
-                env=get_safe_runtime_env(),
+            # Explicit user action. Everything before this point was planning.
+            run_id = str(st.session_state.get(PENDING_RUN_ID_KEY) or "")
+            _launch_run(
+                run_id=run_id,
+                plan=plan,
+                project=project,
+                run_context=st.session_state.get("agent_run_context") or {},
             )
-            # Provenance for the failure diagnosis only; neither field is read
-            # back by the executor or by build_result_context.
-            result["device"] = str(device)
-            result["smoke"] = bool(smoke)
-            workspace = result.get("workspace")
-            if result.get("success") and workspace:
-                result_context = build_result_context(
-                    workspace,
-                    dataset=plan.get("dataset"),
-                    task=plan.get("task"),
-                    model=plan.get("model"),
-                    config_path=plan.get("config_path"),
-                    run_status="SUCCESS",
-                    execution_result=result,
-                    smoke_run=smoke,
-                )
-            _store_json_state("agent_execution_result", _compact_execution_output(result))
-            _store_json_state("agent_result_context", result_context)
+            # The reservation is spent: a repeat of this plan is a new run.
+            st.session_state.pop(PENDING_RUN_ID_KEY, None)
             st.session_state["agent_run_signature"] = current_signature
-            # A repeat of the identical plan is still a new run worth
-            # reporting, so the feedback signature carries a serial.
-            st.session_state["agent_run_serial"] = (
-                int(st.session_state.get("agent_run_serial", 0)) + 1
-            )
-            st.session_state["last_run_status"] = "success" if result.get("success") else "failed"
-            st.session_state["last_run_code"] = result.get("returncode")
             st.rerun()
 
     serial = st.session_state.get("agent_run_serial", 0)

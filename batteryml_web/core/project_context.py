@@ -149,6 +149,32 @@ def agent_workspace(
     return f"{root}/agent_{safe_dataset}_{safe_model}{suffix}"
 
 
+def run_workspace(
+    project: Dict[str, Any],
+    dataset: Any,
+    model: Any,
+    run_id: str,
+    *,
+    smoke: bool = False,
+) -> str:
+    """The directory one *run* writes to.
+
+    ``<agent workspace>/<run_id>``, i.e. a run-specific level beneath the
+    per-(dataset, model) workspace that :func:`agent_workspace` already
+    defines. Two consequences, both deliberate:
+
+    * repeated runs of the same model no longer overwrite each other, which
+      is what made a result impossible to attribute to an execution;
+    * nothing about artifact discovery changes. ``discover_artifacts`` and
+      ``build_result_context`` walk a workspace recursively, so pointing
+      them at the run directory finds exactly that run's files, and pointing
+      them at an older workspace with no run level still works. Older runs
+      stay readable without a migration.
+    """
+    base = agent_workspace(project, dataset, model, smoke=smoke)
+    return f"{base}/{safe_segment(run_id)}"
+
+
 def display_path(path: Any, *, repo_root: str | Path | None = None) -> str:
     """A path as a reader wants to see it: repo-relative where it can be.
 

@@ -28,6 +28,7 @@ from ..core.project_context import display_path
 #: answer "what".
 FIELD_ORDER: tuple[str, ...] = (
     "project",
+    "run_id",
     "workspace",
     "dataset",
     "task",
@@ -49,6 +50,7 @@ def build_run_context(
     device_label: str = "",
     seed: Any = None,
     smoke: bool = False,
+    run_id: Any = None,
 ) -> Dict[str, Any]:
     """The provenance block for one planned or completed run.
 
@@ -73,6 +75,9 @@ def build_run_context(
     return {
         "project": project.get("name"),
         "project_is_default": bool(project.get("is_default")),
+        # Filled by the caller that owns run identity. None before a run has
+        # been reserved, and rendered as UNKNOWN rather than invented.
+        "run_id": run_id if run_id is None else str(run_id),
         "workspace": workspace,
         "workspace_display": display_path(workspace) if workspace else None,
         "dataset": plan.get("dataset"),
@@ -123,6 +128,7 @@ def context_rows(
         return []
     labels = {
         "project": "Project",
+        "run_id": "Run ID",
         "workspace": "Run directory",
         "dataset": "Dataset",
         "task": "Task",

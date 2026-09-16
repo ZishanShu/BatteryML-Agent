@@ -34,6 +34,10 @@ from batteryml_web.ui.feedback import (
     toast,
 )
 from batteryml_web.ui.llm_state import ensure_llm_state_defaults, get_llm_status, is_llm_configured, refresh_llm_status_from_config, set_llm_settings
+from batteryml_web.core.project_context import resolve_project
+from batteryml_web.core.run_manager import get_run_manager
+from batteryml_web.core.run_manifest import find_run
+from batteryml_web.ui.run_history import render_run_detail, render_run_history
 from batteryml_web.ui.settings_panel import render_llm_settings_form
 from batteryml_web.ui.progress_utils import get_safe_runtime_env, run_command_with_progress
 from batteryml_web.ui.workflow_sidebar import NAV_STEPS, get_current_step_index, render_sidebar_workflow, set_current_step
@@ -1567,8 +1571,36 @@ def render_run_model_page():
     render_bottom_step_navigation()
 
 
+def _render_project_run_history() -> None:
+    """The current project's runs, and the one the user opened."""
+    project = resolve_project(
+        project_root=st.session_state.get("project_root"),
+        project_name=st.session_state.get("project_name")
+        or st.session_state.get("current_project"),
+    )
+    root = project["root"]
+    selected = render_run_history(root, project_name=project["name"])
+    if not selected:
+        return
+    manifest = find_run(
+        root, selected, live_run_ids=get_run_manager().live_run_ids()
+    )
+    if manifest is None:
+        st.caption(f"Run {selected} is no longer on disk.")
+        return
+    with st.expander(f"Run {selected}", expanded=True):
+        # Opening a historical run shows it. It never re-runs it.
+        render_run_detail(manifest)
+
+
 def render_review_results_page():
     st.header("📈 Review Results", anchor=False)
+
+    # Run history first: a project holds many runs, and finding an earlier
+    # one should not mean searching the filesystem by hand. Read from the
+    # run manifests, so it survives a refresh and an app restart.
+    _render_project_run_history()
+
     st.markdown("#### Optional LLM interpretation")
     st.caption(
         "Use the LLM assistant to summarize results or explain metrics. BatteryML metrics are computed by BatteryML and will not be modified."

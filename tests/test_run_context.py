@@ -165,10 +165,24 @@ class TestRunProvenance(unittest.TestCase):
         labels = [label for label, _ in context_rows(self.context)]
         self.assertEqual(
             labels,
-            ["Project", "Run directory", "Dataset", "Task", "Model", "Config",
-             "Seed", "Epochs", "Device"],
+            ["Project", "Run ID", "Run directory", "Dataset", "Task", "Model",
+             "Config", "Seed", "Epochs", "Device"],
         )
-        self.assertEqual(len(FIELD_ORDER), 9)
+        self.assertEqual(len(FIELD_ORDER), 10)
+
+    def test_the_run_id_is_carried_but_never_invented(self) -> None:
+        """A run names itself; a plan that has no run yet says so."""
+        rows = dict(context_rows(self.context))
+        self.assertEqual(rows["Run ID"], UNKNOWN)
+        named = build_run_context(
+            project={"name": "alpha"},
+            plan={"command": ["x", "--workspace", "w"]},
+            run_id="run_20260916_185742_batlinet_matr_seed0_a1b2c3",
+        )
+        self.assertEqual(
+            dict(context_rows(named))["Run ID"],
+            "run_20260916_185742_batlinet_matr_seed0_a1b2c3",
+        )
 
     def test_the_workspace_comes_from_the_command_that_will_execute(self) -> None:
         self.assertEqual(self.context["workspace"], self.workspace)

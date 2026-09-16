@@ -22,6 +22,7 @@ Run from the repository root:
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -38,6 +39,7 @@ from tests.test_readiness import (  # noqa: E402
 from batteryml_web.agent.results import SMOKE_RUN_WARNING  # noqa: E402
 from batteryml_web.agent.run_policy import SMOKE_NOTICE  # noqa: E402
 from batteryml_web.core import device_inventory as di  # noqa: E402
+from batteryml_web.core.run_identity import is_run_id  # noqa: E402
 from batteryml_web.core.project_context import (  # noqa: E402
     agent_workspace,
     resolve_project,
@@ -121,6 +123,41 @@ def _code_without_prose(module) -> str:
     # ast.unparse drops ``#`` comments as a side effect of re-rendering
     # from the tree, which is the other half of what this needs.
     return ast.unparse(tree)
+
+
+class _FakeRunManager:
+    """Records what the page asks of the manager; starts nothing.
+
+    The page no longer calls the streaming executor itself — it hands the
+    validated plan to a RunManager that executes on its own thread. These
+    tests assert the page's half of that contract: which run it started, that
+    it started exactly one, and that it started none for a refused plan.
+    """
+
+    def __init__(self, snapshots=None):
+        self.started: list[dict] = []
+        self.cancelled: list[str] = []
+        self._snapshots = dict(snapshots or {})
+
+    def start(self, *, run_id, run_dir, plan, repo_root, env=None, on_finished=None):
+        self.started.append({"run_id": run_id, "run_dir": str(run_dir), "plan": plan})
+        return None
+
+    def snapshot(self, run_id):
+        return self._snapshots.get(str(run_id))
+
+    def get(self, run_id):
+        return None
+
+    def cancel(self, run_id, **kwargs):
+        self.cancelled.append(str(run_id))
+        return True
+
+    def forget(self, run_id):
+        pass
+
+    def live_run_ids(self):
+        return list(self._snapshots)
 
 
 class _Col:
@@ -216,6 +253,7 @@ class FakeStreamlit:
             "text_inputs": [],
             "text_areas": [],
             "dialogs": [],
+            "fragments": [],
         }
         self.in_expander = False
 
@@ -356,6 +394,21 @@ class FakeStreamlit:
 
     def rerun(self):
         raise _Rerun()
+
+    def fragment(self, func=None, **kwargs):
+        """Stand-in for st.fragment(run_every=...).
+
+        The real decorator re-executes only its own block on a timer. Here it
+        returns the function unchanged, so calling it runs the body once —
+        which is what a render test wants: one deterministic draw, not a
+        timer.
+        """
+        self.rec["fragments"].append(dict(kwargs))
+
+        def decorator(inner):
+            return inner
+
+        return decorator if func is None else func
 
 
 #: Example requests as the backend would build them for this stub catalog.
@@ -698,6 +751,16 @@ class TestRenderBoundaries(unittest.TestCase):
             self._plan_calls.append({"dataset": dataset, "task": task, "model": model, **kwargs})
             return kwargs.get("__plan__") or _ok_plan(model, epochs=kwargs.get("epochs"))
 
+        self.manager = _FakeRunManager()
+        self._real_manager = ui.get_run_manager
+        self._real_write = ui.write_manifest
+        ui.get_run_manager = lambda: self.manager
+        # Nothing in a render test may touch the real runs/ directory.
+        self._manifests: list = []
+        ui.write_manifest = lambda run_dir, manifest: self._manifests.append(
+            (str(run_dir), manifest)
+        )
+
         def stub_execute(plan, **kwargs):
             self._exec_calls.append(plan)
             return {
@@ -741,6 +804,8 @@ class TestRenderBoundaries(unittest.TestCase):
         ui.execute_plan_streaming = self._real_execute
         ui.build_result_context = self._real_result_ctx
         ui.is_llm_configured = self._real_llm
+        ui.get_run_manager = self._real_manager
+        ui.write_manifest = self._real_write
 
     def _session(self, context: dict) -> dict:
         return {
@@ -766,18 +831,33 @@ class TestRenderBoundaries(unittest.TestCase):
         self.assertTrue(run_buttons and run_buttons[0]["disabled"] is False)
 
     def test_run_requires_explicit_button_and_validated_plan(self) -> None:
-        # Button not clicked: nothing executed.
+        """Run hands one job to the manager; nothing else starts anything.
+
+        Execution moved off the script's thread, so what the page is
+        responsible for is starting exactly one run, exactly when the button
+        is pressed, and never for a plan the backend refused.
+        """
+        # Button not clicked: nothing started.
         _render(self._session(_MATR_CONTEXT))
+        self.assertEqual(self.manager.started, [])
         self.assertEqual(self._exec_calls, [])
-        # Button clicked with a can_execute plan: executed exactly once.
+        # Button clicked with a can_execute plan: started exactly once, with
+        # a real run id, and recorded on disk before anything ran.
         _render(self._session(_MATR_CONTEXT), clicked={"Run"})
-        self.assertEqual(len(self._exec_calls), 1)
-        # Blocked plan (can_execute False): Run disabled, executor untouched.
-        self._exec_calls.clear()
-        self._real_build  # noqa: B018 (documented seam)
+        self.assertEqual(len(self.manager.started), 1)
+        self.assertTrue(is_run_id(self.manager.started[0]["run_id"]))
+        self.assertEqual(len(self._manifests), 1)
+        self.assertEqual(
+            self._manifests[0][1]["status"], "PLANNED",
+            "the manifest must exist before execution, not after",
+        )
+        # The page itself never calls the blocking executor any more.
+        self.assertEqual(self._exec_calls, [])
+        # Blocked plan (can_execute False): Run disabled, manager untouched.
+        self.manager.started.clear()
         ui.build_execution_plan = lambda dataset, task, model, **kw: _failed_plan(model)
         fake = _render(self._session(_MATR_CONTEXT), clicked={"Run"})
-        self.assertEqual(self._exec_calls, [])
+        self.assertEqual(self.manager.started, [])
         run_buttons = [b for b in fake.rec["buttons"] if b["label"] == ui.RUN_BUTTON_LABEL]
         self.assertTrue(run_buttons and run_buttons[0]["disabled"] is True)
 
@@ -1071,137 +1151,162 @@ class TestLiveProgressRendering(unittest.TestCase):
             )
         self.assertEqual(len(fake.rec["infos"]), drawn)
 
-    def test_progress_is_drawn_while_the_run_is_still_going(self) -> None:
-        """R8: the page consumes callbacks during the run, not a final status.
+    def test_the_page_never_blocks_on_the_executor(self) -> None:
+        """The structural guarantee behind a working Cancel button.
 
-        The stub records what the page had drawn at the moment each event was
-        delivered. If the UI were blocking until the subprocess exited, every
-        event would arrive with nothing drawn and the result already stored.
+        Progress used to be proof that the page consumed events during the
+        run. It is now stronger than that: the page does not call the
+        blocking executor at all. It hands the plan to the RunManager, which
+        owns the thread, and returns — which is the only reason a Cancel
+        button drawn afterwards can ever receive a click.
         """
-        drawn_at_event: list[int] = []
-        result_stored_at_event: list[bool] = []
+        import ast
 
-        def stub_stream(plan, on_event=None, **kwargs):
-            for event in (
-                {"type": "stage", "stage": "Loading data", "current": None,
-                 "total": None, "fraction": None, "message": "Seed is set to 0."},
-                {"type": "training_progress", "stage": "Training", "current": 1,
-                 "total": 4, "fraction": 0.25, "message": "Training X:  25%|#| 1/4"},
-                {"type": "training_progress", "stage": "Training", "current": 4,
-                 "total": 4, "fraction": 1.0, "message": "Training X: 100%|#| 4/4"},
-            ):
-                if on_event is not None:
-                    on_event(event)
-                drawn_at_event.append(len(fake_holder[0].rec["infos"]))
-                result_stored_at_event.append(
-                    "agent_result_context" in fake_holder[0].session_state
-                )
-            return {
-                "started": True, "completed": True, "success": True, "returncode": 0,
-                "command": plan["command"], "workspace": "runs/w",
-                "stdout": "", "stderr": "", "error": None,
-                "artifacts": {}, "dry_run": False,
-                "final_stage": "Complete", "elapsed_s": 1.0,
-            }
-
-        real_stream = ui.execute_plan_streaming
-        real_build = ui.build_execution_plan
-        real_ctx = ui.build_result_context
-        real_llm = ui.is_llm_configured
-        ui.execute_plan_streaming = stub_stream
-        ui.build_execution_plan = lambda d, t_, m, **kw: _ok_plan(m, epochs=kw.get("epochs"))
-        ui.build_result_context = lambda ws, **kw: {
-            "workspace": ws, "success": True, "metrics": {}, "warnings": []
+        source = Path(ui.__file__).read_text(encoding="utf-8")
+        called = {
+            node.func.id
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
         }
-        ui.is_llm_configured = lambda: False
-        fake_holder: list = []
+        self.assertNotIn("execute_plan_streaming", called)
+        self.assertIn("get_run_manager", called)
+
+    def test_live_progress_is_drawn_from_the_managers_real_state(self) -> None:
+        """What is drawn is what the run reported — nothing is invented."""
+        snapshot = {
+            "run_id": "run_1",
+            "status": "RUNNING",
+            "finished": False,
+            "elapsed_s": 65.0,
+            "event": {
+                "type": "training_progress",
+                "stage": "Training",
+                "current": 3,
+                "total": 10,
+                "fraction": 0.3,
+                "message": "Training X:  30%|###| 3/10",
+            },
+            "tail": ["Training X:  30%|###| 3/10"],
+        }
+        manager = _FakeRunManager({"run_1": snapshot})
+        real_manager = ui.get_run_manager
+        ui.get_run_manager = lambda: manager
         try:
-            session = {
-                "agent_workflow_context": _MATR_CONTEXT,
-                "gpu_inventory": _FAKE_GPU_INVENTORY,
-            }
-            fake = FakeStreamlit(session, {"Run"})
-            fake_holder.append(fake)
+            fake = FakeStreamlit({})
+            with _fake_streamlit(fake):
+                ui._render_active_run("run_1", plan={}, smoke=False, device="cpu")
+        finally:
+            ui.get_run_manager = real_manager
+
+        captions = " ".join(fake.rec["captions"])
+        self.assertIn("Training", captions)
+        self.assertIn("3 / 10", captions)
+        self.assertIn("01:05", captions)
+        # The bar is drawn only because the run reported a fraction.
+        self.assertEqual(fake.rec["progress"], [0.3])
+        # The refresh is a timed fragment, not a rerun loop.
+        self.assertTrue(fake.rec["fragments"])
+        self.assertEqual(
+            fake.rec["fragments"][0]["run_every"], ui.PROGRESS_POLL_SECONDS
+        )
+
+    def test_a_running_run_offers_a_cancel_button_that_reaches_the_manager(self) -> None:
+        snapshot = {
+            "run_id": "run_1", "status": "RUNNING", "finished": False,
+            "elapsed_s": 5.0, "event": {"stage": "Training"}, "tail": [],
+        }
+        manager = _FakeRunManager({"run_1": snapshot})
+        real_manager = ui.get_run_manager
+        ui.get_run_manager = lambda: manager
+        try:
+            fake = FakeStreamlit({}, {ui.CANCEL_BUTTON_LABEL})
             with _fake_streamlit(fake):
                 try:
-                    ui.render_agent_workflow()
+                    ui._render_active_run("run_1", plan={}, smoke=False, device="cpu")
                 except _Rerun:
                     pass
         finally:
-            ui.execute_plan_streaming = real_stream
-            ui.build_execution_plan = real_build
-            ui.build_result_context = real_ctx
-            ui.is_llm_configured = real_llm
+            ui.get_run_manager = real_manager
+        self.assertEqual(manager.cancelled, ["run_1"])
 
-        self.assertEqual(len(drawn_at_event), 3, "the page did not consume the events")
-        # Something was drawn by the time the first event had been handled...
-        self.assertGreater(drawn_at_event[0], 0)
-        # ...and the drawing grew as later events arrived, which cannot happen
-        # if the page waits for the process to exit before rendering.
-        self.assertGreater(drawn_at_event[-1], 0)
-        # The result context did not exist yet while progress was being drawn.
-        self.assertEqual(result_stored_at_event, [False, False, False])
-
-    def test_run_click_streams_and_stores_no_fabricated_metrics(self) -> None:
-        emitted: list[dict] = []
-
-        def stub_stream(plan, on_event=None, **kwargs):
-            for event in (
-                {"type": "stage", "stage": "Loading data", "current": None,
-                 "total": None, "fraction": None, "message": "Seed is set to 0."},
-                {"type": "training_progress", "stage": "Training", "current": 1,
-                 "total": 1, "fraction": 1.0, "message": "Training BatLiNet: 100%|##| 1/1"},
-                {"type": "completed", "stage": "Complete", "current": None,
-                 "total": None, "fraction": 1.0, "message": "Finished in 6.8s."},
-            ):
-                emitted.append(event)
-                if on_event is not None:
-                    on_event(event)
-            return {
-                "started": True, "completed": True, "success": True, "returncode": 0,
-                "command": plan["command"], "workspace": "runs/agent_matr_batlinet_smoke",
-                "stdout": "{'RMSE': 794.32}", "stderr": "", "error": None,
-                "artifacts": {"prediction_files": []}, "dry_run": False,
-                "final_stage": "Complete", "elapsed_s": 6.8,
-            }
-
-        real_stream = ui.execute_plan_streaming
-        real_build = ui.build_execution_plan
+    def test_no_metric_is_ever_read_out_of_the_runs_output(self) -> None:
+        """stdout may contain something that looks like a metric. It is not one."""
+        captured: list = []
         real_ctx = ui.build_result_context
-        real_llm = ui.is_llm_configured
-        seen: list[dict] = []
+        real_manager = ui.get_run_manager
 
-        def stub_ctx(workspace, **kwargs):
-            seen.append(kwargs)
-            return {"workspace": workspace, "success": True, "metrics": {}, "warnings": []}
-
-        ui.execute_plan_streaming = stub_stream
-        ui.build_execution_plan = lambda d, t_, m, **kw: _ok_plan(m, epochs=kw.get("epochs"))
-        ui.build_result_context = stub_ctx
-        ui.is_llm_configured = lambda: False
-        try:
-            session = {
-                "agent_workflow_context": _MATR_CONTEXT,
-                "agent_original_request": "Use BatLiNet on MATR to predict battery lifetime.",
-                "gpu_inventory": _FAKE_GPU_INVENTORY,
+        class _Handle:
+            run_dir = Path("/tmp/does-not-matter")
+            result = {
+                "success": True,
+                "workspace": "runs/web_projects/alpha/agent_matr_batlinet/run_1",
+                "returncode": 0,
+                # A number in the output that must never become a metric.
+                "stdout": "{'RMSE': 794.32}",
+                "stderr": "",
+                "command": [],
             }
-            fake = _render(session, clicked={"Run"}, checkboxes={ui.SMOKE_CHECKBOX_LABEL: True})
-        finally:
-            ui.execute_plan_streaming = real_stream
-            ui.build_execution_plan = real_build
-            ui.build_result_context = real_ctx
-            ui.is_llm_configured = real_llm
 
-        self.assertEqual(len(emitted), 3)
-        # Every fraction drawn came from an event that carried one; the UI
-        # never manufactures a position of its own.
-        carried = {e["fraction"] for e in emitted if e.get("fraction") is not None}
-        self.assertTrue(fake.rec["progress"])
-        self.assertTrue(set(fake.rec["progress"]) <= carried)
-        # Metrics come from build_result_context, never from the streamed stdout.
-        self.assertTrue(seen)
-        self.assertEqual(seen[0]["run_status"], "SUCCESS")
-        self.assertFalse(any("794.32" in text for text in fake.rec["infos"]))
+        class _Manager(_FakeRunManager):
+            def get(self, run_id):
+                return _Handle()
+
+        manager = _Manager()
+        ui.get_run_manager = lambda: manager
+        ui.build_result_context = lambda ws, **kw: (
+            captured.append(ws) or {"workspace": ws, "success": True,
+                                    "metrics": {}, "warnings": []}
+        )
+        try:
+            session = {"agent_execution_plan": _ok_plan("batlinet")}
+            fake = FakeStreamlit(session)
+            with _fake_streamlit(fake):
+                ui._finish_active_run(
+                    "run_1", {"status": "COMPLETED"}, smoke=False
+                )
+        finally:
+            ui.build_result_context = real_ctx
+            ui.get_run_manager = real_manager
+
+        # Metrics came from the canonical backend reader, given the run's own
+        # workspace — never parsed from the text above.
+        self.assertEqual(captured, ["runs/web_projects/alpha/agent_matr_batlinet/run_1"])
+        self.assertEqual(session["agent_result_context"]["metrics"], {})
+        self.assertNotIn("794.32", json.dumps(session["agent_result_context"]))
+
+    def test_a_cancelled_run_never_produces_a_result_context(self) -> None:
+        """A killed run has measured nothing, so it offers no metrics."""
+        real_ctx = ui.build_result_context
+        real_manager = ui.get_run_manager
+        built: list = []
+
+        class _Handle:
+            run_dir = Path("/tmp/does-not-matter")
+            result = {"success": False, "workspace": "w", "returncode": -15,
+                      "stdout": "partial", "stderr": "", "command": []}
+
+        class _Manager(_FakeRunManager):
+            def get(self, run_id):
+                return _Handle()
+
+        ui.get_run_manager = lambda: _Manager()
+        ui.build_result_context = lambda ws, **kw: built.append(ws) or {}
+        try:
+            session = {"agent_execution_plan": _ok_plan("batlinet")}
+            fake = FakeStreamlit(session)
+            with _fake_streamlit(fake):
+                ui._finish_active_run(
+                    "run_1", {"status": "CANCELLED"}, smoke=False
+                )
+        finally:
+            ui.build_result_context = real_ctx
+            ui.get_run_manager = real_manager
+
+        self.assertEqual(built, [], "no result context for a cancelled run")
+        # The key is removed rather than set to None: there is no result to
+        # show, so nothing stale can be rendered from it either.
+        self.assertNotIn("agent_result_context", session)
+        self.assertEqual(session["last_run_status"], "cancelled")
 
 
 class TestHandoverFromHome(unittest.TestCase):
@@ -2103,10 +2208,17 @@ class TestProjectDeterminesTheWorkspaceInTheUi(unittest.TestCase):
         return session
 
     def test_the_loaded_project_owns_the_workspace(self) -> None:
+        """Still the project's directory — now with a run of its own inside.
+
+        The plan points at ``<project>/agent_<dataset>_<model>/<run_id>``, so
+        two runs of the same model cannot overwrite each other, and the plan
+        the user reviews is the plan that executes.
+        """
         self._render_for("runs/web_projects/alpha")
-        self.assertEqual(
-            self.plans[-1]["workspace"], "runs/web_projects/alpha/agent_matr_batlinet"
-        )
+        workspace = self.plans[-1]["workspace"]
+        base = "runs/web_projects/alpha/agent_matr_batlinet"
+        self.assertTrue(workspace.startswith(base + "/"), workspace)
+        self.assertTrue(is_run_id(workspace.rsplit("/", 1)[-1]), workspace)
 
     def test_switching_project_switches_the_workspace(self) -> None:
         self._render_for("runs/web_projects/alpha")
@@ -2153,9 +2265,15 @@ class TestProjectDeterminesTheWorkspaceInTheUi(unittest.TestCase):
         self.assertEqual(fields["Project"], "alpha")
         # The readable label, not the argv value the plan table already shows.
         self.assertEqual(fields["Device"], "CPU")
-        self.assertEqual(
-            fields["Run directory"], "runs/web_projects/alpha/agent_matr_batlinet"
+        self.assertTrue(
+            fields["Run directory"].startswith(
+                "runs/web_projects/alpha/agent_matr_batlinet/"
+            ),
+            fields["Run directory"],
         )
+        # The run this page is about to create is named before it starts.
+        self.assertTrue(is_run_id(fields["Run ID"]), fields["Run ID"])
+        self.assertTrue(fields["Run directory"].endswith(fields["Run ID"]))
 
 
 class TestExplainOpensConfigurationInsteadOfDeadEnding(unittest.TestCase):
