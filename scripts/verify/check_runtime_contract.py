@@ -11,9 +11,10 @@ the web layer relies on at run time still behave as specified:
 * BatLiNet's smoke run recommends CPU, and the required smoke sentence is
   the one the UI shows;
 * a device string is a single torch device — a multi-GPU form such as
-  ``"cuda:0,1"`` is refused at the planner boundary, and no DataParallel,
-  DDP or torchrun path is exposed anywhere in the web layer
-  (``docs/GPU_MULTI_GPU_AUDIT.md`` says why);
+  ``"cuda:0,1"`` is refused at the planner boundary, a multi-GPU *selection*
+  produces no device string at all, no model is registered as multi-GPU
+  capable, and no DataParallel, DDP or torchrun path is exposed anywhere in
+  the web layer (``docs/GPU_MULTI_GPU_AUDIT.md`` says why);
 * a CUDA out-of-memory failure is recognised, is never retried, and no
   metric is ever produced from a failed run;
 * the streaming executor stays Streamlit-independent, recognises the real
@@ -48,8 +49,8 @@ REQUIRED_SMOKE_NOTICE = (
 
 #: A synthetic nvidia-smi sample. Never a claim about this machine.
 _SAMPLE_CSV = (
-    "0, NVIDIA GeForce RTX 3090, 24576, 22500, 2076\n"
-    "1, NVIDIA GeForce RTX 3090, 24576, 14000, 10576\n"
+    "0, NVIDIA GeForce RTX 3090, 24576, 22500, 2076, 97\n"
+    "1, NVIDIA GeForce RTX 3090, 24576, 14000, 10576, 12\n"
 )
 
 _SAMPLE_OOM_STDERR = (
@@ -108,7 +109,7 @@ def _device_inventory_problems(module: Any) -> list[str]:
 
     # The count must follow the output, for any count.
     for count in (0, 1, 3, 8):
-        sample = "".join(f"{i}, RTX 3090, 24576, 100, 24476\n" for i in range(count))
+        sample = "".join(f"{i}, RTX 3090, 24576, 100, 24476, 0\n" for i in range(count))
         if len(module.parse_nvidia_smi_gpu_csv(sample)) != count:
             problems.append(
                 f"parse_nvidia_smi_gpu_csv did not report {count} device(s) for a "
@@ -164,6 +165,26 @@ def _device_validation_problems(device_module: Any, execution: Any) -> list[str]
             "string would reach the CLI and fail inside a started run."
         )
 
+    # A selection is structured, and a multi-GPU one yields no device string.
+    for ids, expected in (([], "cpu"), ([0], "cuda:0"), ([3], "cuda:3")):
+        selection = device_module.build_device_selection(ids)
+        actual = device_module.device_string_for_selection(selection)
+        if actual != expected:
+            problems.append(
+                f"a selection of {ids or 'no GPU'} produced device {actual!r}, "
+                f"expected {expected!r}."
+            )
+    for ids in ([0, 1], [0, 1, 2], list(range(8))):
+        selection = device_module.build_device_selection(ids)
+        if selection.get("mode") != device_module.MODE_MULTI_GPU:
+            problems.append(f"a selection of {ids} was not reported as multi-GPU.")
+        if device_module.device_string_for_selection(selection) is not None:
+            problems.append(
+                f"a multi-GPU selection of {ids} produced a device string; there is "
+                "no single torch device for it and inventing one would advertise a "
+                "capability the platform does not have."
+            )
+
     web_root = repo_root() / "batteryml_web"
     for path in sorted(web_root.rglob("*.py")):
         text = path.read_text(encoding="utf-8", errors="ignore")
@@ -175,6 +196,45 @@ def _device_validation_problems(device_module: Any, execution: Any) -> list[str]
                     "layer must not expose a multi-GPU run (see "
                     "docs/GPU_MULTI_GPU_AUDIT.md)."
                 )
+    return problems
+
+
+def _multi_gpu_gate_problems(policy: Any, device_module: Any) -> list[str]:
+    """No model claims multi-GPU, and a multi-GPU choice blocks Run."""
+    problems: list[str] = []
+    if policy.MULTI_GPU_CAPABLE_MODELS:
+        problems.append(
+            "a model is registered as multi-GPU capable "
+            f"({sorted(policy.MULTI_GPU_CAPABLE_MODELS)}), but no DDP or DataParallel "
+            "path exists. Registering one is a claim that it works; see "
+            "docs/GPU_MULTI_GPU_AUDIT.md."
+        )
+    for ids in ([], [0], [5]):
+        blockers = policy.execution_blockers(
+            "any_model", device_module.build_device_selection(ids)
+        )
+        if blockers:
+            problems.append(
+                f"a selection of {ids or 'no GPU'} was blocked: {blockers}. Single-GPU "
+                "and CPU behaviour must be unchanged."
+            )
+    selection = device_module.build_device_selection([0, 1])
+    blockers = policy.execution_blockers("any_model", selection)
+    if not blockers:
+        problems.append(
+            "a multi-GPU selection was not blocked, so Run would be offered for a "
+            "combination the runtime cannot execute."
+        )
+    elif not blockers[0].startswith(policy.MULTI_GPU_UNSUPPORTED_MESSAGE):
+        problems.append(
+            "the multi-GPU blocker no longer opens with the message the UI shows: "
+            f"{blockers[0]!r}."
+        )
+    if selection != {"mode": device_module.MODE_MULTI_GPU, "gpu_ids": [0, 1]}:
+        problems.append(
+            "the capability gate rewrote the selection; it must report, never "
+            "quietly reduce a multi-GPU choice to one GPU."
+        )
     return problems
 
 
@@ -367,6 +427,7 @@ def check(output_dir: Path | None = None) -> CheckResult:
     problems: list[str] = []
     problems.extend(_device_inventory_problems(device_module))
     problems.extend(_device_validation_problems(device_module, execution_module))
+    problems.extend(_multi_gpu_gate_problems(policy_module, device_module))
     problems.extend(_smoke_policy_problems(policy_module, execution_module))
     problems.extend(_failure_problems(policy_module, executor_module))
     problems.extend(_streaming_problems(streaming_module))
@@ -415,9 +476,10 @@ def check(output_dir: Path | None = None) -> CheckResult:
         PASS,
         "Device enumeration is argv-based and count-agnostic; a smoke run is "
         "--epochs 1 on the formal config with no config written; BatLiNet smoke "
-        "recommends CPU; a device is a single torch device and no multi-GPU path "
-        "is exposed; CUDA OOM is recognised, never retried and yields no metric; "
-        f"streaming progress is parsed, never fabricated. {gpu_note}.",
+        "recommends CPU; a device selection is structured and a multi-GPU one "
+        "produces no device string and blocks Run; CUDA OOM is recognised, never "
+        "retried and yields no metric; streaming progress is parsed, never "
+        f"fabricated. {gpu_note}.",
         evidence,
         artifacts,
     )

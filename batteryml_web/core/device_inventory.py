@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import re
 import subprocess
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 #: The query passed to ``nvidia-smi``. Field order is load-bearing:
 #: :func:`parse_nvidia_smi_gpu_csv` reads the columns positionally.
@@ -39,6 +39,7 @@ NVIDIA_SMI_QUERY_FIELDS: tuple[str, ...] = (
     "memory.total",
     "memory.used",
     "memory.free",
+    "utilization.gpu",
 )
 
 NVIDIA_SMI_ARGV: tuple[str, ...] = (
@@ -67,7 +68,8 @@ def parse_nvidia_smi_gpu_csv(text: str) -> List[Dict[str, Any]]:
     Returns:
         One dict per GPU with ``index`` (int), ``name`` (str),
         ``memory_total_mib`` / ``memory_used_mib`` / ``memory_free_mib``
-        (int or None) and ``device`` (``"cuda:<index>"``).
+        (int or None), ``utilization_pct`` (int or None) and ``device``
+        (``"cuda:<index>"``).
 
     Raises:
         ValueError: a non-empty row does not have the expected number of
@@ -92,7 +94,7 @@ def parse_nvidia_smi_gpu_csv(text: str) -> List[Dict[str, Any]]:
                 f"--query-gpu={','.join(NVIDIA_SMI_QUERY_FIELDS)} --format=csv,noheader,nounits` "
                 "and report the output if the driver's format has changed."
             )
-        index_text, name, total_text, used_text, free_text = parts
+        index_text, name, total_text, used_text, free_text, util_text = parts
         try:
             index = int(index_text)
         except ValueError as exc:
@@ -107,6 +109,7 @@ def parse_nvidia_smi_gpu_csv(text: str) -> List[Dict[str, Any]]:
                 "memory_total_mib": _optional_int(total_text),
                 "memory_used_mib": _optional_int(used_text),
                 "memory_free_mib": _optional_int(free_text),
+                "utilization_pct": _optional_int(util_text),
                 "device": f"cuda:{index}",
             }
         )
@@ -287,6 +290,7 @@ def inventory_rows(inventory: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "Free (MiB)": _display_mib(entry.get("memory_free_mib")),
                 "Used (MiB)": _display_mib(entry.get("memory_used_mib")),
                 "Total (MiB)": _display_mib(entry.get("memory_total_mib")),
+                "Utilization (%)": _display_mib(entry.get("utilization_pct")),
             }
         )
     return rows
@@ -334,3 +338,106 @@ def validate_device(device: str) -> str:
             "'cuda', 'cuda:<index>' or 'mps'."
         )
     return name
+
+
+# ---------------------------------------------------------------------------
+# Structured device selection
+# ---------------------------------------------------------------------------
+#
+# A selection is a structure, not a string, because "which devices did the
+# user pick" and "what does BatteryML get on the command line" are different
+# questions with different answers. Keeping them apart is what makes it
+# impossible to answer the second one with "cuda:0,1" — a string torch does
+# not accept and that would advertise a capability the platform does not have
+# (see docs/GPU_MULTI_GPU_AUDIT.md).
+
+MODE_CPU = "cpu"
+MODE_SINGLE_GPU = "single_gpu"
+MODE_MULTI_GPU = "multi_gpu"
+
+
+def build_device_selection(gpu_ids: Optional[Sequence[int]]) -> Dict[str, Any]:
+    """The structured selection for a set of chosen GPU indices.
+
+    Args:
+        gpu_ids: the GPU indices the user selected. Empty or None means CPU.
+
+    Returns ``{"mode", "gpu_ids"}`` with ``mode`` one of ``cpu``,
+    ``single_gpu`` or ``multi_gpu``. Indices are de-duplicated and sorted, so
+    the same choice always produces the same selection.
+
+    Raises:
+        ValueError: an index is not a non-negative integer. A silently
+            dropped index would run on a different GPU than the one asked
+            for.
+    """
+    if not gpu_ids:
+        return {"mode": MODE_CPU, "gpu_ids": []}
+    cleaned: List[int] = []
+    for value in gpu_ids:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"GPU index {value!r} is not an integer; a selection must name "
+                "device indices such as 0 or 3."
+            )
+        if value < 0:
+            raise ValueError(f"GPU index {value!r} is negative.")
+        if value not in cleaned:
+            cleaned.append(value)
+    cleaned.sort()
+    mode = MODE_SINGLE_GPU if len(cleaned) == 1 else MODE_MULTI_GPU
+    return {"mode": mode, "gpu_ids": cleaned}
+
+
+def selection_from_devices(device_names: Optional[Sequence[str]]) -> Dict[str, Any]:
+    """Build a selection from ``cuda:<index>`` strings (what a widget returns)."""
+    indices: List[int] = []
+    for name in device_names or []:
+        text = str(name).strip()
+        if not text or text == CPU_DEVICE:
+            continue
+        if not text.startswith("cuda:"):
+            raise ValueError(
+                f"{text!r} is not a CUDA device name; expected 'cuda:<index>'."
+            )
+        suffix = text.split(":", 1)[1]
+        if not suffix.isdigit():
+            raise ValueError(f"{text!r} does not carry an integer device index.")
+        indices.append(int(suffix))
+    return build_device_selection(indices)
+
+
+def device_string_for_selection(selection: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The ``--device`` value for a selection, or None when there is none.
+
+    ``cpu`` and a single GPU produce a device string. A multi-GPU selection
+    produces **None**: there is no single torch device for it, and inventing
+    one (``"cuda:0,1"``) would be a string that fails inside a started run.
+    The caller must gate execution on the capability instead.
+    """
+    if not isinstance(selection, dict):
+        return CPU_DEVICE
+    mode = str(selection.get("mode") or MODE_CPU)
+    if mode == MODE_CPU:
+        return CPU_DEVICE
+    if mode == MODE_SINGLE_GPU:
+        ids = list(selection.get("gpu_ids") or [])
+        if len(ids) != 1:
+            raise ValueError(
+                f"selection claims {MODE_SINGLE_GPU} but names {len(ids)} device(s)."
+            )
+        return f"cuda:{int(ids[0])}"
+    return None
+
+
+def describe_selection(selection: Optional[Dict[str, Any]]) -> str:
+    """A short human description of a selection, for a caption."""
+    if not isinstance(selection, dict):
+        return "CPU"
+    mode = str(selection.get("mode") or MODE_CPU)
+    ids = [str(value) for value in selection.get("gpu_ids") or []]
+    if mode == MODE_CPU:
+        return "CPU"
+    if mode == MODE_SINGLE_GPU:
+        return f"GPU {ids[0]}"
+    return f"GPUs {', '.join(ids)}"

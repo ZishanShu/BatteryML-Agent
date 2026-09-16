@@ -191,6 +191,14 @@ to 16 GB. The audit behind this group is `docs/GPU_MULTI_GPU_AUDIT.md`.
 | `GPU-02` | A run is sent to exactly one torch device. `cpu`, `cuda`, `cuda:<index>` and `mps` are accepted; a multi-device string such as `cuda:0,1` is refused at the planner boundary with the reason, rather than failing inside a run that has already started. | `IMPLEMENTED-STATIC` | `batteryml_web/core/device_inventory.py` (`validate_device`), `batteryml_web/agent/execution.py` |
 | `GPU-03` | No multi-GPU Run option is exposed while none exists. The web layer contains no `DataParallel`, `DistributedDataParallel`, `init_process_group` or `torchrun` path, and the DEV-01 check fails if one appears. | `IMPLEMENTED-STATIC` | `scripts/verify/check_runtime_contract.py`, `tests/test_agent_smoke.py` |
 | `GPU-04` | The reason multi-GPU is absent is written down, with the code it follows from and the work a real implementation would take: `DataBundle.to(device)` places the whole dataset on one device, so neither DataParallel nor DDP relieves the per-GPU memory limit; BatLiNet's inter-cell support sampling has no defined distributed semantics; DDP changes effective batch size and determinism. | `IMPLEMENTED-STATIC` | `docs/GPU_MULTI_GPU_AUDIT.md` |
+| `GPU-05` | Device selection is a structure — `{"mode": "cpu" \| "single_gpu" \| "multi_gpu", "gpu_ids": [...]}` — separate from the `--device` string BatteryML receives. CPU and one GPU produce a device string; a multi-GPU selection produces none, so `"cuda:0,1"` cannot be constructed. | `IMPLEMENTED-STATIC` | `batteryml_web/core/device_inventory.py` (`build_device_selection`, `device_string_for_selection`) |
+| `GPU-06` | The page offers CPU, one GPU or several through a multiselect (no GPU ticked = CPU), and shows each device's index, name, total/used/free memory and utilization. Single-GPU and CPU behaviour is unchanged. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/agent_workflow.py`, `batteryml_web/core/device_inventory.py` |
+| `GPU-07` | Whether a multi-GPU selection may execute is a backend capability (`supports_multi_gpu`, `multi_gpu_strategy`), and no model carries it today. A multi-GPU selection for a model without it disables Run with "This model/runtime does not yet support multi-GPU execution." — and the selection is never quietly reduced to a single GPU. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/run_policy.py` (`multi_gpu_capability`, `execution_blockers`) |
+
+`GPU-05`…`GPU-07` prepare for a real multi-GPU implementation without
+claiming one: the selection shape and the capability gate are what a DDP
+milestone would fill in, and `DEV-01` fails if a model is registered as
+capable while no DDP path exists.
 
 `GPU-04` is a documentation requirement on purpose: the decision *not* to
 build something is the part of an audit that gets lost, and the next person

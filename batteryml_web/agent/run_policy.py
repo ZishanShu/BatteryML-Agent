@@ -342,3 +342,85 @@ def _no_failure() -> Dict[str, Any]:
         "evidence_line": None,
         "retried": False,
     }
+
+
+# ---------------------------------------------------------------------------
+# Multi-GPU capability
+# ---------------------------------------------------------------------------
+#
+# Whether a model can be run across several GPUs is a property of the model
+# and the runtime, not of the page. The audit in
+# docs/GPU_MULTI_GPU_AUDIT.md concluded that no model can today: BatteryML
+# sends one torch device end to end, DataBundle.to(device) places the whole
+# dataset on it, and no DataParallel / DDP / torchrun path exists anywhere in
+# the repository.
+#
+# The set below is therefore empty, and deliberately so. It is the single
+# place a future DDP implementation registers a model, and it names no model
+# now — an entry here would be a claim that something works.
+
+MULTI_GPU_CAPABLE_MODELS: frozenset[str] = frozenset()
+
+#: Strategy per capable model (e.g. "ddp"). Keys must appear in
+#: :data:`MULTI_GPU_CAPABLE_MODELS`; empty for the same reason.
+MULTI_GPU_STRATEGIES: Dict[str, str] = {}
+
+#: Shown when a multi-GPU selection is made for a model that cannot use one.
+#: Exact wording, because it is what the user reads instead of a Run button.
+MULTI_GPU_UNSUPPORTED_MESSAGE = (
+    "This model/runtime does not yet support multi-GPU execution."
+)
+
+
+def multi_gpu_capability(model_key: str) -> Dict[str, Any]:
+    """Whether ``model_key`` may be executed across several GPUs.
+
+    Returns ``{"model", "supports_multi_gpu", "multi_gpu_strategy",
+    "reason"}``. ``supports_multi_gpu`` is False for every model today; the
+    reason names the audit rather than asserting something about this
+    particular model, because the blocker is the runtime, not the model.
+
+    The UI uses this to disable Run, never to rewrite the selection: a
+    multi-GPU choice is never quietly downgraded to one GPU.
+    """
+    key = str(model_key or "").strip()
+    supported = key in MULTI_GPU_CAPABLE_MODELS
+    return {
+        "model": key,
+        "supports_multi_gpu": supported,
+        "multi_gpu_strategy": MULTI_GPU_STRATEGIES.get(key) if supported else None,
+        "reason": (
+            ""
+            if supported
+            else (
+                MULTI_GPU_UNSUPPORTED_MESSAGE
+                + " BatteryML sends a single torch device through the whole run "
+                "and the dataset is placed on it in one piece, so no model is "
+                "registered as multi-GPU capable yet. See "
+                "docs/GPU_MULTI_GPU_AUDIT.md."
+            )
+        ),
+    }
+
+
+def execution_blockers(
+    model_key: str,
+    selection: Optional[Dict[str, Any]],
+) -> List[str]:
+    """Reasons this (model, device selection) pair must not run.
+
+    Empty means the pair is executable as far as devices are concerned; the
+    validator and readiness still have the final say. A multi-GPU selection
+    for a model without the capability is the only blocker today, and it
+    disables Run rather than changing the selection.
+    """
+    from ..core.device_inventory import MODE_MULTI_GPU
+
+    if not isinstance(selection, dict):
+        return []
+    if str(selection.get("mode")) != MODE_MULTI_GPU:
+        return []
+    capability = multi_gpu_capability(model_key)
+    if capability["supports_multi_gpu"]:
+        return []
+    return [capability["reason"]]

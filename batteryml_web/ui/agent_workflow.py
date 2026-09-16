@@ -52,10 +52,13 @@ from ..agent.recommendation import (
 from ..agent.result_agent import explain_run_result
 from ..agent.results import METRIC_KEYS, SMOKE_RUN_WARNING, build_result_context
 from ..agent.run_policy import (
+    MULTI_GPU_UNSUPPORTED_MESSAGE,
     SMOKE_EPOCHS,
     SMOKE_NOTICE,
     classify_execution_failure,
+    execution_blockers,
     gpu_memory_advisory,
+    multi_gpu_capability,
     smoke_device_recommendation,
     smoke_epochs_for,
 )
@@ -66,10 +69,14 @@ from ..agent.streaming import (
 )
 from ..agent.workflow import guide_workflow
 from ..core.device_inventory import (
+    build_device_selection,
+    describe_selection,
     device_choices_with_manual_gpu,
     device_label,
+    device_string_for_selection,
     inventory_rows,
     query_gpu_inventory,
+    selection_from_devices,
 )
 from .feedback import (
     EVENT_EXPLANATION_READY,
@@ -155,20 +162,32 @@ def device_options(inventory: dict[str, Any] | None) -> list[str]:
     return device_choices_with_manual_gpu(inventory)
 
 
-def default_device_index(
-    options: list[str], model_key: str, smoke: bool
-) -> tuple[int, str]:
-    """Index of the recommended default device, plus the reason to show.
+def gpu_device_options(inventory: dict[str, Any] | None) -> list[str]:
+    """The GPUs a user may tick. CPU is the empty selection, not an entry."""
+    return [name for name in device_options(inventory) if name != "cpu"]
 
-    The recommendation is advice only: the returned index is the *initial*
-    selection of an editable control, and any listed device may be chosen.
+
+def default_gpu_selection(model_key: str, smoke: bool) -> list[str]:
+    """The GPUs the control opens with: none, i.e. CPU.
+
+    CPU is the platform default, and for a smoke run of a model whose smoke
+    policy recommends CPU it is also the recommendation. Returning an empty
+    list means "run on CPU" — the user adds GPUs deliberately.
     """
+    return []
+
+
+def smoke_device_note(model_key: str, smoke: bool) -> str:
+    """The backend's reason for recommending a CPU smoke run, or ''."""
     advice = smoke_device_recommendation(
-        model_key, smoke=smoke, available_devices=options
+        model_key, smoke=smoke, available_devices=["cpu"]
     )
-    device = str(advice.get("device") or "")
-    index = options.index(device) if device in options else 0
-    return index, str(advice.get("reason") or "")
+    return str(advice.get("reason") or "")
+
+
+def selection_blockers(model_key: str, selection: dict[str, Any]) -> list[str]:
+    """Reasons the Run button must stay disabled for this device selection."""
+    return execution_blockers(model_key, selection)
 
 
 def raw_only_notice(context: dict[str, Any]) -> str | None:
@@ -870,53 +889,80 @@ def render_agent_workflow() -> None:
         # the models whose smoke run must not compete for GPU memory.
         smoke = st.checkbox(SMOKE_CHECKBOX_LABEL, key="agent_smoke_mode")
 
-        st.markdown("**Device**")
+        st.markdown("**Compute**")
         _render_gpu_inventory(inventory)
-        default_index, device_reason = default_device_index(
-            devices, str(selected_key), smoke
-        )
+        device_reason = smoke_device_note(str(selected_key), smoke)
         if device_reason:
             st.info(device_reason)
         # The widget key encodes (model, smoke) so that switching model or
         # toggling smoke re-applies the backend's recommended default instead
-        # of silently keeping a device chosen for a different combination.
-        device = st.selectbox(
-            "Device",
-            devices,
-            index=default_index,
+        # of silently keeping a choice made for a different combination.
+        chosen_gpus = st.multiselect(
+            "GPUs (leave empty to run on CPU)",
+            gpu_device_options(inventory),
+            default=default_gpu_selection(str(selected_key), smoke),
             format_func=lambda name: device_label(name, inventory),
-            key=f"agent_device_select_{selected_key}_{int(bool(smoke))}",
+            key=f"agent_gpu_select_{selected_key}_{int(bool(smoke))}",
         )
-        st.session_state["agent_device"] = str(device)
-        advisory = gpu_memory_advisory(str(device), inventory)
-        if advisory:
-            st.warning(advisory)
+        selection = selection_from_devices(chosen_gpus)
+        _store_json_state("agent_device_selection", selection)
+        st.caption(f"Selected: {describe_selection(selection)}")
 
-        plan = build_execution_plan(
-            str(context.get("dataset")),
-            str(context.get("task")),
-            str(selected_key),
-            workflow_context=context,
-            device=str(device),
-            seed=seed,
-            workspace=workspace_for_request(
-                str(context.get("dataset")),
-                str(selected_key),
-                smoke,
-                project_root=st.session_state.get("project_root"),
-            ),
-            epochs=smoke_epochs_value(smoke),
-        )
-        _store_json_state("agent_execution_plan", plan)
-        if run_is_enabled(plan):
-            # Keyed on the plan's subject, not on the device or the smoke box,
-            # so fiddling with those does not toast (see ui/feedback.py).
-            notify_success(
-                f"Execution plan ready for {plan.get('model_display') or plan.get('model')}",
-                event_key=EVENT_PLAN_READY,
-                signature=plan_signature(plan),
+        device_value = device_string_for_selection(selection)
+        blockers = selection_blockers(str(selected_key), selection)
+        for name in chosen_gpus:
+            advisory = gpu_memory_advisory(str(name), inventory)
+            if advisory:
+                st.warning(advisory)
+
+        if blockers:
+            # The selection is left exactly as chosen — never quietly reduced
+            # to one GPU — and Run is unreachable instead. No plan is built,
+            # so the real Run button below is never rendered; this disabled
+            # one stands in its place so the reason sits next to the control.
+            for blocker in blockers:
+                st.error(blocker)
+            capability = multi_gpu_capability(str(selected_key))
+            st.caption(
+                "supports_multi_gpu: "
+                f"{capability['supports_multi_gpu']}; multi_gpu_strategy: "
+                f"{capability['multi_gpu_strategy']}"
             )
-        _render_plan(plan, device=str(device), seed=seed)
+            st.button(
+                RUN_BUTTON_LABEL,
+                disabled=True,
+                use_container_width=True,
+                key="agent_run_blocked",
+            )
+        else:
+            device = str(device_value)
+            st.session_state["agent_device"] = device
+            plan = build_execution_plan(
+                str(context.get("dataset")),
+                str(context.get("task")),
+                str(selected_key),
+                workflow_context=context,
+                device=device,
+                seed=seed,
+                workspace=workspace_for_request(
+                    str(context.get("dataset")),
+                    str(selected_key),
+                    smoke,
+                    project_root=st.session_state.get("project_root"),
+                ),
+                epochs=smoke_epochs_value(smoke),
+            )
+            _store_json_state("agent_execution_plan", plan)
+            if run_is_enabled(plan):
+                # Keyed on the plan's subject, not on the device or the smoke
+                # box, so fiddling with those does not toast (ui/feedback.py).
+                notify_success(
+                    f"Execution plan ready for "
+                    f"{plan.get('model_display') or plan.get('model')}",
+                    event_key=EVENT_PLAN_READY,
+                    signature=plan_signature(plan),
+                )
+            _render_plan(plan, device=device, seed=seed)
 
     if not options:
         # The presentation above already named the blocked models and why;

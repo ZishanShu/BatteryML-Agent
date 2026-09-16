@@ -39,8 +39,8 @@ from batteryml_web.core import device_inventory as di  # noqa: E402
 BATLINET_CONFIG = "configs/external/batlinet/matr_1.yaml"
 
 _TWO_GPU_CSV = (
-    "0, NVIDIA GeForce RTX 3090, 24576, 22500, 2076\n"
-    "1, NVIDIA GeForce RTX 3090, 24576, 14000, 10576\n"
+    "0, NVIDIA GeForce RTX 3090, 24576, 22500, 2076, 97\n"
+    "1, NVIDIA GeForce RTX 3090, 24576, 14000, 10576, 12\n"
 )
 
 _TWO_GPU_INVENTORY = {
@@ -80,19 +80,19 @@ class TestNvidiaSmiParsing(unittest.TestCase):
         self.assertEqual(di.parse_nvidia_smi_gpu_csv("\n   \n"), [])
 
     def test_not_available_memory_is_none_not_zero(self) -> None:
-        rows = di.parse_nvidia_smi_gpu_csv("0, GPU, [N/A], [N/A], [N/A]\n")
+        rows = di.parse_nvidia_smi_gpu_csv("0, GPU, [N/A], [N/A], [N/A], [N/A]\n")
         self.assertIsNone(rows[0]["memory_free_mib"])
         self.assertIsNone(rows[0]["memory_total_mib"])
 
     def test_malformed_row_raises_and_names_the_line(self) -> None:
         with self.assertRaises(ValueError) as ctx:
-            di.parse_nvidia_smi_gpu_csv("0, GPU, 24576\n")
-        self.assertIn("expected 5", str(ctx.exception))
+            di.parse_nvidia_smi_gpu_csv("0, GPU, 24576, 1\n")
+        self.assertIn("expected 6", str(ctx.exception))
         self.assertIn("0, GPU, 24576", str(ctx.exception))
 
     def test_non_integer_index_raises(self) -> None:
         with self.assertRaises(ValueError) as ctx:
-            di.parse_nvidia_smi_gpu_csv("GPU-abc, GPU, 1, 1, 1\n")
+            di.parse_nvidia_smi_gpu_csv("GPU-abc, GPU, 1, 1, 1, 1\n")
         self.assertIn("non-integer GPU index", str(ctx.exception))
 
 
@@ -110,7 +110,7 @@ class TestGpuInventoryQuery(unittest.TestCase):
     def test_device_count_is_discovered_not_hardcoded(self) -> None:
         for count in (0, 1, 3, 8):
             csv = "".join(
-                f"{i}, NVIDIA GeForce RTX 3090, 24576, 100, 24476\n" for i in range(count)
+                f"{i}, NVIDIA GeForce RTX 3090, 24576, 100, 24476, 0\n" for i in range(count)
             )
             inventory = di.query_gpu_inventory(runner=_runner(stdout=csv))
             self.assertEqual(inventory["device_count"], count)
@@ -143,7 +143,7 @@ class TestGpuInventoryQuery(unittest.TestCase):
     def test_malformed_output_becomes_an_error_field(self) -> None:
         inventory = di.query_gpu_inventory(runner=_runner(stdout="garbage line\n"))
         self.assertFalse(inventory["available"])
-        self.assertIn("expected 5", inventory["error"])
+        self.assertIn("expected 6", inventory["error"])
 
 
 class TestDeviceChoices(unittest.TestCase):
@@ -174,7 +174,7 @@ class TestDeviceChoices(unittest.TestCase):
         self.assertIsNone(di.free_memory_mib("cpu", _TWO_GPU_INVENTORY))
 
     def test_rows_report_unknown_rather_than_zero(self) -> None:
-        inventory = {"devices": di.parse_nvidia_smi_gpu_csv("0, GPU, [N/A], [N/A], [N/A]\n")}
+        inventory = {"devices": di.parse_nvidia_smi_gpu_csv("0, GPU, [N/A], [N/A], [N/A], [N/A]\n")}
         rows = di.inventory_rows(inventory)
         self.assertEqual(rows[0]["Free (MiB)"], "unknown")
 
@@ -208,20 +208,44 @@ class TestDeviceValidation(unittest.TestCase):
             )
 
     def test_no_multi_gpu_machinery_is_exposed_by_the_web_layer(self) -> None:
-        """The audit concludes there is none; nothing may advertise one."""
-        web_root = REPO_ROOT / "batteryml_web"
+        """The audit concludes there is none; no code may use one.
+
+        Checked on the parsed syntax tree — names called and names imported —
+        so the prose in run_policy.py that explains why there is no torchrun
+        path does not count as one.
+        """
+        import ast
+
+        forbidden = {
+            "DataParallel",
+            "DistributedDataParallel",
+            "init_process_group",
+            "torchrun",
+            "spawn",
+        }
         offenders: list[str] = []
-        for path in sorted(web_root.rglob("*.py")):
-            text = path.read_text(encoding="utf-8", errors="ignore")
-            for token in (
-                "DataParallel(",
-                "DistributedDataParallel(",
-                "init_process_group(",
-                "torchrun",
-                "nproc_per_node",
-            ):
-                if token in text:
-                    offenders.append(f"{path.name}: {token}")
+        for path in sorted((REPO_ROOT / "batteryml_web").rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    func = node.func
+                    name = (
+                        func.id
+                        if isinstance(func, ast.Name)
+                        else func.attr
+                        if isinstance(func, ast.Attribute)
+                        else ""
+                    )
+                    if name in forbidden:
+                        offenders.append(f"{path.name}:{node.lineno}: calls {name}")
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    if "distributed" in node.module or "parallel" in node.module:
+                        offenders.append(f"{path.name}:{node.lineno}: imports {node.module}")
+                    for alias in node.names:
+                        if alias.name in forbidden:
+                            offenders.append(
+                                f"{path.name}:{node.lineno}: imports {alias.name}"
+                            )
         self.assertEqual(offenders, [])
 
     def test_the_audit_document_exists_and_states_the_verdict(self) -> None:

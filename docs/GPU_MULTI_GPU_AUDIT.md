@@ -33,9 +33,9 @@ as an argv list with `shell=False`, and parsing the rows positionally.
   two-GPU machine offers two; a CPU-only machine offers `cpu` alone. There is
   no `8` anywhere in the code (`scripts/verify/check_runtime_contract.py`,
   DEV-01, asserts the count follows the output for 0, 1, 3 and 8 rows).
-* **Free memory is reported as observed.** `[STATIC]` A column the driver
-  reports as `[N/A]` becomes `None` and is displayed as `unknown`, never as
-  `0`. The Agent Workflow page shows the per-device table and warns with the
+* **Free memory and utilization are reported as observed.** `[STATIC]` A
+  column the driver reports as `[N/A]` becomes `None` and is displayed as
+  `unknown`, never as `0`. The Agent Workflow page shows the per-device table and warns with the
   selected GPU's free memory before a run.
 * **Enumeration failure is a state, not a crash.** `[STATIC]` A missing
   `nvidia-smi`, a timeout, a non-zero exit or an unparsable row all return an
@@ -133,14 +133,47 @@ single-GPU result would then be a separate piece of work, not a side effect.
 
 ---
 
+## Selection is structured; execution is gated
+
+`[STATIC]` The page now lets a user tick **several** GPUs. That is a
+selection, not a promise:
+
+* a selection is a structure — `{"mode": "cpu" | "single_gpu" | "multi_gpu",
+  "gpu_ids": [...]}` — built by
+  `device_inventory.build_device_selection`. No GPUs ticked means CPU; one
+  means that GPU; several mean several;
+* `device_string_for_selection` returns `"cpu"` or `"cuda:<index>"` for the
+  first two, and **`None`** for a multi-GPU selection. There is no single
+  torch device for it, so no string is produced. `"cuda:0,1"` is not
+  something this codebase can construct;
+* whether a multi-GPU selection may *run* is a backend question:
+  `run_policy.multi_gpu_capability(model_key)` returns
+  `supports_multi_gpu` and `multi_gpu_strategy`, read from
+  `MULTI_GPU_CAPABLE_MODELS` — **which is empty**, and says so rather than
+  naming a model;
+* when the selection is multi-GPU and the model has no capability,
+  `run_policy.execution_blockers` returns one reason, the page shows it, and
+  Run is rendered disabled. The selection is left exactly as the user made
+  it: it is never quietly reduced to a single GPU, because silently running
+  something other than what was asked for is the failure mode this whole
+  audit exists to prevent.
+
+Registering a model is therefore the only change a future DDP
+implementation needs on the UI side — and `DEV-01` fails the moment a model
+is registered while no DDP path exists, so the registry cannot drift ahead
+of the runtime.
+
 ## Verdict
 
-**Multi-GPU is not implemented, and no multi-GPU Run option is exposed.**
+**Multi-GPU execution is not implemented, and no multi-GPU Run is offered.**
 `[STATIC]` What ships is:
 
-* real GPU enumeration and single-GPU selection (above);
+* real GPU enumeration (index, name, total/used/free memory, utilization)
+  and selection of CPU, one GPU, or several;
 * an explicit refusal of multi-device strings, with the reason, at the
-  planner boundary rather than deep inside a run.
+  planner boundary rather than deep inside a run;
+* a capability gate that disables Run — rather than a silent downgrade —
+  when the selection is beyond what the runtime supports.
 
 This is a deliberate stop, not an omission: implementing DP or DDP here
 would change batch semantics, change BatLiNet's support-set construction,

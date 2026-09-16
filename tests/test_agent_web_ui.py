@@ -46,8 +46,8 @@ _FAKE_GPU_INVENTORY = {
     "available": True,
     "device_count": 2,
     "devices": di.parse_nvidia_smi_gpu_csv(
-        "0, NVIDIA GeForce RTX 3090, 24576, 22500, 2076\n"
-        "1, NVIDIA GeForce RTX 3090, 24576, 14000, 10576\n"
+        "0, NVIDIA GeForce RTX 3090, 24576, 22500, 2076, 97\n"
+        "1, NVIDIA GeForce RTX 3090, 24576, 14000, 10576, 12\n"
     ),
     "error": None,
 }
@@ -129,10 +129,12 @@ class FakeStreamlit:
         session: dict,
         clicked_buttons: set[str] | None = None,
         checkbox_values: dict[str, bool] | None = None,
+        multiselect_values: dict[str, list] | None = None,
     ):
         self.session_state = session
         self._clicked = set(clicked_buttons or ())
         self._checkbox_values = dict(checkbox_values or {})
+        self._multiselect_values = dict(multiselect_values or {})
         self.rec: dict[str, list] = {
             "markdown": [],
             "captions": [],
@@ -150,6 +152,7 @@ class FakeStreamlit:
             "toasts": [],
             "expanders": [],
             "expander_writes": [],
+            "multiselects": [],
         }
         self.in_expander = False
 
@@ -198,6 +201,14 @@ class FakeStreamlit:
 
     def checkbox(self, label, **kwargs):
         return bool(self._checkbox_values.get(str(label), False))
+
+    def multiselect(self, label, options, default=None, **kwargs):
+        self.rec["multiselects"].append(
+            {"label": str(label), "options": [str(o) for o in options]}
+        )
+        if str(label) in self._multiselect_values:
+            return list(self._multiselect_values[str(label)])
+        return list(default or [])
 
     def button(self, label, **kwargs):
         disabled = bool(kwargs.get("disabled", False))
@@ -379,8 +390,9 @@ def _render(
     session: dict,
     clicked: set[str] | None = None,
     checkboxes: dict[str, bool] | None = None,
+    multiselect_values: dict[str, list] | None = None,
 ) -> FakeStreamlit:
-    fake = FakeStreamlit(session, clicked, checkboxes)
+    fake = FakeStreamlit(session, clicked, checkboxes, multiselect_values)
     with _fake_streamlit(fake):
         try:
             ui.render_agent_workflow()
@@ -710,7 +722,7 @@ class TestSmokeAndDeviceSelection(unittest.TestCase):
         )
         eight = {
             "devices": di.parse_nvidia_smi_gpu_csv(
-                "".join(f"{i}, RTX 3090, 24576, 22000, 2576\n" for i in range(8))
+                "".join(f"{i}, RTX 3090, 24576, 22000, 2576, 50\n" for i in range(8))
             )
         }
         self.assertEqual(len(ui.device_options(eight)), 9)
@@ -720,13 +732,16 @@ class TestSmokeAndDeviceSelection(unittest.TestCase):
         )
 
     def test_batlinet_smoke_defaults_to_cpu_and_explains_why(self) -> None:
-        options = ["cpu", "cuda:0", "cuda:1"]
-        index, reason = ui.default_device_index(options, "batlinet", True)
-        self.assertEqual(options[index], "cpu")
-        self.assertIn("CPU", reason)
+        # CPU is the empty GPU selection, so the control opens with none ticked.
+        self.assertEqual(ui.default_gpu_selection("batlinet", True), [])
+        self.assertIn("CPU", ui.smoke_device_note("batlinet", True))
         # No recommendation text for the ordinary cases.
-        self.assertEqual(ui.default_device_index(options, "batlinet", False)[1], "")
-        self.assertEqual(ui.default_device_index(options, "cptransformer", True)[1], "")
+        self.assertEqual(ui.smoke_device_note("batlinet", False), "")
+        self.assertEqual(ui.smoke_device_note("cptransformer", True), "")
+
+    def test_the_gpu_control_lists_gpus_only(self) -> None:
+        self.assertEqual(ui.gpu_device_options(_FAKE_GPU_INVENTORY), ["cuda:0", "cuda:1"])
+        self.assertNotIn("cpu", ui.gpu_device_options(_FAKE_GPU_INVENTORY))
 
     def test_no_hardcoded_gpu_count_in_the_ui_module(self) -> None:
         source = Path(ui.__file__).read_text(encoding="utf-8")
@@ -1275,6 +1290,110 @@ class TestRequestTabsAndExamples(unittest.TestCase):
         render_examples = source.split("def _render_examples")[1].split("\ndef ")[0]
         for name in ("CPTransformer", "BatLiNet", "XGBoost", "PBT", "MATR"):
             self.assertNotIn(name, render_examples)
+
+
+class TestGpuMultiSelectRender(unittest.TestCase):
+    """G: CPU / one GPU / several, with Run gated on backend capability."""
+
+    def setUp(self) -> None:
+        self._real_build = ui.build_execution_plan
+        self._real_stream = ui.execute_plan_streaming
+        self._real_llm = ui.is_llm_configured
+        self.plans: list[dict] = []
+        self.executed: list = []
+
+        def stub_build(dataset, task, model, **kwargs):
+            self.plans.append({"model": model, **kwargs})
+            return _ok_plan(model, epochs=kwargs.get("epochs"))
+
+        ui.build_execution_plan = stub_build
+        ui.execute_plan_streaming = lambda plan, **kw: self.executed.append(plan)
+        ui.is_llm_configured = lambda: False
+
+    def tearDown(self) -> None:
+        ui.build_execution_plan = self._real_build
+        ui.execute_plan_streaming = self._real_stream
+        ui.is_llm_configured = self._real_llm
+
+    def _session(self) -> dict:
+        return {
+            "agent_workflow_context": _MATR_CONTEXT,
+            "agent_original_request": "Use BatLiNet on MATR to predict battery lifetime.",
+            "agent_selected_model": "batlinet",
+            "gpu_inventory": _FAKE_GPU_INVENTORY,
+        }
+
+    def test_no_gpu_selected_runs_on_cpu(self) -> None:
+        session = self._session()
+        fake = _render(session, multiselect_values={"GPUs (leave empty to run on CPU)": []})
+        self.assertEqual(session["agent_device_selection"], {"mode": "cpu", "gpu_ids": []})
+        self.assertEqual(self.plans[-1]["device"], "cpu")
+        run_buttons = [b for b in fake.rec["buttons"] if b["label"] == ui.RUN_BUTTON_LABEL]
+        self.assertTrue(run_buttons and run_buttons[0]["disabled"] is False)
+
+    def test_one_gpu_selected_stays_executable(self) -> None:
+        session = self._session()
+        fake = _render(
+            session, multiselect_values={"GPUs (leave empty to run on CPU)": ["cuda:1"]}
+        )
+        self.assertEqual(
+            session["agent_device_selection"], {"mode": "single_gpu", "gpu_ids": [1]}
+        )
+        self.assertEqual(self.plans[-1]["device"], "cuda:1")
+        run_buttons = [b for b in fake.rec["buttons"] if b["label"] == ui.RUN_BUTTON_LABEL]
+        self.assertTrue(run_buttons and run_buttons[0]["disabled"] is False)
+
+    def test_several_gpus_disable_run_with_the_exact_message(self) -> None:
+        session = self._session()
+        fake = _render(
+            session,
+            multiselect_values={"GPUs (leave empty to run on CPU)": ["cuda:0", "cuda:1"]},
+        )
+        # The selection is kept exactly as chosen, not reduced to one GPU.
+        self.assertEqual(
+            session["agent_device_selection"], {"mode": "multi_gpu", "gpu_ids": [0, 1]}
+        )
+        # No plan was built, so no device string was needed.
+        self.assertEqual(self.plans, [])
+        self.assertEqual(self.executed, [])
+        errors = " ".join(fake.rec["errors"])
+        self.assertIn(
+            "This model/runtime does not yet support multi-GPU execution.", errors
+        )
+        run_buttons = [b for b in fake.rec["buttons"] if b["label"] == ui.RUN_BUTTON_LABEL]
+        self.assertTrue(run_buttons)
+        self.assertTrue(all(button["disabled"] for button in run_buttons))
+
+    def test_a_multi_gpu_selection_cannot_be_executed_by_clicking(self) -> None:
+        session = self._session()
+        _render(
+            session,
+            clicked={ui.RUN_BUTTON_LABEL},
+            multiselect_values={"GPUs (leave empty to run on CPU)": ["cuda:0", "cuda:1"]},
+        )
+        self.assertEqual(self.executed, [])
+
+    def test_the_capability_fields_are_shown(self) -> None:
+        session = self._session()
+        fake = _render(
+            session,
+            multiselect_values={"GPUs (leave empty to run on CPU)": ["cuda:0", "cuda:1"]},
+        )
+        captions = " ".join(fake.rec["captions"])
+        self.assertIn("supports_multi_gpu: False", captions)
+        self.assertIn("multi_gpu_strategy: None", captions)
+
+    def test_the_inventory_table_shows_utilization(self) -> None:
+        fake = _render(self._session(), multiselect_values={})
+        rows = [
+            row
+            for frame in fake.rec["dataframes"]
+            if isinstance(frame, list)
+            for row in frame
+            if isinstance(row, dict) and "GPU" in row
+        ]
+        self.assertTrue(rows)
+        self.assertIn("Utilization (%)", rows[0])
 
 
 class TestNoFrontendDuplication(unittest.TestCase):
