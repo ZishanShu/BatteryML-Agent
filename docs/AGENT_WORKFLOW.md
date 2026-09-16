@@ -39,6 +39,8 @@ them holding:
 
 | Module | Owns | Never does |
 | --- | --- | --- |
+| `batteryml_web/agent/recommendation.py` | which models the page names, given the request | name a model of its own, or consult readiness |
+| `batteryml_web/ui/feedback.py` | transient success feedback, deduplicated | report a failure |
 | `batteryml_web/agent/intent.py` | deterministic dataset/task phrase matching, English and Chinese | guess a default dataset |
 | `batteryml_web/agent/catalog.py` | the canonical menu, derived from `ConfigRegistry` + readiness | carry a config path |
 | `batteryml_web/agent/llm_intent.py` | the LLM call, and the refusal of everything it invents | plan or execute |
@@ -56,9 +58,18 @@ them holding:
 * **Home** (`batteryml_web/app.py`) offers Quick Start and, at the same
   level, a free-text box with **Analyze with Agent**. Home records the
   request and navigates; it resolves nothing itself.
-* **Agent Workflow** analyses the handed-over request on arrival, shows how
-  it was understood, what was refused, which models are runnable and which
-  are blocked, then builds a plan for the selected model.
+* **Agent Workflow** analyses the handed-over request on arrival and shows
+  how it was understood. The request itself is supplied through two tabs —
+  **Describe request** and **Examples**, where the examples are built from
+  this installation's catalog and only fill the box.
+
+The model section answers the request rather than listing the platform: a
+named runnable model is shown alone; a named blocked model is shown with its
+exact blockers and runnable alternatives; an unregistered name is reported
+as such; a recommendation shows at most three, filtered by readiness. The
+full runnable and blocked catalogues live behind expanders. Where the
+request named something blocked or unregistered, nothing is preselected and
+no plan exists until the user chooses a model deliberately.
 
 The sidebar shows the agent as an alternative intelligent entry point, not
 as a numbered step of the manual protocol route. The manual route
@@ -83,9 +94,19 @@ CUDA attempt died with OOM). An explicit GPU choice is always honoured.
 
 Devices are enumerated from `nvidia-smi` at runtime; the count is
 discovered, never assumed, and each device shows its observed free/total
-memory. A run goes to exactly one torch device — `cuda:0,1` is refused at
-the planner boundary. There is no multi-GPU run and none is advertised; the
-reasoning is in `docs/GPU_MULTI_GPU_AUDIT.md`.
+memory and utilization.
+
+The compute control is a GPU multiselect: nothing ticked means CPU, one
+means that GPU, several mean several. The choice is kept as a structure —
+`{"mode": "cpu" | "single_gpu" | "multi_gpu", "gpu_ids": [...]}` — separate
+from the `--device` string BatteryML receives. CPU and one GPU produce a
+device string; a multi-GPU selection produces none, so `cuda:0,1` cannot be
+built, and `validate_device` would refuse it anyway.
+
+Whether a multi-GPU selection may run is a backend capability
+(`supports_multi_gpu`, `multi_gpu_strategy`). No model carries it today, so
+a multi-GPU choice disables Run with the reason rather than being downgraded
+to a single GPU. The audit behind that is `docs/GPU_MULTI_GPU_AUDIT.md`.
 
 ## Failures
 
@@ -213,7 +234,11 @@ Check by hand, and report what you see:
 | F | While a run is going, the stage and elapsed time update; a bar appears only once real epoch numbers arrive |
 | G | A MICH request reports RAW_ONLY with the backend's own text and offers no `data/raw/MICH` preprocessing command |
 | H | The result panel shows metrics only for a successful run, with the smoke warning visible |
-| I | Creating a project shows "✅ Project created successfully" with the project name and workspace path |
+| I | Creating a project shows a transient toast, with the project name and workspace path left on the page as plain text — no permanent green box |
+| J | The Agent Workflow entry reads exactly `Agent Workflow` on Home, in the sidebar, as the page heading and on the navigation button — no emoji, no caret — and the sidebar carries no "Intelligent entry point" copy |
+| K | The request area has **Describe request** and **Examples** tabs; clicking an example fills the box and does nothing else |
+| L | The Streamlit toolbar offers no "Clear cache" or developer entries (`.streamlit/config.toml`, `toolbarMode = "viewer"`) — this is the one item only the running app can confirm |
+| M | Ticking two or more GPUs leaves the selection as chosen, shows "This model/runtime does not yet support multi-GPU execution.", and renders Run disabled; ticking one GPU still runs |
 
 ### 6. If a GPU run OOMs
 
