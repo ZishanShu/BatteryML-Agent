@@ -192,8 +192,8 @@ to 16 GB. The audit behind this group is `docs/GPU_MULTI_GPU_AUDIT.md`.
 | `GPU-03` | No multi-GPU Run option is exposed while none exists. The web layer contains no `DataParallel`, `DistributedDataParallel`, `init_process_group` or `torchrun` path, and the DEV-01 check fails if one appears. | `IMPLEMENTED-STATIC` | `scripts/verify/check_runtime_contract.py`, `tests/test_agent_smoke.py` |
 | `GPU-04` | The reason multi-GPU is absent is written down, with the code it follows from and the work a real implementation would take: `DataBundle.to(device)` places the whole dataset on one device, so neither DataParallel nor DDP relieves the per-GPU memory limit; BatLiNet's inter-cell support sampling has no defined distributed semantics; DDP changes effective batch size and determinism. | `IMPLEMENTED-STATIC` | `docs/GPU_MULTI_GPU_AUDIT.md` |
 | `GPU-05` | Device selection is a structure — `{"mode": "cpu" \| "single_gpu" \| "multi_gpu", "gpu_ids": [...]}` — separate from the `--device` string BatteryML receives. CPU and one GPU produce a device string; a multi-GPU selection produces none, so `"cuda:0,1"` cannot be constructed. | `IMPLEMENTED-STATIC` | `batteryml_web/core/device_inventory.py` (`build_device_selection`, `device_string_for_selection`) |
-| `GPU-06` | The page offers CPU, one GPU or several through a multiselect (no GPU ticked = CPU), and shows each device's index, name, total/used/free memory and utilization. Single-GPU and CPU behaviour is unchanged. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/agent_workflow.py`, `batteryml_web/core/device_inventory.py` |
-| `GPU-07` | Whether a multi-GPU selection may execute is a backend capability (`supports_multi_gpu`, `multi_gpu_strategy`), and no model carries it today. A multi-GPU selection for a model without it disables Run with "This model/runtime does not yet support multi-GPU execution." — and the selection is never quietly reduced to a single GPU. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/run_policy.py` (`multi_gpu_capability`, `execution_blockers`) |
+| `GPU-06` | The page offers CPU, one GPU or several. Compute device is an explicit CPU/GPU choice (`RUN-04`); in GPU mode a multiselect lists the enumerated devices with index, name, total/used/free memory and utilization. Single-GPU and CPU behaviour is unchanged. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/agent_workflow.py`, `batteryml_web/core/device_inventory.py` |
+| `GPU-07` | Whether a multi-GPU selection may execute is a backend capability (`supports_multi_gpu`, `multi_gpu_strategy`), and no model carries it today. A multi-GPU selection for a model without it disables Run with "True multi-GPU execution is not yet supported for this model/runtime." — and the selection is never quietly reduced to a single GPU. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/run_policy.py` (`multi_gpu_capability`, `execution_blockers`) |
 
 `GPU-05`…`GPU-07` prepare for a real multi-GPU implementation without
 claiming one: the selection shape and the capability gate are what a DDP
@@ -203,6 +203,57 @@ capable while no DDP path exists.
 `GPU-04` is a documentation requirement on purpose: the decision *not* to
 build something is the part of an audit that gets lost, and the next person
 to look at eight idle GPUs needs the reasoning, not just the absence.
+
+---
+
+## RUN — runtime context, provenance and honest reporting
+
+Rationale for the group: the previous milestones made the platform *able* to
+run something. This one makes it able to say, truthfully and before the fact,
+**what** it is about to run and **where** the result will land — and to stop
+short of saying anything it has not observed.
+
+Three failures motivate it. A project could be loaded on Home while the run
+was written under the default project, because the page carried a second
+workspace rule with its own fallback path; the two answers only had to
+disagree once for a result to be attributed to the wrong experiment. A
+progress line with a remaining time is read as a measurement, so inventing
+one from a constant rate is the same class of error as inventing a metric.
+And "Explain computed result" was disabled with a caption telling the user to
+configure an assistant the page offered no way to configure — a dead end
+that made the LLM route look broken rather than optional.
+
+| ID | Requirement | Status | Implementation |
+| --- | --- | --- | --- |
+| `RUN-01` | The loaded project is the only source of an agent run's workspace: `runs/web_projects/<project>/agent_<dataset>_<model>[_smoke]`. No second rule, no fallback path written into the page. A project root that would leave `runs/` is brought back inside it, and an unnameable project raises rather than silently becoming the default. | `IMPLEMENTED-STATIC` | `batteryml_web/core/project_context.py` (`resolve_project`, `agent_workspace`, `safe_segment`) |
+| `RUN-02` | Provenance — Project, Run directory, Dataset, Task, Model, Config, Seed, Epochs, Device — is shown **before** the run is started and preserved **with** the result, so the two can never disagree. The run directory is read out of the plan's own argv, because the argv is what executes. A value the backend does not have renders as "Not available", never as a blank cell. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/provenance.py` (`build_run_context`, `context_rows`), `batteryml_web/ui/agent_workflow.py` (`_render_run_context`) |
+| `RUN-03` | Paths are shown repo-relative where the file is inside the repository; the absolute form stays available in a details view rather than being discarded. | `IMPLEMENTED-STATIC` | `batteryml_web/core/project_context.py` (`display_path`), `batteryml_web/agent/provenance.py` (`artifact_display`) |
+| `RUN-04` | Compute device is an explicit choice — CPU or GPU — not the absence of one. CPU is the default and needs no GPU interaction. The GPU control appears only in GPU mode, and its entries come from the runtime inventory: index, name, free memory and utilization exactly as the driver reported them, with any figure the driver did not report simply omitted. No GPU count, index, name, memory figure or utilization is written into the source. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/agent_workflow.py`, `batteryml_web/core/device_inventory.py` (`gpu_option_label`) |
+| `RUN-05` | An estimated time to completion is shown only where the run itself has produced enough observations to support one — a counter, and more than one measured interval. Until then the line says `estimating…`. Where no counter exists at all, no ETA and no bar are shown. A rate is never assumed from a constant. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/progress_estimate.py` (`EpochTimer`, `progress_line`, `ESTIMATING_LABEL`) |
+| `RUN-06` | A metric is displayed at reading scale beside its exact stored value. The compact form is presentation only: the canonical value from `build_result_context` is never rounded, replaced or re-derived, and MAPE's percent form is a supplementary reading of the stored ratio. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/formatting.py` (`compact_metric`, `full_precision`, `metric_display`) |
+| `RUN-07` | User-facing settings live in the sidebar, in the application's own UI. Streamlit's developer menu is not product UI and is not relied on (see `UI-08`); no script drags, hides or rewrites Streamlit's own DOM elements. The top chrome is reduced through documented, stable `data-testid` selectors only. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/settings_panel.py` (`render_sidebar_settings`), `batteryml_web/app.py` |
+| `RUN-08` | "Explain computed result" is always clickable. With no assistant configured it opens the LLM configuration form (Cancel / Save settings / Save & explain) instead of dead-ending; it never calls anything before the user saves. Both entry points — sidebar and prompt — read and write the one existing credential store, so there is no second settings system. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/settings_panel.py`, `batteryml_web/ui/llm_state.py`, `batteryml_web/ui/agent_workflow.py` (`_explain_result`) |
+| `RUN-09` | The API key is entered masked (`type="password"`), is reduced to a boolean anywhere the page may describe the settings, and is never written to a caption, toast, log, debug view or repository file. It is held in session state for the session only — the mechanism the app already used — and this milestone adds no new persistence. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/settings_panel.py` (`llm_settings_summary`, `render_llm_settings_form`) |
+| `RUN-10` | Creating or loading a project confirms which project is now current — `Project "<name>" created and loaded` / `Project "<name>" loaded` — once, transiently (see `UI-09`), and the current project stays visible in the sidebar for the rest of the session. Loading a project clears the previous project's plan, result and run context rather than leaving them attributed to the new one. | `IMPLEMENTED-STATIC` | `batteryml_web/app.py`, `batteryml_web/ui/workflow_sidebar.py` (`current_project_label`) |
+
+The check that establishes this group is `RUN-01`
+(`scripts/verify/check_run_context.py`); the tests are
+`tests/test_run_context.py` (the four backend modules, without Streamlit)
+and, in `tests/test_agent_web_ui.py`, the classes
+`TestComputeDeviceSelector`, `TestProjectDeterminesTheWorkspaceInTheUi`,
+`TestExplainOpensConfigurationInsteadOfDeadEnding` and
+`TestNothingRuntimeIsHardcoded`. The last is written to fail if anyone later
+writes a GPU count, a GPU name, a device string, a project path or a metric
+value into the UI source, and its scan is proved non-vacuous by mutation.
+
+`RUN-04` deliberately does **not** claim multi-GPU execution. A multi-GPU
+selection is still preserved as `{"mode": "multi_gpu", "gpu_ids": [...]}`,
+still produces no device string, and still disables Run — see `GPU-05`…
+`GPU-07`. **True multi-GPU execution remains unimplemented.**
+
+Nothing in this group may be marked `VERIFIED` from the authoring
+environment: every row about what the *page* does needs a rendered Streamlit
+app, which has never run here.
 
 ---
 

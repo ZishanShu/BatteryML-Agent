@@ -368,7 +368,7 @@ MULTI_GPU_STRATEGIES: Dict[str, str] = {}
 #: Shown when a multi-GPU selection is made for a model that cannot use one.
 #: Exact wording, because it is what the user reads instead of a Run button.
 MULTI_GPU_UNSUPPORTED_MESSAGE = (
-    "This model/runtime does not yet support multi-GPU execution."
+    "True multi-GPU execution is not yet supported for this model/runtime."
 )
 
 

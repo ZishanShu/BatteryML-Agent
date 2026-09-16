@@ -68,15 +68,38 @@ from ..agent.streaming import (
     execute_plan_streaming,
 )
 from ..agent.workflow import guide_workflow
+from ..agent.progress_estimate import (
+    EpochTimer,
+    progress_line,
+)
+from ..agent.provenance import (
+    artifact_display,
+    build_run_context,
+    context_rows,
+)
 from ..core.device_inventory import (
     build_device_selection,
     describe_selection,
     device_choices_with_manual_gpu,
     device_label,
     device_string_for_selection,
+    gpu_option_label,
     inventory_rows,
     query_gpu_inventory,
     selection_from_devices,
+)
+from ..core.project_context import (
+    agent_workspace,
+    display_path,
+    resolve_project,
+)
+from .formatting import metric_display
+from .settings_panel import (
+    clear_llm_configuration_request,
+    llm_configuration_requested,
+    pending_action,
+    render_llm_configuration_prompt,
+    request_llm_configuration,
 )
 from .feedback import (
     EVENT_EXPLANATION_READY,
@@ -111,6 +134,14 @@ ERROR_TAIL_CHARS = 20000
 PROGRESS_REDRAW_INTERVAL_S = 0.25
 #: How many trailing output lines the live log shows while a run is going.
 LIVE_LOG_LINES = 12
+#: The two compute modes, as the user picks them.
+COMPUTE_MODES: tuple[str, str] = ("CPU", "GPU")
+COMPUTE_LABEL = "Compute device"
+#: Shown when more GPUs are selected than the runtime can actually execute
+#: on. Re-exported from the backend rather than restated: the page and the
+#: planner must not be able to disagree about whether multi-GPU works.
+MULTI_GPU_NOTICE = MULTI_GPU_UNSUPPORTED_MESSAGE
+EXPLAIN_BUTTON_LABEL = "Explain computed result"
 
 
 def _display_name(entry: dict[str, Any]) -> str:
@@ -208,19 +239,6 @@ def raw_only_notice(context: dict[str, Any]) -> str | None:
         ),
         None,
     )
-
-
-def workspace_for_request(
-    dataset: str, model: str, smoke: bool, project_root: str | None = None
-) -> str:
-    """Workspace path inside the repository runs/ area for one agent run."""
-    base = str(project_root or "").strip("/") or "runs/web_projects/default"
-    if not Path(base).is_relative_to("runs"):
-        base = "runs/web_projects/default"
-    safe_dataset = "".join(char if char.isalnum() else "_" for char in str(dataset)).lower().strip("_")
-    safe_model = "".join(char if char.isalnum() else "_" for char in str(model)).lower().strip("_")
-    suffix = "_smoke" if smoke else ""
-    return f"{base}/agent_{safe_dataset}_{safe_model}{suffix}"
 
 
 def display_metrics(result_context: dict[str, Any] | None) -> dict[str, float]:
@@ -473,6 +491,43 @@ def _render_gpu_inventory(inventory: dict[str, Any]) -> None:
         st.caption(f"GPU inventory unavailable: {inventory['error']}")
 
 
+def _render_run_context(
+    run_context: dict[str, Any] | None,
+    *,
+    title: str = "Run context",
+) -> None:
+    """Where this run writes and what it runs, from the plan itself.
+
+    Shown before execution and preserved with the result, so the answer never
+    changes between the two. Paths are repo-relative here; the exact absolute
+    form stays in the details expander, because it is what is really on disk.
+    """
+    rows = context_rows(run_context)
+    if not rows:
+        return
+    st.markdown(f"**{title}**")
+    if run_context and run_context.get("project_is_default"):
+        st.caption(
+            "No project is loaded, so this run goes to the default project. "
+            "Create or load a project on Home to keep runs separate."
+        )
+    st.dataframe(
+        [{"Field": label, "Value": value} for label, value in rows],
+        hide_index=True,
+        use_container_width=True,
+    )
+    absolute = (run_context or {}).get("workspace")
+    config = (run_context or {}).get("config")
+    if absolute or config:
+        with st.expander("Exact paths", expanded=False):
+            if absolute:
+                st.caption("Run directory")
+                st.code(str(absolute), language="text")
+            if config:
+                st.caption("Config")
+                st.code(str(config), language="text")
+
+
 def _render_plan(plan: dict[str, Any], device: str, seed: int) -> None:
     st.subheader("Execution plan", anchor=False)
     rows = [
@@ -500,25 +555,26 @@ def progress_caption(
     current: int | None,
     total: int | None,
     elapsed_s: float,
+    *,
+    eta_s: float | None = None,
+    estimating: bool = False,
 ) -> str:
-    """One status line: the stage, the observed counter, and elapsed time.
+    """One status line: stage, the observed counter, elapsed, and an ETA.
 
-    A counter appears only when the run itself reported one. There is no
-    fallback percentage: an unknown position is shown as the stage plus the
-    elapsed clock, never as an invented number.
+    A counter appears only when the run itself reported one, and an ETA only
+    when enough of that counter has completed to time. Where a counter exists
+    but not enough of it, the line says "estimating…" rather than a number;
+    where there is no counter at all it says neither. There is no fallback
+    percentage and no invented countdown.
     """
-    parts = [str(stage or "Running")]
-    if isinstance(current, int) and isinstance(total, int) and total > 0:
-        parts.append(f"step {current}/{total}")
-    parts.append(f"elapsed {_format_elapsed(elapsed_s)}")
-    return " — ".join(parts)
-
-
-def _format_elapsed(seconds: float) -> str:
-    total = max(0, int(seconds))
-    hours, rest = divmod(total, 3600)
-    minutes, secs = divmod(rest, 60)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return progress_line(
+        stage,
+        current=current,
+        total=total,
+        elapsed_s=elapsed_s,
+        eta_s=eta_s,
+        estimating=estimating,
+    )
 
 
 class _LiveProgress:
@@ -539,6 +595,9 @@ class _LiveProgress:
         self._last_draw = 0.0
         self._stage = ""
         self._lines: list[str] = []
+        # Times the run's own epoch counter. Produces an ETA only once enough
+        # epochs have completed to measure one.
+        self._timer = EpochTimer()
 
     def on_event(self, event: dict[str, Any]) -> None:
         message = str(event.get("message") or "")
@@ -560,11 +619,20 @@ class _LiveProgress:
 
     def _draw(self, event: dict[str, Any]) -> None:
         elapsed = time.monotonic() - self._started
+        self._timer.observe(event.get("current"), event.get("total"), elapsed)
+        eta = self._timer.eta_seconds()
+        has_counter = isinstance(event.get("current"), int) and isinstance(
+            event.get("total"), int
+        )
         caption = progress_caption(
             str(event.get("stage") or ""),
             event.get("current"),
             event.get("total"),
             elapsed,
+            eta_s=eta,
+            # A counter exists but has not produced enough completed units to
+            # time yet: say so instead of guessing.
+            estimating=has_counter and eta is None,
         )
         if event.get("stage") == STAGE_FAILED:
             self._status.error(caption)
@@ -617,6 +685,25 @@ def _render_execution_status(
         st.text(result.get("stderr") or "No stderr captured.")
 
 
+def _explain_result(result_context: dict[str, Any]) -> None:
+    """Call the existing explanation path. Never called by opening a form."""
+    try:
+        parsed = explain_run_result(
+            result_context,
+            base_url=st.session_state["llm_base_url"],
+            api_key=st.session_state["llm_api_key"],
+            model=st.session_state["llm_model"],
+        )
+        st.session_state["agent_explanation"] = explanation_text(parsed)
+        st.session_state["agent_explanation_serial"] = (
+            int(st.session_state.get("agent_explanation_serial", 0)) + 1
+        )
+    except Exception as exc:
+        # The message may quote the endpoint; it never quotes the API key,
+        # which this module does not read into any string.
+        st.session_state["agent_explanation"] = f"LLM explanation failed: {exc}"
+
+
 def _render_result(result_context: dict[str, Any]) -> None:
     st.subheader("Run result", anchor=False)
     for warning in provenance_warnings(result_context):
@@ -629,24 +716,44 @@ def _render_result(result_context: dict[str, Any]) -> None:
             st.caption(str(warning))
         return
 
+    # Compact row. The canonical values stay exactly as build_result_context
+    # returned them; only the strings drawn here are shortened, and the full
+    # precision is one expander away.
     metrics = display_metrics(result_context)
-    cols = st.columns(len(METRIC_KEYS))
-    for col, key in zip(cols, METRIC_KEYS):
-        if key in metrics:
-            col.metric(key, str(metrics[key]))
-            if key == "MAPE":
-                col.caption(f"= {mape_percent(metrics[key])} (display only; ratio is canonical)")
-        else:
-            col.metric(key, "Unavailable")
+    cells = [metric_display(metrics, key) for key in METRIC_KEYS]
+    st.markdown(
+        " &nbsp;·&nbsp; ".join(
+            f"**{key}** {cell['compact']}"
+            + (f" ({cell['percent']})" if cell["percent"] else "")
+            if cell["present"]
+            else f"**{key}** —"
+            for key, cell in zip(METRIC_KEYS, cells)
+        )
+    )
+    st.caption(
+        "MAPE percentage is a display reading; the canonical value is the ratio."
+    )
 
-    for label, value in result_summary_rows(result_context):
-        st.write(f"**{label}:** {value if value is not None else 'Unavailable'}")
+    artifact = artifact_display(result_context)
+    if artifact["display"]:
+        st.caption("Predictions artifact")
+        st.code(artifact["display"], language="text")
 
-    warnings = result_context.get("warnings", [])
-    if warnings:
-        with st.expander("All backend warnings", expanded=False):
-            for warning in warnings:
-                st.caption(str(warning))
+    predictions = result_context.get("num_predictions")
+    if predictions is not None:
+        st.caption(f"{predictions} prediction(s)")
+
+    with st.expander("Result details", expanded=False):
+        for key, cell in zip(METRIC_KEYS, cells):
+            if cell["present"]:
+                st.caption(f"{key} (canonical): {cell['exact']}")
+        for label, value in result_summary_rows(result_context):
+            st.write(f"**{label}:** {value if value is not None else 'Unavailable'}")
+        if artifact["absolute"]:
+            st.caption("Predictions artifact (absolute)")
+            st.code(artifact["absolute"], language="text")
+        for warning in result_context.get("warnings", []):
+            st.caption(str(warning))
 
 
 def _resolve_intent(trimmed: str, catalog: dict[str, Any]) -> dict[str, Any]:
@@ -848,6 +955,13 @@ def render_agent_workflow() -> None:
     plan: dict[str, Any] | None = None
     smoke = False
     selected_key: str = NO_SELECTION
+    # The project decides where a run is written. Resolved once, here, so the
+    # workspace the page shows and the workspace the plan carries cannot come
+    # from different places.
+    project = resolve_project(
+        project_root=st.session_state.get("project_root"),
+        project_name=st.session_state.get("project_name"),
+    )
     inventory = _gpu_inventory()
     devices = device_options(inventory)
     device = devices[0]
@@ -889,24 +1003,45 @@ def render_agent_workflow() -> None:
         # the models whose smoke run must not compete for GPU memory.
         smoke = st.checkbox(SMOKE_CHECKBOX_LABEL, key="agent_smoke_mode")
 
-        st.markdown("**Compute**")
-        _render_gpu_inventory(inventory)
+        st.markdown(f"**{COMPUTE_LABEL}**")
         device_reason = smoke_device_note(str(selected_key), smoke)
         if device_reason:
             st.info(device_reason)
-        # The widget key encodes (model, smoke) so that switching model or
-        # toggling smoke re-applies the backend's recommended default instead
-        # of silently keeping a choice made for a different combination.
-        chosen_gpus = st.multiselect(
-            "GPUs (leave empty to run on CPU)",
-            gpu_device_options(inventory),
-            default=default_gpu_selection(str(selected_key), smoke),
-            format_func=lambda name: device_label(name, inventory),
-            key=f"agent_gpu_select_{selected_key}_{int(bool(smoke))}",
+
+        gpu_options = gpu_device_options(inventory)
+        # CPU is an explicit choice, not "the absence of a GPU choice".
+        mode = st.radio(
+            COMPUTE_LABEL,
+            list(COMPUTE_MODES),
+            index=0,
+            horizontal=True,
+            label_visibility="collapsed",
+            key=f"agent_compute_mode_{selected_key}_{int(bool(smoke))}",
         )
+        if mode == "GPU" and not gpu_options:
+            st.warning(
+                "No CUDA device was enumerated on this machine, so GPU mode is "
+                "unavailable. Runs will use the CPU."
+            )
+            mode = "CPU"
+
+        chosen_gpus: list[str] = []
+        if mode == "GPU":
+            _render_gpu_inventory(inventory)
+            chosen_gpus = st.multiselect(
+                "GPUs to use",
+                gpu_options,
+                default=gpu_options[:1],
+                format_func=lambda name: gpu_option_label(name, inventory),
+                key=f"agent_gpu_select_{selected_key}_{int(bool(smoke))}",
+            )
+            if not chosen_gpus:
+                st.info("Select at least one GPU, or switch back to CPU.")
+
         selection = selection_from_devices(chosen_gpus)
         _store_json_state("agent_device_selection", selection)
-        st.caption(f"Selected: {describe_selection(selection)}")
+        device_label_text = describe_selection(selection)
+        st.caption(f"Selected: {device_label_text}")
 
         device_value = device_string_for_selection(selection)
         blockers = selection_blockers(str(selected_key), selection)
@@ -915,13 +1050,12 @@ def render_agent_workflow() -> None:
             if advisory:
                 st.warning(advisory)
 
-        if blockers:
+        if blockers or device_value is None:
             # The selection is left exactly as chosen — never quietly reduced
-            # to one GPU — and Run is unreachable instead. No plan is built,
-            # so the real Run button below is never rendered; this disabled
-            # one stands in its place so the reason sits next to the control.
+            # to one GPU — and Run is unreachable instead.
+            st.error(MULTI_GPU_NOTICE)
             for blocker in blockers:
-                st.error(blocker)
+                st.caption(blocker)
             capability = multi_gpu_capability(str(selected_key))
             st.caption(
                 "supports_multi_gpu: "
@@ -944,15 +1078,20 @@ def render_agent_workflow() -> None:
                 workflow_context=context,
                 device=device,
                 seed=seed,
-                workspace=workspace_for_request(
-                    str(context.get("dataset")),
-                    str(selected_key),
-                    smoke,
-                    project_root=st.session_state.get("project_root"),
+                workspace=agent_workspace(
+                    project, str(context.get("dataset")), str(selected_key), smoke=smoke
                 ),
                 epochs=smoke_epochs_value(smoke),
             )
             _store_json_state("agent_execution_plan", plan)
+            run_context = build_run_context(
+                project=project,
+                plan=plan,
+                device_label=device_label_text,
+                seed=seed,
+                smoke=smoke,
+            )
+            _store_json_state("agent_run_context", run_context)
             if run_is_enabled(plan):
                 # Keyed on the plan's subject, not on the device or the smoke
                 # box, so fiddling with those does not toast (ui/feedback.py).
@@ -962,6 +1101,7 @@ def render_agent_workflow() -> None:
                     event_key=EVENT_PLAN_READY,
                     signature=plan_signature(plan),
                 )
+            _render_run_context(run_context, title="Run context")
             _render_plan(plan, device=device, seed=seed)
 
     if not options:
@@ -1050,30 +1190,42 @@ def render_agent_workflow() -> None:
         )
 
     if isinstance(result_context, dict):
+        # The provenance the page showed before the run, preserved with the
+        # result so "where did this come from" has one answer either side.
+        _render_run_context(
+            st.session_state.get("agent_run_context"), title="Run provenance"
+        )
         _render_result(result_context)
-        explain_disabled = not is_llm_configured()
-        if explain_disabled:
-            st.caption("Configure the optional LLM assistant to enable result explanation.")
+
+        # Always clickable. When the assistant is not configured the click
+        # opens the configuration form instead of doing nothing.
         if st.button(
-            "Explain computed result",
-            disabled=explain_disabled,
+            EXPLAIN_BUTTON_LABEL,
             use_container_width=True,
             key="agent_explain_result",
         ):
-            try:
-                parsed = explain_run_result(
-                    result_context,
-                    base_url=st.session_state["llm_base_url"],
-                    api_key=st.session_state["llm_api_key"],
-                    model=st.session_state["llm_model"],
-                )
-                st.session_state["agent_explanation"] = explanation_text(parsed)
-                st.session_state["agent_explanation_serial"] = (
-                    int(st.session_state.get("agent_explanation_serial", 0)) + 1
-                )
-            except Exception as exc:
-                st.session_state["agent_explanation"] = f"LLM explanation failed: {exc}"
-            st.rerun()
+            if is_llm_configured():
+                _explain_result(result_context)
+                st.rerun()
+            else:
+                request_llm_configuration("explain")
+                st.rerun()
+
+        if llm_configuration_requested():
+            action = render_llm_configuration_prompt()
+            if action == "cancel":
+                clear_llm_configuration_request()
+                st.rerun()
+            elif action == "save":
+                clear_llm_configuration_request()
+                st.rerun()
+            elif action == "save_and_run":
+                wanted = pending_action()
+                clear_llm_configuration_request()
+                # Only an explicit "Save & explain" sends anything anywhere.
+                if wanted == "explain" and is_llm_configured():
+                    _explain_result(result_context)
+                st.rerun()
 
     if st.session_state.get("agent_explanation") and isinstance(context, dict):
         explanation_serial = st.session_state.get("agent_explanation_serial")

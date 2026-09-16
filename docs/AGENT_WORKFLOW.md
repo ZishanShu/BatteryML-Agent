@@ -51,6 +51,11 @@ them holding:
 | `batteryml_web/agent/run_policy.py` | what a smoke run is; what a failure means | choose a device for you |
 | `batteryml_web/core/device_inventory.py` | the machine's real GPUs | assume a GPU count |
 | `batteryml_web/agent/results.py` | metrics, from the saved `scores` only | recompute a metric |
+| `batteryml_web/core/project_context.py` | which project a run belongs to, and its workspace under `runs/web_projects/` | let a run escape `runs/`, or silently fall back to the default project |
+| `batteryml_web/agent/provenance.py` | the run's own account of itself, read from the plan's argv | invent a field the plan does not carry |
+| `batteryml_web/agent/progress_estimate.py` | an ETA, once the run has earned one | assume a rate, or guess before two intervals are timed |
+| `batteryml_web/ui/formatting.py` | metrics at reading scale | change the stored value |
+| `batteryml_web/ui/settings_panel.py` | the LLM settings form, in the sidebar and wherever it is needed | display, log or persist the API key |
 | `batteryml_web/ui/agent_workflow.py` | rendering all of the above | any of the above |
 
 ## Two entry points
@@ -226,7 +231,7 @@ Check by hand, and report what you see:
 
 | # | Check |
 | --- | --- |
-| A | Home shows Quick Start **and** an Agent Workflow box at the same level; the `🤖 Agent Workflow` heading renders as a heading, with no anchor icon, `[svg]` or stray markup |
+| A | Home shows Quick Start **and** an Agent Workflow box at the same level; the `Agent Workflow` heading renders as a heading, with no anchor icon, `[svg]` or stray markup (see J: no emoji) |
 | B | "Use CPTransformer on MATR to predict battery lifetime." → MATR / RUL prediction, CPTransformer selectable, PBT listed as blocked, Run is the only way to start |
 | C | "Recommend a model to predict battery lifetime on MATR." → only READY models are recommended |
 | D | "帮我用 MATR 做电池寿命预测" → MATR + RUL prediction (this one works with no API key) |
@@ -238,7 +243,37 @@ Check by hand, and report what you see:
 | J | The Agent Workflow entry reads exactly `Agent Workflow` on Home, in the sidebar, as the page heading and on the navigation button — no emoji, no caret — and the sidebar carries no "Intelligent entry point" copy |
 | K | The request area has **Describe request** and **Examples** tabs; clicking an example fills the box and does nothing else |
 | L | The Streamlit toolbar offers no "Clear cache" or developer entries (`.streamlit/config.toml`, `toolbarMode = "viewer"`) — this is the one item only the running app can confirm |
-| M | Ticking two or more GPUs leaves the selection as chosen, shows "This model/runtime does not yet support multi-GPU execution.", and renders Run disabled; ticking one GPU still runs |
+| M | Ticking two or more GPUs leaves the selection as chosen, shows "True multi-GPU execution is not yet supported for this model/runtime.", and renders Run disabled; ticking one GPU still runs |
+
+Runtime context, provenance and settings (the `RUN` group). These twenty are
+the acceptance list for that milestone; every one of them needs the running
+app, so none can be established from the authoring environment:
+
+| # | Check |
+| --- | --- |
+| N | **Compute device** is an explicit CPU/GPU control, visible before any GPU interaction, opening on CPU |
+| O | In CPU mode there is no GPU control on the page at all, and a run starts with `--device cpu` |
+| P | Switching to GPU reveals exactly as many options as the machine has GPUs — count them against `nvidia-smi -L` |
+| Q | Each GPU option reads `GPU <i> · <name> · <free> free · <util>% util` with the driver's own figures; a figure the driver did not report is absent, not zero |
+| R | On a machine with no readable `nvidia-smi`, GPU mode offers at most the single manual `cuda:0` override, shows the enumeration error, and warns that its availability is unknown |
+| S | Ticking one GPU sends `--device cuda:<i>` — the index you ticked, not always `0` |
+| T | Ticking two GPUs keeps both ticked, disables Run with the multi-GPU message, and no `cuda:0,1` string appears anywhere, including the plan's command |
+| U | Create a project: the toast reads `Project "<name>" created and loaded`, exactly once, and the sidebar then shows that project under **Current project** |
+| V | Load a different project: the toast reads `Project "<name>" loaded`, once, and the previous run's plan and result are cleared rather than shown under the new project |
+| W | With project `alpha` loaded, the Run directory reads `runs/web_projects/alpha/agent_<dataset>_<model>`; load `beta` and it changes to `beta` |
+| X | The run context (Project, Run directory, Dataset, Task, Model, Config, Seed, Epochs, Device) is shown **before** you press Run |
+| Y | After the run finishes, the same nine fields are shown with the same values — compare them line by line against what you saw in X |
+| Z | Paths in the run context are repo-relative; "Exact paths" expands to the absolute form actually on disk |
+| AA | Confirm the run directory in the provenance block is the directory that actually appeared on the filesystem |
+| AB | Metrics are readable at a glance — no oversized or clipped digits — and the exact stored value is visible beside each compact one |
+| AC | MAPE's percent form matches the stored ratio ×100; the stored ratio is still what `metrics.csv` carries |
+| AD | During training, the progress line says `estimating…` until at least two epochs have been timed, then shows an ETA that tracks the observed rate. A run with no counter shows a stage and an elapsed clock and no bar |
+| AE | Settings are in the left sidebar; the top chrome is reduced but the sidebar still opens and closes normally |
+| AF | With no assistant configured, **Explain computed result** is clickable and opens the LLM configuration form (Cancel / Save settings / Save & explain); nothing is sent before you save |
+| AG | The API key field is masked, and the key appears nowhere on the page, in any toast, in the debug expander, or in any file under `runs/` — grep for it to be sure |
+
+**True multi-GPU execution is still not implemented.** T checks that the
+platform says so rather than attempting one.
 
 ### 6. If a GPU run OOMs
 

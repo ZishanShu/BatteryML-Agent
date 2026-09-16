@@ -83,6 +83,34 @@ if "last_run_time" not in st.session_state:
 ensure_llm_state_defaults()
 refresh_llm_status_from_config()
 
+# Top chrome. Streamlit reserves a tall header band above the app; on a
+# laptop that is most of the first screen before any content appears. This
+# trims the block container's top padding and collapses the empty header,
+# using Streamlit's stable data-testid selectors rather than generated class
+# names.
+#
+# Scope and dependency, deliberately narrow:
+#   * stAppViewBlockContainer / stAppViewContainer — padding only;
+#   * stHeader — height only, and only because .streamlit/config.toml already
+#     sets client.toolbarMode = "viewer", so the band holds nothing a user
+#     needs. The sidebar toggle lives in stSidebar and is untouched.
+# Nothing is hidden by display:none, so errors, toasts, status widgets and
+# the sidebar control all remain reachable, including on small screens.
+st.markdown(
+    """
+<style>
+[data-testid="stAppViewBlockContainer"] {
+    padding-top: 1.5rem;
+}
+[data-testid="stHeader"] {
+    height: 2.25rem;
+    background: transparent;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
 st.markdown(
     """
 <style>
@@ -361,12 +389,18 @@ def _render_project_created_notice() -> None:
     notice = st.session_state.get("project_created_notice")
     if not isinstance(notice, dict):
         return
-    notify_success(
-        f"Project '{notice.get('name')}' created",
-        event_key=EVENT_PROJECT_CREATED,
-        signature=notice.get("workspace"),
+    action = str(notice.get("action") or "created")
+    message = (
+        f'Project "{notice.get("name")}" created and loaded'
+        if action == "created"
+        else f'Project "{notice.get("name")}" loaded'
     )
-    st.caption("Created project")
+    notify_success(
+        message,
+        event_key=EVENT_PROJECT_CREATED,
+        signature=[action, notice.get("workspace")],
+    )
+    st.caption("Current project")
     st.write(f"**Project:** {notice.get('name')}")
     st.write("**Workspace:**")
     st.code(str(notice.get("workspace")), language="text")
@@ -472,6 +506,7 @@ def render_home_page():
             st.session_state["project_created_notice"] = {
                 "name": created.name,
                 "workspace": created.as_posix(),
+                "action": "created",
             }
             st.rerun()
         _render_project_created_notice()
@@ -488,7 +523,21 @@ def render_home_page():
                 st.session_state["project_root"] = str(folder)
                 st.session_state["project_name"] = selected
                 st.session_state["current_project"] = selected
-                st.session_state.pop("project_created_notice", None)
+                st.session_state["project_created_notice"] = {
+                    "name": selected,
+                    "workspace": folder.as_posix(),
+                    "action": "loaded",
+                }
+                # A different project means a different run workspace; any
+                # plan or result still on the page belongs to the old one.
+                for key in (
+                    "agent_execution_plan",
+                    "agent_execution_result",
+                    "agent_result_context",
+                    "agent_run_context",
+                    "agent_run_signature",
+                ):
+                    st.session_state.pop(key, None)
                 st.rerun()
         else:
             st.info("No existing project found yet.")
