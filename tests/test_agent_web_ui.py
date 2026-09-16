@@ -1080,13 +1080,22 @@ class TestBatLiNetSmokeRender(unittest.TestCase):
             "dry_run": False,
         }
         fake = _render(session)
+        # The plain answer is the error line; the detail and the suggested
+        # actions follow it. Asserted across everything the page rendered,
+        # so the layout can change without the substance being lost.
         errors = " ".join(fake.rec["errors"])
-        self.assertIn("CUDA out of memory on cuda:0", errors)
-        actions = " ".join(fake.rec["writes"])
-        self.assertIn("CPU", actions)
-        self.assertIn("cuda:1", actions)  # only the GPU with more free memory
-        self.assertIn("never moves a failed run", actions)
-        # The raw traceback is still displayed verbatim.
+        self.assertIn("GPU memory", errors)
+        visible = " ".join(
+            fake.rec["errors"] + fake.rec["writes"] + fake.rec["markdown"]
+            + fake.rec["captions"]
+        )
+        self.assertIn("CUDA out of memory on cuda:0", visible)
+        self.assertIn("CPU", visible)
+        self.assertIn("cuda:1", visible)  # only the GPU with more free memory
+        self.assertIn("never moves a failed run", visible)
+        # ...and the page says outright that nothing was retried or swapped.
+        self.assertIn("Nothing was retried", visible)
+        # The raw traceback is still displayed verbatim, behind the details.
         self.assertTrue(any("OutOfMemoryError" in w for w in fake.rec["writes"]))
         # No metrics for a failed run.
         self.assertFalse(any(label in {"RMSE", "MAE", "MAPE"} for label, _ in fake.rec["metrics"]))

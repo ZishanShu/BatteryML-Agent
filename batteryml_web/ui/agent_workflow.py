@@ -62,7 +62,6 @@ from ..agent.run_policy import (
     MULTI_GPU_UNSUPPORTED_MESSAGE,
     SMOKE_EPOCHS,
     SMOKE_NOTICE,
-    classify_execution_failure,
     execution_blockers,
     gpu_memory_advisory,
     multi_gpu_capability,
@@ -94,6 +93,13 @@ from ..core.device_inventory import (
     inventory_rows,
     query_gpu_inventory,
     selection_from_devices,
+)
+from ..agent.failure_taxonomy import (
+    CATEGORY_NONE,
+    classify_llm_failure,
+    classify_run_failure,
+    explanation_failure_is_not_a_run_failure,
+    redact,
 )
 from ..core import run_manifest as rm
 from ..core.run_manifest import write_manifest
@@ -698,19 +704,33 @@ def _render_execution_status(
     st.write(f"**Success:** {bool(result.get('success'))}")
     st.write(f"**Return code:** {result.get('returncode', 'N/A')}")
 
-    diagnosis = classify_execution_failure(
-        result, device=device, inventory=inventory, smoke=smoke
+    finding = classify_run_failure(
+        result,
+        device=device,
+        inventory=inventory,
+        smoke=smoke,
+        status=str(st.session_state.get("last_run_status", "")).upper() or None,
     )
-    if diagnosis["kind"] != "none":
-        st.error(diagnosis["headline"])
-        for action in diagnosis["actions"]:
-            st.write(f"- {action}")
-        if diagnosis["evidence_line"]:
-            st.caption(f"From the run's own output: {diagnosis['evidence_line']}")
+    if finding["category"] != CATEGORY_NONE:
+        # What happened, in one line, and what the user can do — before any
+        # traceback. The details stay one click away, never removed.
+        st.error(f"Run failed — {finding['short_title']}")
+        if finding["user_message"]:
+            st.write(finding["user_message"])
+        if finding["recommended_action"]:
+            st.markdown("**Suggested action:**")
+            st.markdown(finding["recommended_action"])
+        if finding["evidence_line"]:
+            st.caption(f"From the run's own output: {finding['evidence_line']}")
+        # Stated explicitly, because "did it silently try something else?" is
+        # the first question a scientist asks about a failed run.
+        st.caption(
+            "Nothing was retried and no device was changed on your behalf."
+        )
     elif result.get("error"):
-        st.error(str(result["error"]))
+        st.error(redact(str(result["error"])))
 
-    with st.expander("Execution debug output", expanded=False):
+    with st.expander("Show technical details", expanded=False):
         command = result.get("command")
         if command:
             st.caption("Exact argv executed (built by the backend planner):")
@@ -733,14 +753,20 @@ def _explain_result(result_context: dict[str, Any]) -> None:
             api_key=st.session_state["llm_api_key"],
             model=st.session_state["llm_model"],
         )
+        st.session_state.pop("agent_explanation_failure", None)
         st.session_state["agent_explanation"] = explanation_text(parsed)
         st.session_state["agent_explanation_serial"] = (
             int(st.session_state.get("agent_explanation_serial", 0)) + 1
         )
-    except Exception as exc:
-        # The message may quote the endpoint; it never quotes the API key,
-        # which this module does not read into any string.
-        st.session_state["agent_explanation"] = f"LLM explanation failed: {exc}"
+    except Exception as exc:  # noqa: BLE001 - reported, never escalated
+        # An explanation is optional. Failing to produce one says nothing
+        # about the run: the metrics came from BatteryML's own saved scores
+        # and are untouched, and the run's status is not changed here.
+        finding = classify_llm_failure(
+            exc, configured=is_llm_configured()
+        )
+        st.session_state["agent_explanation_failure"] = finding
+        st.session_state.pop("agent_explanation", None)
 
 
 def _render_result(result_context: dict[str, Any]) -> None:
@@ -829,9 +855,15 @@ def _analyze_request(trimmed: str) -> None:
         "agent_execution_result",
         "agent_result_context",
         "agent_explanation",
+        "agent_explanation_failure",
         "agent_run_signature",
         "agent_model_request",
         "agent_suggestions",
+        # C5: a new request must not leave the previous run's identity or
+        # provenance on screen beside a fresh selection.
+        "agent_run_context",
+        PENDING_RUN_ID_KEY,
+        "agent_pending_run_subject",
     ):
         st.session_state.pop(key, None)
     if st.session_state.get("agent_model_choice") is not None:
@@ -1562,6 +1594,22 @@ def render_agent_workflow() -> None:
                 st.rerun()
             # "connect_failed" leaves the form open with its error showing,
             # so the endpoint can be corrected without reopening anything.
+
+    explanation_failure = st.session_state.get("agent_explanation_failure")
+    if isinstance(explanation_failure, dict) and isinstance(context, dict):
+        # Shown beside the result, never instead of it: the metrics above came
+        # from BatteryML's own saved scores and are unaffected by the
+        # assistant being unreachable.
+        st.warning(
+            f"{explanation_failure.get('short_title')} "
+            f"{explanation_failure.get('user_message')}"
+        )
+        if explanation_failure.get("recommended_action"):
+            st.caption(str(explanation_failure["recommended_action"]))
+        st.caption(
+            "The computed result above is unaffected: it comes from the run's "
+            "own saved scores, not from the assistant."
+        )
 
     if st.session_state.get("agent_explanation") and isinstance(context, dict):
         explanation_serial = st.session_state.get("agent_explanation_serial")

@@ -278,6 +278,28 @@ app, so none can be established from the authoring environment:
 | AL | Pressing Tab in the request box moves focus and does **not** fill it — the suggestion is accepted only by `Use suggestion` (docs/STREAMLIT_KEYBOARD_AUDIT.md says why) |
 | AM | Type into the request box while `Use suggestion` is still visible, then click it: your text must survive |
 
+Run lifecycle, results and recovery. These need the real server and a real
+run; none may be marked VERIFIED from unit tests.
+
+| # | Check |
+| --- | --- |
+| AN | Start a 1-epoch BatLiNet CPU smoke run; the page stays responsive and shows a Run ID before it starts |
+| AO | While it runs, the stage, counter, elapsed clock and (once earned) the ETA update without you touching the page |
+| AP | Start another suitable run and press **Cancel run**; confirm with `ps` that the training process is really gone |
+| AQ | The cancelled run shows "Cancelled by user" and **no metrics** |
+| AR | Refresh the browser; both runs are still in Run History with their real statuses |
+| AS | Run the same model twice; the two runs have different Run IDs and different run directories |
+| AT | Switch project and confirm the history and the run directories are isolated |
+| AU | Open an older completed run from history; its result appears without re-running it |
+| AV | A completed RUL run shows observed-vs-predicted and residuals, if its artifact carries observed labels |
+| AW | Spot-check three rows of the prediction table against the saved artifact |
+| AX | Download the run bundle; confirm it contains the manifest, metrics, environment and logs |
+| AY | Grep the bundle for your API key and for `data/raw` — neither may appear |
+| AZ | Set a wrong LLM key and press Connect: an actionable error, and the computed workflow still works |
+| BA | With the LLM unreachable, a request still resolves deterministically and says assistance was unavailable |
+| BB | Force a CUDA OOM: a clear message, a suggested action, no retry and no device switch |
+| BC | Restart Streamlit: completed history is still visible, and any run that was active is INTERRUPTED, not COMPLETED |
+
 **True multi-GPU execution is still not implemented.** T checks that the
 platform says so rather than attempting one.
 
