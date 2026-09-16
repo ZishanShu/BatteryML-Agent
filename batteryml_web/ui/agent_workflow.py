@@ -1170,6 +1170,42 @@ def _progress_timer(run_id: str) -> EpochTimer:
     return timers[run_id]
 
 
+def _render_result_figures(result_context: dict[str, Any] | None) -> None:
+    """Observed-vs-predicted, residuals and the prediction table.
+
+    Only for a successful run, and only from the predictions artifact the
+    backend result context names — the same file the canonical metrics came
+    from. Nothing here recomputes a metric; a run whose artifact lacks
+    observed labels gets the stated reason instead of a figure.
+    """
+    if not isinstance(result_context, dict) or result_context.get("success") is not True:
+        return
+    predictions_file = result_context.get("predictions_file")
+    if not predictions_file:
+        return
+    from ..agent.result_views import RUL_SCHEMA, TRAJECTORY_SCHEMA, load_view
+    from .run_history import (
+        render_prediction_table,
+        render_rul_figures,
+        render_trajectory_figure,
+    )
+
+    try:
+        views = load_view(str(predictions_file))
+    except Exception as exc:  # noqa: BLE001 - a figure must not break a result
+        st.warning(
+            f"The predictions artifact could not be read "
+            f"({type(exc).__name__}: {exc}); no figure is drawn from it. The "
+            "metrics above are unaffected."
+        )
+        return
+    if views["schema"] == RUL_SCHEMA:
+        render_rul_figures(views["rul"])
+        render_prediction_table(views["rul"])
+    elif views["schema"] == TRAJECTORY_SCHEMA:
+        render_trajectory_figure(views["trajectory"])
+
+
 def render_agent_workflow() -> None:
     """Analyze -> select -> plan -> explicit Run -> structured result -> explain."""
     st.header("Agent Workflow", anchor=False)
@@ -1497,6 +1533,9 @@ def render_agent_workflow() -> None:
             st.session_state.get("agent_run_context"), title="Run provenance"
         )
         _render_result(result_context)
+        # The scientific views for the run that just finished, from its own
+        # saved artifact and through the same reader the history view uses.
+        _render_result_figures(result_context)
 
         # Always clickable. When the assistant is not configured the click
         # opens the configuration form instead of doing nothing.
