@@ -124,7 +124,7 @@ each route is offered, not what either one does.
 | `UI-04` | The sidebar shows the Agent Workflow as an alternative intelligent entry point in its own block, not as a numbered step of the protocol workflow. The manual route stays numbered 1–3 and remains fully usable with no LLM. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/workflow_sidebar.py` |
 | `UI-05` | Creating a project confirms what was created — the project name and its workspace, drawn from the directory that was actually created — and the confirmation itself is transient (see `UI-09`). Project filesystem semantics are unchanged. | `IMPLEMENTED-STATIC` | `batteryml_web/app.py` (`_ensure_project`, `_render_project_created_notice`) |
 | `UI-06` | The Agent Workflow entry is written exactly `Agent Workflow` wherever it appears — Home, sidebar, page heading, navigation buttons. No emoji, no caret, no numbering, and no copy explaining that it is an alternative route: one destination, one name. Quick Start and Agent Workflow remain equal primary Home entries. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/workflow_sidebar.py` (`nav_label`), `batteryml_web/app.py`, `batteryml_web/ui/agent_workflow.py` |
-| `UI-07` | The request is supplied through two tabs: **Describe request** (free text) and **Examples** (clickable). Examples are built from the backend catalog and, where readiness is known, name a model that is actually runnable — no model name is written into the UI. Clicking one fills the request field and reruns; it never analyses and never executes. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/catalog.py` (`build_example_requests`), `batteryml_web/ui/agent_workflow.py` (`_render_examples`) |
+| `UI-07` | The request is supplied through **one** control: a single text area, no tabs and no example gallery. While it is empty it shows one suggestion as grey placeholder text, derived from the backend catalog and — where readiness is known — naming a model that is actually runnable; no model or dataset name is written into the UI. Superseded in part by `RUN-13`, which governs accepting that suggestion. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/catalog.py` (`build_request_suggestion`), `batteryml_web/ui/agent_workflow.py` (`request_suggestion`) |
 | `UI-08` | The Streamlit developer toolbar is not offered to end users: `client.toolbarMode = "viewer"` in `.streamlit/config.toml`. Configured, not scripted — no JavaScript intercepts keystrokes. | `IMPLEMENTED-STATIC` | `.streamlit/config.toml` |
 | `UI-09` | Success is transient and failure is persistent. An ordinary successful action reports through one `st.toast`, emitted once per occurrence; Streamlit reruns do not repeat it, and a signature keyed on the action's *subject* keeps a device or checkbox change from toasting. Failures stay on the page as `st.error` / `st.warning`, and a failure is never rendered in a success box. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/feedback.py` |
 
@@ -235,6 +235,9 @@ that made the LLM route look broken rather than optional.
 | `RUN-08` | "Explain computed result" is always clickable. With no assistant configured it opens the LLM configuration form (Cancel / Save settings / Save & explain) instead of dead-ending; it never calls anything before the user saves. Both entry points — sidebar and prompt — read and write the one existing credential store, so there is no second settings system. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/settings_panel.py`, `batteryml_web/ui/llm_state.py`, `batteryml_web/ui/agent_workflow.py` (`_explain_result`) |
 | `RUN-09` | The API key is entered masked (`type="password"`), is reduced to a boolean anywhere the page may describe the settings, and is never written to a caption, toast, log, debug view or repository file. It is held in session state for the session only — the mechanism the app already used — and this milestone adds no new persistence. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/settings_panel.py` (`llm_settings_summary`, `render_llm_settings_form`) |
 | `RUN-10` | Creating or loading a project confirms which project is now current — `Project "<name>" created and loaded` / `Project "<name>" loaded` — once, transiently (see `UI-09`), and the current project stays visible in the sidebar for the rest of the session. Loading a project clears the previous project's plan, result and run context rather than leaving them attributed to the new one. | `IMPLEMENTED-STATIC` | `batteryml_web/app.py`, `batteryml_web/ui/workflow_sidebar.py` (`current_project_label`) |
+| `RUN-11` | The LLM settings form offers **Save** and **Connect**, in that order, wherever settings are edited — the sidebar and the prompt opened from "Explain computed result" alike. There is no primary Cancel / Save settings pair. Save stores the entered values through the existing credential store and makes no network call. Connect stores the same values through the same function and then runs the connection test; success sets status Connected and reports transiently, failure leaves an actionable persistent error. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/settings_panel.py` (`render_llm_settings_form`, `SAVE_LABEL`, `CONNECT_LABEL`) |
+| `RUN-12` | There is one connection implementation. Connect calls `agent.llm_client.test_llm_connection` — the platform's existing test — and no page opens a socket, builds a request or parses a response of its own. The API key is password-masked, reduced to a boolean wherever the settings are described, and never appears in a caption, toast, log, error message or toast signature. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/settings_panel.py` (`connect_llm`, `llm_settings_signature`), `batteryml_web/app.py` (`render_inline_llm_settings`) |
+| `RUN-13` | Accepting the request suggestion fills the box and nothing else: it writes the one canonical request key (`agent_original_request`) and the box's own widget key, and does not analyse, call the LLM, build a plan or execute. Analyze stays a separate explicit action. Acceptance is refused whenever the field already holds text, re-checked at the moment it is applied. **Tab is not intercepted** — see `docs/STREAMLIT_KEYBOARD_AUDIT.md` — and the page never claims that it is. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/agent_workflow.py` (`accept_suggestion`, `ACCEPT_SUGGESTION_KEY`), `docs/STREAMLIT_KEYBOARD_AUDIT.md` |
 
 The check that establishes this group is `RUN-01`
 (`scripts/verify/check_run_context.py`); the tests are
@@ -251,9 +254,22 @@ selection is still preserved as `{"mode": "multi_gpu", "gpu_ids": [...]}`,
 still produces no device string, and still disables Run — see `GPU-05`…
 `GPU-07`. **True multi-GPU execution remains unimplemented.**
 
-Nothing in this group may be marked `VERIFIED` from the authoring
-environment: every row about what the *page* does needs a rendered Streamlit
-app, which has never run here.
+`RUN-13` is the one requirement in this document that records a capability
+the platform deliberately does **not** have. Tab-key acceptance was specified
+and was not built, because no stable API in the installed Streamlit supports
+it; `docs/STREAMLIT_KEYBOARD_AUDIT.md` carries the evidence and the three
+conditions that would unblock it. A visible accept control is the documented
+substitute, never a silent one.
+
+Most rows in this group still need a rendered app before they can be marked
+`VERIFIED`. `RUN-11`, `RUN-13` and the `UI-07` request area are the
+exception: they were exercised in a headless Chromium against the running
+app during development — no tabs rendered; one text area carrying the derived
+suggestion as its placeholder; Tab moving focus without filling; the accept
+control filling the box and then disappearing; typed text surviving a click
+on it; Save and Connect present with one masked field. Those observations
+were made in the authoring container, not on the server, so the rows stay
+`IMPLEMENTED-STATIC` until the user reproduces them there.
 
 ---
 

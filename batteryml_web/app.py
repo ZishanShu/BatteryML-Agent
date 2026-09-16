@@ -12,7 +12,7 @@ import pandas as pd
 import streamlit as st
 import torch
 
-from batteryml_web.agent.llm_client import run_llm_prompt, save_llm_output, test_llm_connection
+from batteryml_web.agent.llm_client import run_llm_prompt, save_llm_output
 from batteryml_web.ui.agent_workflow import render_agent_workflow
 from batteryml_web.core.custom_uploads import (
     ALLOWED_CUSTOM_SOURCE_FORMATS,
@@ -34,6 +34,7 @@ from batteryml_web.ui.feedback import (
     toast,
 )
 from batteryml_web.ui.llm_state import ensure_llm_state_defaults, get_llm_status, is_llm_configured, refresh_llm_status_from_config, set_llm_settings
+from batteryml_web.ui.settings_panel import render_llm_settings_form
 from batteryml_web.ui.progress_utils import get_safe_runtime_env, run_command_with_progress
 from batteryml_web.ui.workflow_sidebar import NAV_STEPS, get_current_step_index, render_sidebar_workflow, set_current_step
 from batteryml_web.core.readiness import assess_dataset
@@ -1176,39 +1177,23 @@ def _safe_read_log_tail(log_path: Path, lines: int = 80) -> str:
 
 
 def render_inline_llm_settings(location_key: str, expanded: bool = False):
+    """The LLM settings, wherever a page offers them inline.
+
+    One form, one credential store: this delegates to
+    :func:`batteryml_web.ui.settings_panel.render_llm_settings_form`, which is
+    the same form the sidebar and the Explain prompt show. It used to carry
+    its own copy of the fields and its own Save/Test handling — and that copy
+    had a real defect: ``test_llm_connection`` *returns* ``(ok, message)`` and
+    does not raise, so its ``except Exception`` never fired and a failed test
+    was reported as "connected". Delegating removes the second
+    implementation and the defect with it.
+    """
     with st.expander("Optional LLM Assistant settings", expanded=expanded):
         st.caption(
-            "LLM assistant is optional. Without an LLM endpoint, the platform still runs the deterministic BatteryML workflow."
+            "LLM assistant is optional. Without an LLM endpoint, the platform "
+            "still runs the deterministic BatteryML workflow."
         )
-        base_url = st.text_input("Base URL", value=st.session_state.get("llm_base_url", ""), key=f"{location_key}_llm_base_url_input")
-        api_key = st.text_input("API key", value=st.session_state.get("llm_api_key", ""), type="password", key=f"{location_key}_llm_api_key_input")
-        model = st.text_input("Model", value=st.session_state.get("llm_model", ""), key=f"{location_key}_llm_model_input")
-        save_clicked = st.button("Save LLM settings", key=f"{location_key}_save_llm_settings", use_container_width=True)
-        test_clicked = st.button("Test connection", key=f"{location_key}_test_llm_connection", use_container_width=True)
-        if save_clicked or test_clicked:
-            st.session_state["llm_base_url"] = base_url.strip()
-            st.session_state["llm_api_key"] = api_key.strip()
-            st.session_state["llm_model"] = model.strip()
-            refresh_llm_status_from_config()
-            if not is_llm_configured():
-                st.session_state["llm_status"] = "not_configured"
-                st.session_state["llm_status_message"] = "Missing Base URL, API key, or model."
-                st.warning(st.session_state["llm_status_message"])
-            elif save_clicked and not test_clicked:
-                st.session_state["llm_status"] = "configured"
-                st.session_state["llm_status_message"] = "LLM settings saved. Connection not tested yet."
-                st.success(st.session_state["llm_status_message"])
-            elif test_clicked:
-                try:
-                    test_llm_connection(base_url=st.session_state["llm_base_url"], api_key=st.session_state["llm_api_key"], model=st.session_state["llm_model"])
-                    st.session_state["llm_status"] = "connected"
-                    st.session_state["llm_status_message"] = "LLM connection verified."
-                    st.success(st.session_state["llm_status_message"])
-                except Exception as exc:
-                    st.session_state["llm_status"] = "failed"
-                    st.session_state["llm_status_message"] = f"LLM connection failed: {exc}"
-                    st.error(st.session_state["llm_status_message"])
-            st.rerun()
+        render_llm_settings_form(key_prefix=location_key)
         st.caption(f"Status: {get_llm_status().replace('_', ' ').title()}")
 
 

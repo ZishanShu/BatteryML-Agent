@@ -94,15 +94,62 @@ class _ExpanderCtx:
         return False
 
 
+def _code_without_prose(module) -> str:
+    """A module's code with docstrings and comments dropped.
+
+    Static scans in this file assert what the code *does*. A docstring or a
+    ``#`` comment that quotes an old label, an example metric or a GPU name
+    while explaining why it is gone is documentation, and reading it as
+    behaviour makes a test that punishes the codebase for being explained.
+    """
+    import ast
+
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            body = getattr(node, "body", [])
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                node.body = body[1:] or [ast.Pass()]
+    # ast.unparse drops ``#`` comments as a side effect of re-rendering
+    # from the tree, which is the other half of what this needs.
+    return ast.unparse(tree)
+
+
 class _Col:
-    def __init__(self, rec: dict):
-        self._rec = rec
+    """Stand-in for one st.columns() cell.
+
+    It holds the fake itself, not just its recorder, because a widget in a
+    column is a widget: a button here must honour the same clicked set as one
+    rendered at top level, or a two-button row (Save / Connect) could never
+    be exercised.
+    """
+
+    def __init__(self, fake: "FakeStreamlit"):
+        self._fake = fake
+        self._rec = fake.rec
 
     def metric(self, label, value, **kwargs):
         self._rec["metrics"].append((str(label), str(value)))
 
     def caption(self, text, **kwargs):
         self._rec["captions"].append(str(text))
+
+    def button(self, label, **kwargs):
+        return self._fake.button(label, **kwargs)
+
+    def markdown(self, text, **kwargs):
+        self._rec["markdown"].append(str(text))
+
+    def write(self, *args, **kwargs):
+        self._fake.write(*args, **kwargs)
 
 
 class _Slot:
@@ -167,6 +214,7 @@ class FakeStreamlit:
             "headings": [],
             "radios": [],
             "text_inputs": [],
+            "text_areas": [],
             "dialogs": [],
         }
         self.in_expander = False
@@ -209,10 +257,22 @@ class FakeStreamlit:
 
     def columns(self, spec, **kwargs):
         count = spec if isinstance(spec, int) else len(spec)
-        return [_Col(self.rec) for _ in range(count)]
+        return [_Col(self) for _ in range(count)]
 
     # --- widgets -------------------------------------------------------
     def text_area(self, label, value="", **kwargs):
+        # The placeholder is recorded because the request suggestion *is*
+        # the placeholder: grey, and not the user's request until accepted.
+        self.rec["text_areas"].append(
+            {
+                "label": str(label),
+                "value": str(value or ""),
+                "placeholder": str(kwargs.get("placeholder", "")),
+            }
+        )
+        key = kwargs.get("key")
+        if key is not None and str(key) in self.session_state:
+            return str(self.session_state[str(key)] or "")
         return str(value or "")
 
     def selectbox(self, label, options, index=0, **kwargs):
@@ -230,6 +290,9 @@ class FakeStreamlit:
         self.rec["text_inputs"].append(
             {"label": str(label), "type": str(kwargs.get("type", "default"))}
         )
+        key = kwargs.get("key")
+        if key is not None and str(key) in self.session_state:
+            return str(self.session_state[str(key)] or "")
         return str(value or "")
 
     def dialog(self, title, **kwargs):
@@ -1406,13 +1469,15 @@ class TestLlmAssistedIntentInTheUi(unittest.TestCase):
         self.assertEqual(session["agent_suggestions"]["blocked"], ["PBT"])
 
 
-class TestRequestTabsAndExamples(unittest.TestCase):
-    """B: two ways to supply a request; examples fill the box and stop there."""
+class TestRequestAreaIsOneControl(unittest.TestCase):
+    """The tabs and the example gallery are gone; one suggestion remains."""
+
+    SUGGESTION = "Use CPTransformer on MATR to predict battery lifetime."
 
     def setUp(self) -> None:
         self._real_resolve = ui.resolve_workflow_intent_with_llm
         self._real_catalog = ui.build_intent_catalog
-        self._real_examples = ui.build_example_requests
+        self._real_suggestion = ui.build_request_suggestion
         self._real_stream = ui.execute_plan_streaming
         self._real_llm = ui.is_llm_configured
         self.analysed: list[str] = []
@@ -1420,74 +1485,177 @@ class TestRequestTabsAndExamples(unittest.TestCase):
 
         def stub_resolve(request, **kwargs):
             self.analysed.append(request)
-            raise AssertionError("clicking an example must not analyse")
+            raise AssertionError("accepting a suggestion must not analyse")
 
         def stub_stream(plan, **kwargs):
             self.executed.append(plan)
-            raise AssertionError("clicking an example must not execute")
+            raise AssertionError("accepting a suggestion must not execute")
 
         ui.resolve_workflow_intent_with_llm = stub_resolve
         ui.execute_plan_streaming = stub_stream
         ui.build_intent_catalog = lambda **kw: _FAKE_CATALOG
-        ui.build_example_requests = lambda catalog, **kw: list(_FAKE_EXAMPLES)
+        ui.build_request_suggestion = lambda catalog, **kw: self.SUGGESTION
         ui.is_llm_configured = lambda: False
 
     def tearDown(self) -> None:
         ui.resolve_workflow_intent_with_llm = self._real_resolve
         ui.build_intent_catalog = self._real_catalog
-        ui.build_example_requests = self._real_examples
+        ui.build_request_suggestion = self._real_suggestion
         ui.execute_plan_streaming = self._real_stream
         ui.is_llm_configured = self._real_llm
 
-    def test_the_two_tabs_are_rendered_in_order(self) -> None:
+    # --- the gallery is gone ------------------------------------------
+    def test_no_tabs_are_rendered_for_the_request(self) -> None:
         fake = _render({"gpu_inventory": _FAKE_GPU_INVENTORY})
-        self.assertIn(["Describe request", "Examples"], fake.rec["tabs"])
-        self.assertEqual(ui.REQUEST_TABS, ("Describe request", "Examples"))
+        for group in fake.rec["tabs"]:
+            self.assertNotIn("Examples", group)
+            self.assertNotIn("Describe request", group)
+        self.assertFalse(hasattr(ui, "REQUEST_TABS"))
 
-    def test_examples_are_offered_as_buttons(self) -> None:
+    def test_the_example_gallery_is_gone_from_the_source(self) -> None:
+        source = Path(ui.__file__).read_text(encoding="utf-8")
+        for gone in (
+            "REQUEST_TABS",
+            "_render_examples",
+            "build_example_requests",
+            "agent_example_requests",
+        ):
+            self.assertNotIn(gone, source, f"{gone} still present in the page")
+
+    def test_no_gallery_of_example_buttons_is_rendered(self) -> None:
         fake = _render({"gpu_inventory": _FAKE_GPU_INVENTORY})
-        labels = [button["label"] for button in fake.rec["buttons"]]
-        for example in _FAKE_EXAMPLES:
-            self.assertIn(example, labels)
+        labels = [b["label"] for b in fake.rec["buttons"]]
+        # Exactly one suggestion affordance, not a list of requests.
+        self.assertEqual(labels.count(ui.USE_SUGGESTION_LABEL), 1)
+        for label in labels:
+            self.assertNotIn("帮我用", label)
 
-    def test_clicking_an_example_fills_the_box_and_does_nothing_else(self) -> None:
-        session = {"gpu_inventory": _FAKE_GPU_INVENTORY, "agent_request_input": "stale text"}
-        chosen = _FAKE_EXAMPLES[0]
-        _render(session, clicked={chosen})
-        # Written into the same field the Describe request tab reads...
-        self.assertEqual(session["agent_original_request"], chosen)
-        # ...the stale widget value is cleared so the box shows it...
-        self.assertNotIn("agent_request_input", session)
-        # ...and nothing was analysed or executed.
-        self.assertEqual(self.analysed, [])
-        self.assertEqual(self.executed, [])
-        self.assertNotIn("agent_workflow_context", session)
+    # --- one suggestion ------------------------------------------------
+    def test_the_empty_box_shows_one_grey_suggestion(self) -> None:
+        fake = _render({"gpu_inventory": _FAKE_GPU_INVENTORY})
+        areas = [a for a in fake.rec["text_areas"] if a["label"] == ui.REQUEST_LABEL]
+        self.assertEqual(len(areas), 1)
+        # Grey, because it is the placeholder: a hint, not the request.
+        self.assertEqual(areas[0]["placeholder"], self.SUGGESTION)
+        self.assertEqual(areas[0]["value"], "")
 
-    def test_examples_are_computed_once_and_cached(self) -> None:
+    def test_the_suggestion_is_computed_once_and_cached(self) -> None:
         calls: list = []
 
         def counting(catalog, **kwargs):
             calls.append(kwargs)
-            return list(_FAKE_EXAMPLES)
+            return self.SUGGESTION
 
-        ui.build_example_requests = counting
+        ui.build_request_suggestion = counting
         session = {"gpu_inventory": _FAKE_GPU_INVENTORY}
         _render(session)
         _render(session)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(session["agent_example_requests"], list(_FAKE_EXAMPLES))
+        self.assertEqual(session["agent_request_suggestion"], self.SUGGESTION)
 
-    def test_an_empty_catalog_offers_no_example_rather_than_a_fake_one(self) -> None:
-        ui.build_example_requests = lambda catalog, **kw: []
-        fake = _render({"gpu_inventory": _FAKE_GPU_INVENTORY})
-        self.assertTrue(any("No example can be offered" in text for text in fake.rec["infos"]))
-
-    def test_no_model_name_is_written_into_the_example_ui(self) -> None:
-        """The examples come from the backend; the page names no model."""
+    def test_the_page_names_no_model_or_dataset_of_its_own(self) -> None:
         source = Path(ui.__file__).read_text(encoding="utf-8")
-        render_examples = source.split("def _render_examples")[1].split("\ndef ")[0]
+        block = source.split("def request_suggestion")[1].split("\ndef ")[0]
         for name in ("CPTransformer", "BatLiNet", "XGBoost", "PBT", "MATR"):
-            self.assertNotIn(name, render_examples)
+            self.assertNotIn(name, block)
+
+    # --- accepting it ---------------------------------------------------
+    def test_accepting_writes_the_canonical_request_state(self) -> None:
+        """Two runs, because that is how a keyed widget is re-seeded.
+
+        The click records the intent and reruns; the next run writes the
+        widget key *before* the text area is built. A browser check of the
+        first attempt — which popped the key and leaned on ``value=`` —
+        showed the box still empty, so this asserts the text really lands in
+        the widget, not only in the canonical state.
+        """
+        session = {"gpu_inventory": _FAKE_GPU_INVENTORY}
+        _render(session, clicked={ui.USE_SUGGESTION_LABEL})
+        self.assertTrue(session[ui.ACCEPT_SUGGESTION_KEY])
+
+        fake = _render(session)
+        # The same key manual typing writes — one state, not three.
+        self.assertEqual(session[ui.REQUEST_STATE_KEY], self.SUGGESTION)
+        self.assertEqual(ui.REQUEST_STATE_KEY, "agent_original_request")
+        # ...and the box itself now holds it.
+        self.assertEqual(session[ui.REQUEST_WIDGET_KEY], self.SUGGESTION)
+        areas = [a for a in fake.rec["text_areas"] if a["label"] == ui.REQUEST_LABEL]
+        self.assertEqual(areas[0]["value"], self.SUGGESTION)
+        # The one-shot flag is consumed, so a later rerun cannot re-accept
+        # over text the user has since typed.
+        self.assertNotIn(ui.ACCEPT_SUGGESTION_KEY, session)
+
+    def test_accepting_does_not_analyse_call_the_llm_or_execute(self) -> None:
+        session = {"gpu_inventory": _FAKE_GPU_INVENTORY}
+        _render(session, clicked={ui.USE_SUGGESTION_LABEL})
+        _render(session)
+        self.assertEqual(self.analysed, [])
+        self.assertEqual(self.executed, [])
+        self.assertNotIn("agent_workflow_context", session)
+        self.assertNotIn("agent_execution_plan", session)
+
+    def test_typed_text_is_never_overwritten_by_the_suggestion(self) -> None:
+        typed = "Run BatLiNet on HUST"
+        session = {
+            "gpu_inventory": _FAKE_GPU_INVENTORY,
+            ui.REQUEST_STATE_KEY: typed,
+            "agent_request_input": typed,
+        }
+        fake = _render(session, clicked={ui.USE_SUGGESTION_LABEL})
+        # The accept control is not even offered once the field has content.
+        labels = [b["label"] for b in fake.rec["buttons"]]
+        self.assertNotIn(ui.USE_SUGGESTION_LABEL, labels)
+        self.assertEqual(session[ui.REQUEST_STATE_KEY], typed)
+
+    def test_text_typed_before_the_click_lands_is_not_overwritten(self) -> None:
+        """The race a browser check exposed.
+
+        Streamlit commits a text area on blur, so the accept control can
+        still be on screen while the user types. Clicking it blurs the box,
+        which commits their text on the very run that applies the
+        acceptance. Their text must win.
+        """
+        typed = "Run BatLiNet on MATR"
+        session = {"gpu_inventory": _FAKE_GPU_INVENTORY}
+        _render(session, clicked={ui.USE_SUGGESTION_LABEL})
+        self.assertTrue(session[ui.ACCEPT_SUGGESTION_KEY])
+        # The blur commits what they typed, then the accepting run happens.
+        session[ui.REQUEST_WIDGET_KEY] = typed
+        _render(session)
+        self.assertEqual(session[ui.REQUEST_WIDGET_KEY], typed)
+        self.assertNotEqual(session.get(ui.REQUEST_STATE_KEY), self.SUGGESTION)
+
+    def test_the_accept_rule_is_pure_and_refuses_a_non_empty_field(self) -> None:
+        self.assertTrue(ui.accept_suggestion(self.SUGGESTION, ""))
+        self.assertTrue(ui.accept_suggestion(self.SUGGESTION, "   "))
+        self.assertFalse(ui.accept_suggestion(self.SUGGESTION, "typed"))
+        self.assertFalse(ui.accept_suggestion("", ""))
+
+    def test_analyze_remains_the_explicit_action(self) -> None:
+        fake = _render({"gpu_inventory": _FAKE_GPU_INVENTORY})
+        self.assertIn("Analyze", [b["label"] for b in fake.rec["buttons"]])
+        self.assertEqual(self.analysed, [])
+
+    def test_no_keyboard_interception_is_claimed_or_injected(self) -> None:
+        """Section 4: do not fake Tab completion.
+
+        The page must not inject a key handler, and must not tell the user
+        that Tab does something it does not do.
+        """
+        source = Path(ui.__file__).read_text(encoding="utf-8")
+        for forbidden in (
+            "keydown",
+            "addEventListener",
+            "preventDefault",
+            "window.parent",
+            "unsafe_allow_html",
+            "declare_component",
+            "_bidi_component",
+        ):
+            self.assertNotIn(forbidden, source)
+        rendered = repr(_render({"gpu_inventory": _FAKE_GPU_INVENTORY}).rec)
+        self.assertNotIn("Press Tab", rendered)
+        self.assertNotIn("press Tab", rendered)
 
 
 class TestGpuMultiSelectRender(unittest.TestCase):
@@ -2071,6 +2239,151 @@ class TestExplainOpensConfigurationInsteadOfDeadEnding(unittest.TestCase):
             summary = ui_settings.llm_settings_summary()
         self.assertTrue(summary["api_key_set"])
         self.assertNotIn("sk-secret", repr(summary))
+
+    # --- Save and Connect -------------------------------------------
+    def test_the_form_offers_save_and_connect_and_no_cancel_pair(self) -> None:
+        fake = FakeStreamlit({})
+        with _fake_streamlit(fake):
+            ui_settings.render_llm_settings_form(key_prefix="t")
+        labels = [b["label"] for b in fake.rec["buttons"]]
+        self.assertIn(ui_settings.SAVE_LABEL, labels)
+        self.assertIn(ui_settings.CONNECT_LABEL, labels)
+        self.assertEqual(labels, ["Save", "Connect"])
+        # The old primary pair must not survive anywhere.
+        self.assertNotIn("Cancel", labels)
+        self.assertNotIn("Save settings", labels)
+        # ...and the old pair is gone from the code too. Scanned with
+        # docstrings and comments removed: the module explains in prose why
+        # "Cancel / Save settings" was replaced, and that prose is
+        # documentation, not a button.
+        code = _code_without_prose(ui_settings)
+        self.assertNotIn("Save settings", code)
+        self.assertNotIn("Cancel", code)
+
+    def test_save_stores_settings_without_testing_the_connection(self) -> None:
+        calls: list = []
+        real = ui_settings.test_llm_connection
+        ui_settings.test_llm_connection = lambda **kw: calls.append(kw) or (True, "ok")
+        try:
+            fake = FakeStreamlit({}, clicked_buttons={ui_settings.SAVE_LABEL})
+            fake.session_state.update(
+                {"t_base_url": "u", "t_api_key": "k", "t_model": "m"}
+            )
+            with _fake_streamlit(fake):
+                action = ui_settings.render_llm_settings_form(key_prefix="t")
+        finally:
+            ui_settings.test_llm_connection = real
+        self.assertEqual(action, "save")
+        self.assertEqual(calls, [], "Save must not call the connection test")
+        self.assertEqual(fake.session_state["llm_base_url"], "u")
+        self.assertEqual(fake.session_state["llm_model"], "m")
+        self.assertIn(ui_settings.SAVED_MESSAGE, " ".join(fake.rec["toasts"]))
+
+    def test_connect_invokes_the_existing_connection_test(self) -> None:
+        calls: list = []
+        real = ui_settings.test_llm_connection
+        ui_settings.test_llm_connection = lambda **kw: (
+            calls.append(kw) or (True, "LLM connection verified.")
+        )
+        try:
+            fake = FakeStreamlit({}, clicked_buttons={ui_settings.CONNECT_LABEL})
+            fake.session_state.update(
+                {"t_base_url": "u", "t_api_key": "k", "t_model": "m"}
+            )
+            with _fake_streamlit(fake):
+                action = ui_settings.render_llm_settings_form(key_prefix="t")
+        finally:
+            ui_settings.test_llm_connection = real
+        self.assertEqual(action, "connect")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            fake.session_state["llm_status"], ui_llm_state.LLM_STATUS_CONNECTED
+        )
+        self.assertIn(ui_settings.CONNECTED_MESSAGE, " ".join(fake.rec["toasts"]))
+
+    def test_connection_testing_is_not_reimplemented(self) -> None:
+        """One connection implementation, imported from the agent client."""
+        source = Path(ui_settings.__file__).read_text(encoding="utf-8")
+        self.assertIn("from ..agent.llm_client import test_llm_connection", source)
+        for forbidden in ("requests.post", "urlopen", "httpx", "chat/completions"):
+            self.assertNotIn(forbidden, source)
+        app_source = (Path(ui.__file__).parents[1] / "app.py").read_text(encoding="utf-8")
+        self.assertNotIn("test_llm_connection(base_url=", app_source)
+
+    def test_a_failed_connect_is_persistent_and_leaks_no_key(self) -> None:
+        secret = "sk-never-show-me"
+        real = ui_settings.test_llm_connection
+        ui_settings.test_llm_connection = lambda **kw: (
+            False,
+            "LLM connection failed: Connection refused",
+        )
+        try:
+            fake = FakeStreamlit({}, clicked_buttons={ui_settings.CONNECT_LABEL})
+            fake.session_state.update(
+                {"t_base_url": "u", "t_api_key": secret, "t_model": "m"}
+            )
+            with _fake_streamlit(fake):
+                action = ui_settings.render_llm_settings_form(key_prefix="t")
+        finally:
+            ui_settings.test_llm_connection = real
+        self.assertEqual(action, "connect_failed")
+        self.assertEqual(
+            fake.session_state["llm_status"], ui_llm_state.LLM_STATUS_FAILED
+        )
+        # Persistent, not a toast that vanishes before it can be acted on.
+        self.assertTrue(fake.rec["errors"])
+        self.assertEqual(fake.rec["toasts"], [])
+        self.assertNotIn(secret, repr(fake.rec))
+
+    def test_connect_with_a_missing_field_never_reaches_the_network(self) -> None:
+        calls: list = []
+        real = ui_settings.test_llm_connection
+        ui_settings.test_llm_connection = lambda **kw: calls.append(kw) or (True, "ok")
+        try:
+            fake = FakeStreamlit({}, clicked_buttons={ui_settings.CONNECT_LABEL})
+            fake.session_state.update({"t_base_url": "u", "t_api_key": "", "t_model": "m"})
+            with _fake_streamlit(fake):
+                ui_settings.render_llm_settings_form(key_prefix="t")
+        finally:
+            ui_settings.test_llm_connection = real
+        self.assertEqual(calls, [])
+        self.assertIn(ui_settings.INCOMPLETE_MESSAGE, " ".join(fake.rec["errors"]))
+
+    def test_the_signature_used_for_toasts_never_carries_the_key(self) -> None:
+        fake = FakeStreamlit(
+            {"llm_base_url": "u", "llm_api_key": "sk-secret", "llm_model": "m"}
+        )
+        with _fake_streamlit(fake):
+            signature = ui_settings.llm_settings_signature()
+        self.assertNotIn("sk-secret", signature)
+        self.assertIn("key", signature)
+
+    def test_connecting_from_the_explain_prompt_does_not_auto_explain(self) -> None:
+        """Explicit control: Connect enables Explain, it does not press it."""
+        ui.is_llm_configured = lambda: False
+        real = ui_settings.test_llm_connection
+        ui_settings.test_llm_connection = lambda **kw: (True, "ok")
+        try:
+            session = self._session()
+            session[ui_settings.FORM_OPEN_KEY] = True
+            session[ui_settings.PENDING_ACTION_KEY] = "explain"
+            session.update(
+                {
+                    "dialog_llm_base_url": "u",
+                    "dialog_llm_api_key": "k",
+                    "dialog_llm_model": "m",
+                }
+            )
+            _render(
+                session,
+                clicked={ui_settings.CONNECT_LABEL},
+                radio_values={ui.COMPUTE_LABEL: "CPU"},
+            )
+        finally:
+            ui_settings.test_llm_connection = real
+        self.assertEqual(self.explain_calls, [], "Connect must not send the result")
+        # The prompt closed, so the page is back on the result workflow.
+        self.assertNotIn(ui_settings.FORM_OPEN_KEY, session)
 
     def test_one_configuration_source_backs_both_entry_points(self) -> None:
         source = Path(ui_settings.__file__).read_text(encoding="utf-8")

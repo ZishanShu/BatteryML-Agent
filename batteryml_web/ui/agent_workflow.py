@@ -31,7 +31,7 @@ from typing import Any
 
 import streamlit as st
 
-from ..agent.catalog import build_example_requests, build_intent_catalog
+from ..agent.catalog import build_intent_catalog, build_request_suggestion
 from ..agent.execution import build_execution_plan
 from ..agent.llm_intent import (
     filter_suggestions,
@@ -97,7 +97,6 @@ from .formatting import metric_display
 from .settings_panel import (
     clear_llm_configuration_request,
     llm_configuration_requested,
-    pending_action,
     render_llm_configuration_prompt,
     request_llm_configuration,
 )
@@ -116,11 +115,25 @@ from .progress_utils import get_safe_runtime_env
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 RUN_BUTTON_LABEL = "Run"
-#: The two ways to supply a request. Ordered as rendered.
-REQUEST_TABS: tuple[str, str] = ("Describe request", "Examples")
-#: Placeholder for the request box. A template-free sentence: the clickable
-#: examples, which do name a model, are built from the backend catalog.
-REQUEST_PLACEHOLDER = "Use CPTransformer on MATR to predict battery lifetime."
+#: Label of the one request control. There are no tabs: an example gallery
+#: was a second way to do the same thing, and the page now offers one.
+REQUEST_LABEL = "Workflow request"
+
+#: The quiet affordance that accepts the grey suggestion. Section 4 of the
+#: milestone allows a visible control only where a key-driven one cannot be
+#: built; docs/STREAMLIT_KEYBOARD_AUDIT.md records why that is the case here.
+USE_SUGGESTION_LABEL = "Use suggestion"
+#: Session key holding the canonical request text. One key, written by
+#: typing and by accepting the suggestion alike (milestone section 6).
+REQUEST_STATE_KEY = "agent_original_request"
+
+#: The request text area's own widget key. Named because accepting the
+#: suggestion has to write it before the widget is instantiated.
+REQUEST_WIDGET_KEY = "agent_request_input"
+
+#: Set by the accept button, consumed on the next run. A one-shot flag, not
+#: a second request state: the text it produces goes into REQUEST_STATE_KEY.
+ACCEPT_SUGGESTION_KEY = "agent_accept_suggestion"
 #: Exact wording milestone A requires wherever a smoke run is offered or shown.
 SMOKE_CHECKBOX_LABEL = SMOKE_NOTICE
 #: Raw stdout/stderr are display tails only; metrics never come from them.
@@ -783,7 +796,7 @@ def _analyze_request(trimmed: str) -> None:
     workflow context, and optionally asks the LLM to explain it. Nothing is
     executed here — execution needs the explicit Run button below.
     """
-    st.session_state["agent_original_request"] = trimmed
+    st.session_state[REQUEST_STATE_KEY] = trimmed
     for key in (
         "agent_selected_model",
         "agent_execution_plan",
@@ -851,51 +864,37 @@ def _analyze_request(trimmed: str) -> None:
         st.session_state["agent_explanation"] = f"LLM guidance failed: {exc}"
 
 
-def _example_requests() -> list[str]:
-    """Example requests for this installation, computed once per session.
+def request_suggestion() -> str:
+    """The one suggestion the empty request box shows.
 
-    Built from the backend catalog and, where a workflow context has already
-    been loaded, from the models readiness currently reports as runnable —
-    so an example names a dataset and a model that really exist here. No
-    model name is written into the UI.
+    Derived from the live catalog and, where readiness is known, from the
+    models that are actually runnable — so the box never proposes a missing
+    dataset or a model with no config. This is request-completion UX, not a
+    second recommendation engine: the choice is "first READY dataset, first
+    model with a config for it", and the real model/task recommendation
+    stays with the agent backend.
+
+    Cached per session because it is a hint, not a live readout, and
+    rebuilding the catalog on every rerun would cost more than it is worth.
     """
-    cached = st.session_state.get("agent_example_requests")
-    if isinstance(cached, list):
-        return [str(item) for item in cached]
+    cached = st.session_state.get("agent_request_suggestion")
+    if isinstance(cached, str) and cached:
+        return cached
     context = st.session_state.get("agent_workflow_context")
-    runnable = (
-        runnable_model_keys(context) if isinstance(context, dict) else None
-    )
-    examples = build_example_requests(build_intent_catalog(), runnable_keys=runnable)
-    st.session_state["agent_example_requests"] = list(examples)
-    return list(examples)
+    runnable = runnable_model_keys(context) if isinstance(context, dict) else None
+    suggestion = build_request_suggestion(build_intent_catalog(), runnable_keys=runnable)
+    st.session_state["agent_request_suggestion"] = str(suggestion)
+    return str(suggestion)
 
 
-def _render_examples() -> None:
-    """Clickable examples that fill the request box and stop there.
+def accept_suggestion(suggestion: str, current_request: str) -> bool:
+    """Whether accepting ``suggestion`` should overwrite the request field.
 
-    Clicking writes the example into the same session-state field the
-    Describe request tab reads, and reruns so the text box shows it. It does
-    not analyse and it does not execute: both remain explicit actions.
+    Pure, so the rule is testable without Streamlit. Accepting is allowed
+    only into an empty field: text the user typed is never overwritten by a
+    suggestion, however they trigger the acceptance.
     """
-    st.caption(
-        "Pick one to fill the request box. Nothing is analysed or run until you "
-        "press Analyze."
-    )
-    examples = _example_requests()
-    if not examples:
-        st.info(
-            "No example can be offered: the config registry declares no dataset "
-            "this platform could run a workflow on."
-        )
-        return
-    for index, example in enumerate(examples):
-        if st.button(example, key=f"agent_example_{index}", use_container_width=True):
-            st.session_state["agent_original_request"] = example
-            # The text box is a keyed widget: clearing its stored value lets
-            # the freshly chosen example become its content on the rerun.
-            st.session_state.pop("agent_request_input", None)
-            st.rerun()
+    return bool(str(suggestion or "").strip()) and not str(current_request or "").strip()
 
 
 def render_agent_workflow() -> None:
@@ -914,23 +913,50 @@ def render_agent_workflow() -> None:
     if isinstance(pending, str) and pending.strip():
         _analyze_request(pending.strip())
 
-    describe_tab, examples_tab = st.tabs(list(REQUEST_TABS))
-    with describe_tab:
-        request = st.text_area(
-            "Workflow request",
-            value=st.session_state.get("agent_original_request", ""),
-            placeholder=REQUEST_PLACEHOLDER,
-            key="agent_request_input",
-            height=90,
-        )
-        if st.button("Analyze", key="agent_analyze", use_container_width=True):
-            if not str(request or "").strip():
-                st.error("Enter a workflow request before analyzing.")
-            else:
-                _analyze_request(str(request).strip())
-                st.rerun()
-    with examples_tab:
-        _render_examples()
+    # One request control. The suggestion is grey placeholder text while the
+    # field is empty: it is a hint, not the user's request, and nothing is
+    # analysed or executed until Analyze is pressed.
+    suggestion = request_suggestion()
+
+    # Accepting is applied *here*, before the text area is instantiated.
+    # A keyed widget takes its content from its own session key, and that key
+    # may only be written before the widget exists; writing it afterwards (or
+    # popping it and relying on ``value=``) leaves the box empty, which is
+    # exactly what a browser check of the first attempt showed.
+    if st.session_state.pop(ACCEPT_SUGGESTION_KEY, False):
+        # Re-checked here, against the value the widget actually committed.
+        # Streamlit commits a text area on blur, so a user can be typing
+        # while the accept control is still on screen; clicking it then
+        # blurs the box and commits their text. Without this second check
+        # that text would be overwritten — which a browser check caught.
+        committed = str(st.session_state.get(REQUEST_WIDGET_KEY, "") or "")
+        if accept_suggestion(suggestion, committed):
+            st.session_state[REQUEST_STATE_KEY] = suggestion
+            st.session_state[REQUEST_WIDGET_KEY] = suggestion
+
+    request = st.text_area(
+        REQUEST_LABEL,
+        value=st.session_state.get(REQUEST_STATE_KEY, ""),
+        placeholder=suggestion,
+        key=REQUEST_WIDGET_KEY,
+        height=90,
+    )
+    if accept_suggestion(suggestion, request):
+        # Only reachable while the field is empty, so typed text can never be
+        # overwritten. See docs/STREAMLIT_KEYBOARD_AUDIT.md for why this is a
+        # button rather than the Tab key.
+        if st.button(USE_SUGGESTION_LABEL, key="agent_use_suggestion"):
+            # Only records the intent and reruns; the write happens above, on
+            # the next run, before the widget is built. Filling the box is all
+            # it does: no analysis, no LLM call, no plan, no execution.
+            st.session_state[ACCEPT_SUGGESTION_KEY] = True
+            st.rerun()
+    if st.button("Analyze", key="agent_analyze", use_container_width=True):
+        if not str(request or "").strip():
+            st.error("Enter a workflow request before analyzing.")
+        else:
+            _analyze_request(str(request).strip())
+            st.rerun()
 
     context = st.session_state.get("agent_workflow_context")
     if not isinstance(context, dict):
@@ -1213,19 +1239,15 @@ def render_agent_workflow() -> None:
 
         if llm_configuration_requested():
             action = render_llm_configuration_prompt()
-            if action == "cancel":
+            if action in ("save", "connect"):
+                # Settings are stored (and, for Connect, tested). Close the
+                # form and stay on the result: Explain is now usable, and the
+                # user presses it again if they want an explanation. Nothing
+                # is sent to the LLM on their behalf.
                 clear_llm_configuration_request()
                 st.rerun()
-            elif action == "save":
-                clear_llm_configuration_request()
-                st.rerun()
-            elif action == "save_and_run":
-                wanted = pending_action()
-                clear_llm_configuration_request()
-                # Only an explicit "Save & explain" sends anything anywhere.
-                if wanted == "explain" and is_llm_configured():
-                    _explain_result(result_context)
-                st.rerun()
+            # "connect_failed" leaves the form open with its error showing,
+            # so the endpoint can be corrected without reopening anything.
 
     if st.session_state.get("agent_explanation") and isinstance(context, dict):
         explanation_serial = st.session_state.get("agent_explanation_serial")

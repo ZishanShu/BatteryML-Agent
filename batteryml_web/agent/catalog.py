@@ -401,6 +401,41 @@ def example_model(
     return _short_display(candidates[0].get("model_display"), candidates[0].get("model_key"))
 
 
+#: The suggestion shown in the empty request box when the catalog cannot
+#: supply one. It is the platform's documented default demo request
+#: (CLAUDE.md §11: MATR / RUL / XGBoost is the default configuration, and
+#: CPTransformer is the model the quick-start prose names), kept here as the
+#: single literal rather than written into the page.
+FALLBACK_REQUEST_SUGGESTION = "Use CPTransformer on MATR to predict battery lifetime."
+
+
+def build_request_suggestion(
+    catalog: Dict[str, Any],
+    *,
+    runnable_keys: Optional[Sequence[str]] = None,
+) -> str:
+    """The **one** request suggestion the empty request box shows.
+
+    Deliberately not a gallery and not a second recommendation engine: it
+    reuses :func:`example_dataset` and :func:`example_model`, which pick the
+    first READY dataset and a model that has a validated config for it, and
+    fills the single "Use {model} on {dataset}" template. Model/task
+    recommendation stays with the agent backend.
+
+    A suggestion is only offered when the catalog supplies both halves, so
+    the box never proposes a missing dataset or a model with no config for
+    it. Otherwise the documented fallback is returned, so the field is never
+    left with no hint at all.
+    """
+    dataset = example_dataset(catalog)
+    if not dataset:
+        return FALLBACK_REQUEST_SUGGESTION
+    model = example_model(catalog, dataset, runnable_keys=runnable_keys)
+    if not model:
+        return FALLBACK_REQUEST_SUGGESTION
+    return f"Use {model} on {dataset} to predict battery lifetime."
+
+
 def build_example_requests(
     catalog: Dict[str, Any],
     *,

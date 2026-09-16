@@ -241,7 +241,7 @@ Check by hand, and report what you see:
 | H | The result panel shows metrics only for a successful run, with the smoke warning visible |
 | I | Creating a project shows a transient toast, with the project name and workspace path left on the page as plain text — no permanent green box |
 | J | The Agent Workflow entry reads exactly `Agent Workflow` on Home, in the sidebar, as the page heading and on the navigation button — no emoji, no caret — and the sidebar carries no "Intelligent entry point" copy |
-| K | The request area has **Describe request** and **Examples** tabs; clicking an example fills the box and does nothing else |
+| K | The request area is one text area with no tabs and no example gallery; while empty it shows one grey suggestion, and `Use suggestion` fills the box and does nothing else |
 | L | The Streamlit toolbar offers no "Clear cache" or developer entries (`.streamlit/config.toml`, `toolbarMode = "viewer"`) — this is the one item only the running app can confirm |
 | M | Ticking two or more GPUs leaves the selection as chosen, shows "True multi-GPU execution is not yet supported for this model/runtime.", and renders Run disabled; ticking one GPU still runs |
 
@@ -271,6 +271,12 @@ app, so none can be established from the authoring environment:
 | AE | Settings are in the left sidebar; the top chrome is reduced but the sidebar still opens and closes normally |
 | AF | With no assistant configured, **Explain computed result** is clickable and opens the LLM configuration form (Cancel / Save settings / Save & explain); nothing is sent before you save |
 | AG | The API key field is masked, and the key appears nowhere on the page, in any toast, in the debug expander, or in any file under `runs/` — grep for it to be sure |
+| AH | LLM settings show **Save** and **Connect** — no Cancel / Save settings — in the sidebar and in the form Explain opens |
+| AI | Save stores the values and reports "LLM settings saved" without contacting the endpoint (watch the network, or save with the endpoint down) |
+| AJ | Connect against a working endpoint reports "LLM connected" and the status becomes Connected; against a wrong one it leaves a persistent error naming the reason, with no key in it |
+| AK | Connect from the Explain form closes it and leaves the result on screen; the explanation appears only when you press Explain again |
+| AL | Pressing Tab in the request box moves focus and does **not** fill it — the suggestion is accepted only by `Use suggestion` (docs/STREAMLIT_KEYBOARD_AUDIT.md says why) |
+| AM | Type into the request box while `Use suggestion` is still visible, then click it: your text must survive |
 
 **True multi-GPU execution is still not implemented.** T checks that the
 platform says so rather than attempting one.
