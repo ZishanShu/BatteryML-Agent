@@ -31,12 +31,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tests.test_readiness import REGISTRIES_AVAILABLE  # noqa: E402
+from tests.test_readiness import (  # noqa: E402
+    REGISTRIES_AVAILABLE,
+    REGISTRY_SKIP_MESSAGE,
+)
 from batteryml_web.agent.results import SMOKE_RUN_WARNING  # noqa: E402
 from batteryml_web.agent.run_policy import SMOKE_NOTICE  # noqa: E402
 from batteryml_web.core import device_inventory as di  # noqa: E402
 from batteryml_web.ui import agent_workflow as ui  # noqa: E402
 from batteryml_web.ui import feedback as ui_feedback  # noqa: E402
+from batteryml_web.ui import llm_state as ui_llm_state  # noqa: E402
 
 #: A fixed two-GPU inventory. Seeded into session state by every render test
 #: so the UI never shells out to nvidia-smi during the suite and the device
@@ -153,12 +157,19 @@ class FakeStreamlit:
             "expanders": [],
             "expander_writes": [],
             "multiselects": [],
+            "headings": [],
         }
         self.in_expander = False
 
     # --- text/display -------------------------------------------------
     def markdown(self, text, **kwargs):
         self.rec["markdown"].append(str(text))
+
+    def header(self, text, **kwargs):
+        self.rec["headings"].append(str(text))
+
+    def subheader(self, text, **kwargs):
+        self.rec["headings"].append(str(text))
 
     def caption(self, text, **kwargs):
         self.rec["captions"].append(str(text))
@@ -402,11 +413,14 @@ def _render(
 
 
 class _fake_streamlit:
-    """Point both the UI module and the feedback helper at the fake.
+    """Point every UI module that reads Streamlit at the same fake.
 
-    ``ui/feedback.py`` reads ``st.session_state`` to deduplicate toasts, and
-    that call needs a Streamlit script context. Swapping its module-level
-    ``st`` for the same fake keeps these tests free of a runtime.
+    Three modules hold their own ``st``: the page, the feedback helper
+    (which reads ``st.session_state`` to deduplicate toasts) and the LLM
+    settings helper (which reads the credentials). Missing one does not
+    raise — it silently reads the *real* Streamlit's empty session state,
+    which is how ``is_llm_configured()`` quietly returned False and made a
+    test look like a production bug.
     """
 
     def __init__(self, fake: FakeStreamlit):
@@ -414,7 +428,7 @@ class _fake_streamlit:
         self._saved: list = []
 
     def __enter__(self):
-        for module in (ui, ui_feedback):
+        for module in (ui, ui_feedback, ui_llm_state):
             self._saved.append((module, module.st))
             module.st = self._fake
         return self._fake
@@ -648,7 +662,10 @@ class TestRenderBoundaries(unittest.TestCase):
         self.assertEqual(fake.rec["selectboxes"], [])
         self.assertEqual([b for b in fake.rec["buttons"] if b["label"] == ui.RUN_BUTTON_LABEL], [])
         self.assertEqual(self._exec_calls, [])
-        self.assertIn("BatteryMFormer", " ".join(fake.rec["writes"]))
+        # Nothing is runnable, so the blocked model that would have served the
+        # request is named in the primary view rather than only in an expander.
+        shown = " ".join(fake.rec["writes"] + fake.rec["expander_writes"])
+        self.assertIn("BatteryMFormer", shown)
         self.assertEqual(self._plan_calls, [])
 
     def test_failed_execution_displays_no_metrics(self) -> None:
@@ -792,11 +809,17 @@ class TestBatLiNetSmokeRender(unittest.TestCase):
         self.assertEqual(call["model"], "batlinet")
         self.assertEqual(call["epochs"], 1)
         self.assertEqual(call["device"], "cpu")
-        # The device control lists every enumerated GPU and defaults to cpu.
-        device_box = [
-            box for box in fake.rec["selectboxes"] if box["label"] == "Device"
+        # The compute control lists every enumerated GPU; none ticked means CPU.
+        gpu_box = [
+            box
+            for box in fake.rec["multiselects"]
+            if box["label"].startswith("GPUs")
         ]
-        self.assertEqual(device_box[0]["options"], ["cpu", "cuda:0", "cuda:1"])
+        self.assertTrue(gpu_box, "the compute control is missing")
+        self.assertEqual(gpu_box[0]["options"], ["cuda:0", "cuda:1"])
+        self.assertEqual(
+            session["agent_device_selection"], {"mode": "cpu", "gpu_ids": []}
+        )
         joined = " ".join(fake.rec["infos"])
         self.assertIn(SMOKE_NOTICE, joined)
 
@@ -897,6 +920,77 @@ class TestLiveProgressRendering(unittest.TestCase):
                  "total": None, "fraction": None, "message": ui.HEARTBEAT_MESSAGE}
             )
         self.assertEqual(len(fake.rec["infos"]), drawn)
+
+    def test_progress_is_drawn_while_the_run_is_still_going(self) -> None:
+        """R8: the page consumes callbacks during the run, not a final status.
+
+        The stub records what the page had drawn at the moment each event was
+        delivered. If the UI were blocking until the subprocess exited, every
+        event would arrive with nothing drawn and the result already stored.
+        """
+        drawn_at_event: list[int] = []
+        result_stored_at_event: list[bool] = []
+
+        def stub_stream(plan, on_event=None, **kwargs):
+            for event in (
+                {"type": "stage", "stage": "Loading data", "current": None,
+                 "total": None, "fraction": None, "message": "Seed is set to 0."},
+                {"type": "training_progress", "stage": "Training", "current": 1,
+                 "total": 4, "fraction": 0.25, "message": "Training X:  25%|#| 1/4"},
+                {"type": "training_progress", "stage": "Training", "current": 4,
+                 "total": 4, "fraction": 1.0, "message": "Training X: 100%|#| 4/4"},
+            ):
+                if on_event is not None:
+                    on_event(event)
+                drawn_at_event.append(len(fake_holder[0].rec["infos"]))
+                result_stored_at_event.append(
+                    "agent_result_context" in fake_holder[0].session_state
+                )
+            return {
+                "started": True, "completed": True, "success": True, "returncode": 0,
+                "command": plan["command"], "workspace": "runs/w",
+                "stdout": "", "stderr": "", "error": None,
+                "artifacts": {}, "dry_run": False,
+                "final_stage": "Complete", "elapsed_s": 1.0,
+            }
+
+        real_stream = ui.execute_plan_streaming
+        real_build = ui.build_execution_plan
+        real_ctx = ui.build_result_context
+        real_llm = ui.is_llm_configured
+        ui.execute_plan_streaming = stub_stream
+        ui.build_execution_plan = lambda d, t_, m, **kw: _ok_plan(m, epochs=kw.get("epochs"))
+        ui.build_result_context = lambda ws, **kw: {
+            "workspace": ws, "success": True, "metrics": {}, "warnings": []
+        }
+        ui.is_llm_configured = lambda: False
+        fake_holder: list = []
+        try:
+            session = {
+                "agent_workflow_context": _MATR_CONTEXT,
+                "gpu_inventory": _FAKE_GPU_INVENTORY,
+            }
+            fake = FakeStreamlit(session, {"Run"})
+            fake_holder.append(fake)
+            with _fake_streamlit(fake):
+                try:
+                    ui.render_agent_workflow()
+                except _Rerun:
+                    pass
+        finally:
+            ui.execute_plan_streaming = real_stream
+            ui.build_execution_plan = real_build
+            ui.build_result_context = real_ctx
+            ui.is_llm_configured = real_llm
+
+        self.assertEqual(len(drawn_at_event), 3, "the page did not consume the events")
+        # Something was drawn by the time the first event had been handled...
+        self.assertGreater(drawn_at_event[0], 0)
+        # ...and the drawing grew as later events arrived, which cannot happen
+        # if the page waits for the process to exit before rendering.
+        self.assertGreater(drawn_at_event[-1], 0)
+        # The result context did not exist yet while progress was being drawn.
+        self.assertEqual(result_stored_at_event, [False, False, False])
 
     def test_run_click_streams_and_stores_no_fabricated_metrics(self) -> None:
         emitted: list[dict] = []
@@ -1077,7 +1171,11 @@ class TestLlmAssistedIntentInTheUi(unittest.TestCase):
             )
         self.assertIn("MATR has validated RUL configs.", " ".join(fake.rec["writes"]))
         self.assertIn("Backend-owned field(s) discarded.", " ".join(fake.rec["warnings"]))
-        self.assertIn("config_path", " ".join(fake.rec["writes"]))
+        # The refused values are shown; they sit inside the "Values the
+        # platform refused" expander rather than the page body.
+        shown = " ".join(fake.rec["writes"] + fake.rec["expander_writes"])
+        self.assertIn("config_path", shown)
+        self.assertIn("configs/fake.yaml", shown)
         self.assertIn("Which dataset should I use?", " ".join(fake.rec["infos"]))
 
     def test_blocked_model_is_reported_and_not_substituted(self) -> None:
@@ -1098,12 +1196,25 @@ class TestLlmAssistedIntentInTheUi(unittest.TestCase):
         with _fake_streamlit(fake):
             ui._render_model_presentation(presentation)
         joined = " ".join(fake.rec["writes"] + fake.rec["warnings"] + fake.rec["captions"])
+        # Semantics, not punctuation: the blocker is stated, runnable
+        # alternatives are offered, and nothing was chosen for the user.
         self.assertIn("NEEDS_ASSETS", joined)
-        self.assertIn("cptransformer", joined)
         self.assertIn("Nothing was substituted", joined)
-        # The blocked model is never offered as a choice.
+        self.assertEqual(
+            [entry["model"] for entry in presentation["blocked_focus"]], ["PBT"]
+        )
+        alternatives = [entry["model"] for entry in presentation["primary"]]
+        self.assertTrue(alternatives)
+        self.assertTrue(set(alternatives) <= set(ui.runnable_model_keys(_MATR_CONTEXT)))
+        # Each alternative is named on the page, by whatever display name the
+        # backend gave it.
+        display = ui.runnable_display_names(_MATR_CONTEXT)
+        for key in alternatives:
+            self.assertIn(display[key], joined)
+        # The blocked model is never offered as a choice, and nothing is preselected.
         self.assertNotIn("PBT", ui.selectbox_options(presentation))
         self.assertEqual(ui.selectbox_options(presentation)[0], ui.NO_SELECTION)
+        self.assertIsNone(presentation["default_model"])
 
     def test_a_requested_ready_model_is_shown_alone(self) -> None:
         fake = FakeStreamlit({})
@@ -1396,6 +1507,148 @@ class TestGpuMultiSelectRender(unittest.TestCase):
         self.assertIn("Utilization (%)", rows[0])
 
 
+class TestTheFakeCoversTheRealSurface(unittest.TestCase):
+    """The fake must offer exactly what the page actually calls.
+
+    The regression this guards against really happened: the page moved to
+    ``st.header`` for the Agent Workflow title (a native primitive, so no
+    heading-anchor markup leaks into the UI), the fake was never told, and
+    every render test in this file died with ``FakeStreamlit has no
+    attribute 'header'``. Because those tests could not even import in the
+    authoring environment, the breakage was invisible until the server ran
+    them.
+
+    Comparing the two surfaces mechanically means the next primitive the
+    page adopts fails here, loudly, instead of on someone else's machine.
+    """
+
+    def _production_surface(self) -> set[str]:
+        import ast
+
+        used: set[str] = set()
+        for module in (ui, ui_feedback, ui_llm_state):
+            tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "st"
+                ):
+                    used.add(node.attr)
+        return used
+
+    def test_the_fake_provides_every_primitive_the_page_uses(self) -> None:
+        fake = FakeStreamlit({})
+        missing = sorted(
+            name for name in self._production_surface() if not hasattr(fake, name)
+        )
+        self.assertEqual(
+            missing,
+            [],
+            "the page calls Streamlit primitives the fake does not provide, so "
+            "its render tests cannot run",
+        )
+
+    def test_headings_use_native_primitives_not_markdown(self) -> None:
+        """UI-03: markdown headings carry an anchor; native ones can suppress it."""
+        source = Path(ui.__file__).read_text(encoding="utf-8")
+        for bad in ('st.markdown("# ', 'st.markdown("## ', 'st.markdown("### '):
+            self.assertNotIn(bad, source)
+
+    def test_the_page_title_is_the_undecorated_label(self) -> None:
+        session = {"gpu_inventory": _FAKE_GPU_INVENTORY}
+        fake = _render(session)
+        self.assertIn("Agent Workflow", fake.rec["headings"])
+        for decorated in ("🤖 Agent Workflow", "▶ Agent Workflow", "▶ 🤖 Agent Workflow"):
+            self.assertNotIn(decorated, fake.rec["headings"])
+
+
+class TestTheLlmResolverIsOnTheRealPath(unittest.TestCase):
+    """R6: the page really calls the LLM-assisted resolver, with credentials.
+
+    Asserting that llm_intent.py exists proves nothing. These drive the
+    actual Analyze path and check what reached the resolver.
+    """
+
+    def setUp(self) -> None:
+        self._real_resolve = ui.resolve_workflow_intent_with_llm
+        self._real_context = ui.build_agent_workflow_context
+        self._real_catalog = ui.build_intent_catalog
+        self._real_guide = ui.guide_workflow
+        self.calls: list[dict] = []
+
+        def stub_resolve(request, **kwargs):
+            self.calls.append({"request": request, **kwargs})
+            return {
+                "source": "llm", "llm_available": True,
+                "dataset": "MATR", "task": "RUL prediction",
+                "requested_model": None, "requested_model_name": None,
+                "recommendation_requested": True, "needs_clarification": False,
+                "clarification_question": None,
+                "suggested_model_keys": ["cptransformer"],
+                "user_facing_rationale": "ok", "rejected": [], "warnings": [],
+                "message": "ok",
+            }
+
+        ui.resolve_workflow_intent_with_llm = stub_resolve
+        ui.build_agent_workflow_context = lambda dataset, task, **kw: _MATR_CONTEXT
+        ui.build_intent_catalog = lambda **kw: _FAKE_CATALOG
+        ui.guide_workflow = lambda *a, **kw: {"guidance": "explained"}
+
+    def tearDown(self) -> None:
+        ui.resolve_workflow_intent_with_llm = self._real_resolve
+        ui.build_agent_workflow_context = self._real_context
+        ui.build_intent_catalog = self._real_catalog
+        ui.guide_workflow = self._real_guide
+
+    def _analyze(self, session: dict, request: str) -> None:
+        fake = FakeStreamlit(session)
+        with _fake_streamlit(fake):
+            ui._analyze_request(request)
+
+    def test_configured_credentials_reach_the_resolver(self) -> None:
+        session = {
+            "llm_base_url": "https://example.invalid/v1",
+            "llm_api_key": "secret",
+            "llm_model": "some-model",
+        }
+        self._analyze(session, "Can you recommend something for cycle aging on MATR?")
+        self.assertEqual(len(self.calls), 1)
+        call = self.calls[0]
+        self.assertEqual(call["request"], "Can you recommend something for cycle aging on MATR?")
+        self.assertEqual(call["base_url"], "https://example.invalid/v1")
+        self.assertEqual(call["api_key"], "secret")
+        self.assertEqual(call["model"], "some-model")
+        self.assertIs(call["catalog"], _FAKE_CATALOG)
+
+    def test_without_credentials_the_resolver_is_still_used_offline(self) -> None:
+        """The deterministic path runs through the same entry point."""
+        session: dict = {}
+        self._analyze(session, "Use CPTransformer on MATR to predict battery lifetime.")
+        self.assertEqual(len(self.calls), 1)
+        self.assertNotIn("api_key", self.calls[0])
+
+    def test_the_structured_result_drives_the_page_not_prose(self) -> None:
+        session = {
+            "llm_base_url": "u", "llm_api_key": "k", "llm_model": "m",
+        }
+        self._analyze(session, "Which model should I use for MATR lifetime?")
+        # Canonical identifiers, taken from the validated structure.
+        self.assertEqual(session["agent_workflow_context"]["dataset"], "MATR")
+        self.assertEqual(session["agent_intent"]["task"], "RUL prediction")
+        # Suggestions were split by readiness before reaching the page.
+        self.assertEqual(session["agent_suggestions"]["runnable"], ["cptransformer"])
+        # The presentation is a recommendation, capped and readiness-filtered.
+        presentation = ui.build_model_presentation(
+            resolution=session["agent_intent"],
+            workflow_context=_MATR_CONTEXT,
+            model_request=session["agent_model_request"],
+            suggestions=session["agent_suggestions"],
+        )
+        self.assertEqual(presentation["mode"], "recommendation")
+        self.assertEqual([e["model"] for e in presentation["primary"]], ["cptransformer"])
+
+
 class TestNoFrontendDuplication(unittest.TestCase):
     """The UI module must not reimplement what the backend owns."""
 
@@ -1430,26 +1683,26 @@ class TestNoFrontendDuplication(unittest.TestCase):
 class TestBackendPlanContractsUsedByTheUI(unittest.TestCase):
     """Registry-backed checks that the UI gate (can_execute) is correct."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_ready_models_produce_executable_plans(self) -> None:
         plan = self._plan("MATR", "RUL prediction", "cptransformer")
         self.assertTrue(ui.run_is_enabled(plan), plan.get("reason"))
         self.assertEqual(plan["model"], "cptransformer")
         self.assertTrue(plan["config_path"].endswith("configs/external/cptransformer/matr_1.yaml"))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_blocked_pbt_plan_disabled(self) -> None:
         plan = self._plan("MATR", "RUL prediction", "PBT")
         self.assertFalse(ui.run_is_enabled(plan))
         self.assertTrue(plan["command"] in (None, []))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_trajectory_batterymformer_never_rul_executable(self) -> None:
         plan = self._plan("MATR", "Degradation trajectory forecasting", "BatteryMFormer")
         self.assertFalse(ui.run_is_enabled(plan))
         self.assertTrue(plan["command"] in (None, []))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_mich_raw_only_plan_disabled_and_without_command(self) -> None:
         plan = self._plan("MICH", "RUL prediction", "cptransformer")
         self.assertEqual(plan["dataset_status"], "RAW_ONLY")
@@ -1457,7 +1710,7 @@ class TestBackendPlanContractsUsedByTheUI(unittest.TestCase):
         self.assertIsNone(plan["command"])
         self.assertNotIn("data/raw/MICH", str(plan))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_smoke_plan_command_carries_only_epochs_override(self) -> None:
         plan = self._plan("MATR", "RUL prediction", "cptransformer", epochs=1)
         self.assertTrue(ui.run_is_enabled(plan))

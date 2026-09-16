@@ -21,7 +21,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tests.test_readiness import REGISTRIES_AVAILABLE  # noqa: E402
+from tests.test_readiness import (  # noqa: E402
+    REGISTRIES_AVAILABLE,
+    REGISTRY_SKIP_MESSAGE,
+)
 from batteryml_web.agent.intent import (  # noqa: E402
     resolve_task,
     resolve_dataset,
@@ -99,7 +102,7 @@ class TestIntentResolution(unittest.TestCase):
 class TestWorkflowRuntime(unittest.TestCase):
     """Intent -> compact context -> injected prompt -> stubbed LLM."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_matr_lifetime_runtime(self) -> None:
         seen: dict = {}
         result = guide_workflow(
@@ -127,7 +130,7 @@ class TestWorkflowRuntime(unittest.TestCase):
         self.assertEqual(result["guidance"], "STUBBED-GUIDANCE: use a runnable model.")
         self.assertEqual(len(result["prompt_messages"]), 2)
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_trajectory_runtime_exposes_batterymformer(self) -> None:
         seen: dict = {}
         result = guide_workflow(
@@ -142,7 +145,7 @@ class TestWorkflowRuntime(unittest.TestCase):
         self.assertNotIn("BatteryMFormer", _runnable_names(result["workflow_context"]))
         self.assertNotIn("cptransformer", _runnable_names(result["workflow_context"]))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_mich_lifetime_no_executable_command(self) -> None:
         preview = workflow_guidance_preview("Predict battery lifetime with MICH.")
         context = preview["workflow_context"]
@@ -152,7 +155,7 @@ class TestWorkflowRuntime(unittest.TestCase):
         self.assertNotIn("data/raw/MICH", user_text)
         self.assertIn("not yet wired", user_text)
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_no_fabricated_config_paths(self) -> None:
         result = workflow_guidance_preview(
             "I want to use MATR to predict battery lifetime."

@@ -21,7 +21,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tests.test_readiness import REGISTRIES_AVAILABLE  # noqa: E402
+from tests.test_readiness import (  # noqa: E402
+    REGISTRIES_AVAILABLE,
+    REGISTRY_SKIP_MESSAGE,
+)
 from batteryml_web.agent.execution import build_execution_plan, plan_for_request  # noqa: E402
 from batteryml_web.agent.executor import (  # noqa: E402
     discover_artifacts,
@@ -51,7 +54,7 @@ def _mutate(plan: dict, **overrides: object) -> dict:
 class TestDryRunValidPlans(unittest.TestCase):
     """Dry-run validates and returns argv without starting a process."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_cptransformer_dry_run(self) -> None:
         calls: list = []
         plan = plan_for_request("Use CPTransformer on MATR to predict battery lifetime.")
@@ -67,7 +70,7 @@ class TestDryRunValidPlans(unittest.TestCase):
         self.assertEqual(result["command"], plan["command"])
         self.assertIsInstance(result["command"], list)
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_batlinet_dry_run(self) -> None:
         calls: list = []
         plan = plan_for_request("Use BatLiNet on MATR to predict battery lifetime.")
@@ -83,7 +86,7 @@ class TestDryRunValidPlans(unittest.TestCase):
 class TestMockedExecution(unittest.TestCase):
     """Injected runner: honest success/failure propagation, no retry."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_mocked_success(self) -> None:
         import tempfile
 
@@ -106,7 +109,7 @@ class TestMockedExecution(unittest.TestCase):
         self.assertEqual(result["stdout"], "<stdout rc=0>")
         self.assertIn(str(ws), str(result["workspace"]))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_mocked_nonzero_preserved(self) -> None:
         calls: list = []
         plan = plan_for_request("Use CPTransformer on MATR to predict battery lifetime.")
@@ -130,7 +133,7 @@ class TestMockedExecution(unittest.TestCase):
 class TestBlockedPlansRejected(unittest.TestCase):
     """Blocked plans never reach subprocess."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_pbt_rejected(self) -> None:
         calls: list = []
         plan = plan_for_request("Use PBT on MATR to predict battery lifetime.")
@@ -142,7 +145,7 @@ class TestBlockedPlansRejected(unittest.TestCase):
         self.assertFalse(result["started"])
         self.assertFalse(result["success"])
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_mich_rejected(self) -> None:
         calls: list = []
         plan = plan_for_request("Use XGBoost on MICH to predict battery lifetime.")
@@ -154,7 +157,7 @@ class TestBlockedPlansRejected(unittest.TestCase):
         self.assertFalse(result["started"])
         self.assertNotIn("data/raw/MICH", str(result))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_batterymformer_rejected(self) -> None:
         calls: list = []
         plan = plan_for_request("Forecast the degradation trajectory for MATR with BatteryMFormer.")
@@ -169,7 +172,7 @@ class TestBlockedPlansRejected(unittest.TestCase):
 class TestForgedPlansRejected(unittest.TestCase):
     """Validation rules catch mutated/forged plans before subprocess."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_forged_can_execute_with_invalid_config_rejected(self) -> None:
         calls: list = []
         plan = plan_for_request("Use CPTransformer on MATR to predict battery lifetime.")
@@ -180,7 +183,7 @@ class TestForgedPlansRejected(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertFalse(result["started"])
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_shell_string_command_rejected(self) -> None:
         calls: list = []
         plan = plan_for_request("Use CPTransformer on MATR to predict battery lifetime.")
@@ -192,7 +195,7 @@ class TestForgedPlansRejected(unittest.TestCase):
         self.assertFalse(result["started"])
         self.assertIn("shell", str(result["error"]).lower())
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_config_mismatch_rejected(self) -> None:
         calls: list = []
         plan = plan_for_request("Use CPTransformer on MATR to predict battery lifetime.")
@@ -206,7 +209,7 @@ class TestForgedPlansRejected(unittest.TestCase):
         self.assertFalse(result["started"])
         self.assertIn("config", str(result["error"]).lower())
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_workspace_outside_runs_rejected(self) -> None:
         calls: list = []
         plan = plan_for_request("Use CPTransformer on MATR to predict battery lifetime.")

@@ -22,7 +22,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tests.test_readiness import REGISTRIES_AVAILABLE  # noqa: E402
+from tests.test_readiness import (  # noqa: E402
+    REGISTRIES_AVAILABLE,
+    REGISTRY_SKIP_MESSAGE,
+)
 from batteryml_web.agent.execution import build_execution_plan  # noqa: E402
 from batteryml_web.agent.executor import execute_plan  # noqa: E402
 from batteryml_web.agent.run_policy import (  # noqa: E402
@@ -36,7 +39,13 @@ from batteryml_web.agent.run_policy import (  # noqa: E402
 )
 from batteryml_web.core import device_inventory as di  # noqa: E402
 
+#: The formal BatLiNet config, as a repo-relative path. The planner reports
+#: it as an absolute path, because readiness derives config paths from the
+#: repository root — so comparisons resolve both sides rather than matching
+#: strings. The two spellings name the same file, and the planner's is the
+#: correct one: it is unambiguous whatever the process's working directory.
 BATLINET_CONFIG = "configs/external/batlinet/matr_1.yaml"
+BATLINET_CONFIG_PATH = (REPO_ROOT / BATLINET_CONFIG).resolve()
 
 _TWO_GPU_CSV = (
     "0, NVIDIA GeForce RTX 3090, 24576, 22500, 2076, 97\n"
@@ -200,7 +209,7 @@ class TestDeviceValidation(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     di.validate_device(bad)
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_the_planner_refuses_a_multi_gpu_device(self) -> None:
         with self.assertRaises(ValueError):
             build_execution_plan(
@@ -393,7 +402,7 @@ class TestFailureClassification(unittest.TestCase):
 class TestExecutorNeverRetries(unittest.TestCase):
     """A CUDA OOM must not be retried, on another GPU or otherwise."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_failed_run_calls_the_runner_exactly_once(self) -> None:
         plan = build_execution_plan(
             "MATR",
@@ -415,7 +424,7 @@ class TestExecutorNeverRetries(unittest.TestCase):
 class TestBatLiNetSmokePlan(unittest.TestCase):
     """The smoke plan uses the formal config and changes only --epochs."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_smoke_plan_is_epochs_one_on_the_formal_config(self) -> None:
         plan = build_execution_plan(
             "MATR",
@@ -427,7 +436,12 @@ class TestBatLiNetSmokePlan(unittest.TestCase):
             workspace="runs/agent_matr_batlinet_smoke",
         )
         self.assertTrue(plan["can_execute"])
-        self.assertEqual(plan["config_path"], BATLINET_CONFIG)
+        self.assertEqual(
+            Path(plan["config_path"]).resolve(),
+            BATLINET_CONFIG_PATH,
+            "the plan must point at the formal BatLiNet config, however it is spelled",
+        )
+        self.assertTrue(BATLINET_CONFIG_PATH.is_file())
         command = plan["command"]
         self.assertIn("--epochs", command)
         self.assertEqual(command[command.index("--epochs") + 1], "1")
@@ -435,7 +449,7 @@ class TestBatLiNetSmokePlan(unittest.TestCase):
         self.assertIn("--eval", command)
         self.assertEqual(command[command.index("--device") + 1], "cpu")
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_non_smoke_plan_keeps_the_config_schedule(self) -> None:
         plan = build_execution_plan(
             "MATR", "RUL prediction", "batlinet", device="cpu", epochs=None
@@ -443,7 +457,7 @@ class TestBatLiNetSmokePlan(unittest.TestCase):
         self.assertTrue(plan["can_execute"])
         self.assertNotIn("--epochs", plan["command"])
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, "batteryml is not importable in this environment")
+    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
     def test_explicit_gpu_choice_is_honoured(self) -> None:
         plan = build_execution_plan(
             "MATR", "RUL prediction", "batlinet", device="cuda:3", epochs=1
@@ -470,7 +484,7 @@ class TestBatLiNetSmokePlan(unittest.TestCase):
         """The smoke override touches epochs only; batch/support stay as shipped."""
         import yaml
 
-        config = yaml.safe_load((REPO_ROOT / BATLINET_CONFIG).read_text(encoding="utf-8"))
+        config = yaml.safe_load(BATLINET_CONFIG_PATH.read_text(encoding="utf-8"))
         model = config["model"]
         self.assertEqual(model["name"], "BatLiNetRULPredictor")
         self.assertEqual(model["batch_size"], 1)

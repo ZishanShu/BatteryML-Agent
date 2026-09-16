@@ -230,7 +230,9 @@ def build_model_presentation(
                     else "No model can run for this dataset and task."
                 ),
                 "primary": _take(runnable, chosen),
-                "blocked_focus": _take(blocked, agent_blocked),
+                "blocked_focus": _take(blocked, agent_blocked) or _explanatory_blocked(
+                    blocked, chosen
+                ),
                 "default_model": chosen[0] if chosen else None,
             }
         )
@@ -261,10 +263,31 @@ def build_model_presentation(
                 else "No model can run for this dataset and task."
             ),
             "primary": _take(runnable, chosen),
+            "blocked_focus": _explanatory_blocked(blocked, chosen),
             "default_model": chosen[0] if chosen else None,
         }
     )
     return presentation
+
+
+def _explanatory_blocked(
+    blocked: Sequence[Dict[str, Any]],
+    chosen: Sequence[str],
+) -> List[Dict[str, Any]]:
+    """Blocked entries to show when there is nothing runnable to show instead.
+
+    "No model can run for this dataset and task" is not an answer on its own —
+    the user needs to know *which* model was expected to serve the request and
+    what is missing. Trajectory forecasting is the case that matters: it is
+    served by one external model, and when that model is blocked the page
+    would otherwise say only that nothing is runnable.
+
+    When something *is* runnable, the blocked catalogue stays behind its
+    expander, because then it is background rather than the answer.
+    """
+    if chosen:
+        return []
+    return [dict(entry) for entry in blocked[:PRIMARY_LIMIT]]
 
 
 def selectbox_options(presentation: Dict[str, Any]) -> List[str]:
