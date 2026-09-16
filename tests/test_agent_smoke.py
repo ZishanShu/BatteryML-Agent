@@ -250,7 +250,8 @@ class TestDeviceValidation(unittest.TestCase):
 
     def test_the_audit_document_exists_and_states_the_verdict(self) -> None:
         audit = (REPO_ROOT / "docs" / "GPU_MULTI_GPU_AUDIT.md").read_text(encoding="utf-8")
-        self.assertIn("Multi-GPU is not implemented", audit)
+        self.assertIn("Multi-GPU execution is not implemented", audit)
+        self.assertIn("no multi-GPU Run is offered", audit)
         self.assertIn("DataBundle.to(device)", audit)
         self.assertIn("What a real implementation would require", audit)
 
