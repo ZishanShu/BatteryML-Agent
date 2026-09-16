@@ -163,11 +163,16 @@ The order is fixed and must not be shortened:
 | `INTENT-07` | An unresolved dataset or task produces one concise clarification question. An explicit request is never defaulted to MATR. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/llm_intent.py`, `batteryml_web/agent/intent.py` |
 | `INTENT-08` | Common Chinese and mixed-language phrasings resolve, in the **offline** route as well: the task phrase table carries the Chinese spellings, so "帮我用 MATR 做电池寿命预测" resolves to MATR + RUL prediction with no API key. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/intent.py`, `batteryml_web/agent/catalog.py` (`TASK_ALIASES`) |
 | `INTENT-09` | Free-form LLM prose can never trigger a run. The intent layer imports no executor, calls no planner, and touches neither `subprocess` nor the filesystem; the canonical identifiers it produces still go through `build_agent_workflow_context`, `build_execution_plan`, the validator and the explicit Run button. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/llm_intent.py`, `scripts/verify/check_intent_catalog.py` |
+| `INTENT-10` | A request that asks *which* model to use is recognised as a recommendation request — in English and in Chinese, deterministically, so the offline route behaves the same way. When an LLM is configured such a request reaches it even though the dataset and task already resolve, because choosing among runnable models is a judgement the phrase table cannot make. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/intent.py` (`detect_recommendation_request`), `batteryml_web/agent/llm_intent.py` |
+| `INTENT-11` | The model section answers the request instead of listing the platform. A named runnable model is shown alone; a named blocked model is shown with its exact status and blockers, then runnable alternatives; an unregistered name is reported as such with the closest runnable models; a recommendation shows at most three, drawn from the agent's suggestions only where readiness keeps them. The full runnable and blocked catalogues live behind expanders. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/recommendation.py`, `batteryml_web/ui/agent_workflow.py` (`_render_model_presentation`) |
+| `INTENT-12` | Nothing is ever substituted for a model the user asked for. Where the request named something blocked or unregistered, no model is preselected: the control opens on an empty choice and no plan exists — and therefore no Run — until the user selects one deliberately. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/recommendation.py` (`selectbox_options`, `NO_SELECTION`), `batteryml_web/ui/agent_workflow.py` |
+| `INTENT-13` | No model name is written into recommendation logic. The presentation layer reads the readiness context and the catalog it is given, cannot consult readiness itself, and so cannot overrule it. `DEV`/`INTENT-01` fails if a model name appears there. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/recommendation.py`, `scripts/verify/check_intent_catalog.py` |
 
 The check that establishes this group is `INTENT-01`
 (`scripts/verify/check_intent_catalog.py`); the unit tests are
-`tests/test_llm_intent.py` (45 cases, every LLM answer stubbed) and the
-LLM-intent class in `tests/test_agent_web_ui.py`. Nothing here may be
+`tests/test_llm_intent.py` (57 cases, every LLM answer stubbed),
+`tests/test_model_presentation.py` (22 cases) and the LLM-intent class in
+`tests/test_agent_web_ui.py`. Nothing here may be
 marked `VERIFIED` from this environment: no LLM endpoint has been called
 from it.
 

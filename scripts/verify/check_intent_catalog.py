@@ -12,7 +12,11 @@ without a network and without an API key:
 * the catalog is **binding** — an invented dataset, task, model or config
   path is rejected by ``validate_llm_intent`` and recorded, not accepted with
   a warning; and nothing in the intent layer can reach a planner or an
-  executor.
+  executor;
+* the presentation layer that turns a resolved request into what the page
+  shows names **no model of its own**, cannot consult readiness (so it cannot
+  overrule it), and never places a blocked model where the page could select
+  it.
 
 The catalog is also checked for config paths: a path that reaches the prompt
 is a path the model can echo back, and a config path must come from
@@ -40,6 +44,7 @@ _HALLUCINATED_ANSWER = {
     "task": "anomaly detection",
     "requested_model": "MegaNet9000",
     "suggested_model_keys": ["AlsoNotReal"],
+    "recommendation_requested": "yes",
     "config_path": "configs/external/invented/matr_1.yaml",
     "command": "python bin/batteryml.py run configs/invented.yaml",
     "needs_clarification": False,
@@ -130,6 +135,11 @@ def _rejection_problems(catalog: dict[str, Any], intent: Any) -> list[str]:
         problems.append(
             "an answer with no resolvable dataset or task did not ask for clarification."
         )
+    if result.get("recommendation_requested") is not False:
+        problems.append(
+            "a non-boolean recommendation_requested was accepted as "
+            f"{result.get('recommendation_requested')!r}."
+        )
     kinds = {item.get("kind") for item in result.get("rejected", [])}
     for expected in ("unknown_dataset", "unknown_task", "unknown_model", "forbidden_field"):
         if expected not in kinds:
@@ -141,6 +151,106 @@ def _rejection_problems(catalog: dict[str, Any], intent: Any) -> list[str]:
                 f"a model-supplied {token!r} survived validation; only readiness may "
                 "supply a config path."
             )
+    return problems
+
+
+#: Model names that must not appear in recommendation logic. Their presence
+#: would mean the page had started deciding for itself instead of reading the
+#: catalog and readiness.
+_FORBIDDEN_MODEL_NAMES = (
+    "CPTransformer",
+    "cptransformer",
+    "BatLiNet",
+    "batlinet",
+    "BatteryMFormer",
+    "XGBoost",
+    "xgboost",
+    "PBT",
+)
+
+
+def _presentation_problems(presentation: Any) -> list[str]:
+    """The request-aware model view: derived, capped, and readiness-bound."""
+    problems: list[str] = []
+    source = inspect.getsource(presentation)
+    for name in _FORBIDDEN_MODEL_NAMES:
+        if name in source:
+            problems.append(
+                f"batteryml_web/agent/recommendation.py names the model {name!r}; "
+                "the primary model view must be derived from the catalog and "
+                "readiness alone."
+            )
+    for forbidden in (
+        "get_workflow_context",
+        "build_agent_workflow_context",
+        "assess_model",
+        "assess_dataset",
+        "import streamlit",
+    ):
+        if forbidden in source:
+            problems.append(
+                f"batteryml_web/agent/recommendation.py references {forbidden!r}; it "
+                "must read the readiness context it is given, never derive its own."
+            )
+
+    context = {
+        "dataset": "DS",
+        "task": "RUL prediction",
+        "runnable_models": [
+            {"model": f"m{i}", "model_display": f"M{i}", "status": "READY"}
+            for i in range(5)
+        ],
+        "blocked_models": [
+            {"model": "blocked", "status": "NEEDS_ASSETS", "missing": ["ckpt"],
+             "recommended_action": "Provide the assets."}
+        ],
+    }
+
+    browse = presentation.build_model_presentation(resolution={}, workflow_context=context)
+    if len(browse["primary"]) > presentation.PRIMARY_LIMIT:
+        problems.append(
+            f"the primary model view named {len(browse['primary'])} models; at most "
+            f"{presentation.PRIMARY_LIMIT} may appear outside the expander."
+        )
+    if presentation.hidden_runnable_count(browse) != 2:
+        problems.append(
+            "the models the primary view omits are not counted for the "
+            "'Show all compatible models' expander."
+        )
+
+    blocked_view = presentation.build_model_presentation(
+        resolution={"requested_model": "blocked"},
+        workflow_context=context,
+        model_request={
+            "status": "blocked", "model_key": "blocked", "requested": "blocked",
+            "reason": "blocked is NEEDS_ASSETS.", "alternatives": ["m0"],
+            "requires_confirmation": True,
+        },
+    )
+    if "blocked" in blocked_view["selectable"]:
+        problems.append("a blocked model was placed among the selectable options.")
+    if blocked_view["default_model"] is not None:
+        problems.append(
+            "a blocked request preselected a substitute; the user must choose."
+        )
+    options = presentation.selectbox_options(blocked_view)
+    if not options or options[0] != presentation.NO_SELECTION:
+        problems.append(
+            "a request needing confirmation did not open on the empty selection, so "
+            "a model would be chosen for the user."
+        )
+
+    recommended = presentation.build_model_presentation(
+        resolution={"recommendation_requested": True},
+        workflow_context=context,
+        suggestions={"runnable": ["blocked", "m2"], "blocked": [], "unknown": ["ghost"]},
+    )
+    named = [str(entry.get("model")) for entry in recommended["primary"]]
+    if named != ["m2"]:
+        problems.append(
+            f"a recommendation kept non-runnable suggestions: {named}. Only models "
+            "readiness reports as runnable may be recommended."
+        )
     return problems
 
 
@@ -191,6 +301,7 @@ def check(output_dir: Path | None = None) -> CheckResult:
     try:
         from batteryml_web.agent import catalog as catalog_module
         from batteryml_web.agent import llm_intent as intent_module
+        from batteryml_web.agent import recommendation as presentation_module
         from batteryml_web.core import readiness as readiness_module
         from batteryml_web.core.config_registry import get_config_registry
     except Exception as exc:  # noqa: BLE001 - reported as a SKIP, never hidden
@@ -213,6 +324,7 @@ def check(output_dir: Path | None = None) -> CheckResult:
     problems.extend(_alias_problems(catalog, catalog_module.resolve_catalog_model))
     problems.extend(_rejection_problems(catalog, intent_module))
     problems.extend(_isolation_problems(intent_module))
+    problems.extend(_presentation_problems(presentation_module))
 
     evidence: dict[str, Any] = {
         "dataset_count": len(catalog.get("datasets", [])),
@@ -245,8 +357,9 @@ def check(output_dir: Path | None = None) -> CheckResult:
         f"The catalog is derived from the backend ({evidence['dataset_count']} dataset(s), "
         f"{evidence['task_count']} task(s), {evidence['model_count']} model(s)), carries no "
         "config path, and every alias folds back onto its own key. An invented dataset, "
-        "task, model or config path is rejected and recorded, and the intent layer neither "
-        "plans nor executes.",
+        "task, model or config path is rejected and recorded, the intent layer neither "
+        "plans nor executes, and the request-aware model view names no model of its own, "
+        "caps the primary list and never makes a blocked model selectable.",
         evidence,
         artifacts,
     )

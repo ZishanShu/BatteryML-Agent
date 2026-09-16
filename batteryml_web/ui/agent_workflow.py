@@ -39,6 +39,16 @@ from ..agent.llm_intent import (
     resolve_workflow_intent_with_llm,
 )
 from ..agent.prompts import build_agent_workflow_context
+from ..agent.recommendation import (
+    MODE_BROWSE,
+    MODE_RECOMMENDATION,
+    NO_SELECTION,
+    build_model_presentation,
+    default_option_index,
+    hidden_blocked_count,
+    hidden_runnable_count,
+    selectbox_options,
+)
 from ..agent.result_agent import explain_run_result
 from ..agent.results import METRIC_KEYS, SMOKE_RUN_WARNING, build_result_context
 from ..agent.run_policy import (
@@ -323,41 +333,69 @@ def _render_intent(resolution: dict[str, Any] | None) -> None:
         st.info(question)
 
 
-def _render_model_request(model_request: dict[str, Any] | None) -> None:
-    """Explain what happened to an explicitly requested model.
+def _render_model_presentation(presentation: dict[str, Any]) -> None:
+    """Show the models this request is about, and hide the rest.
 
-    A blocked or unknown model is never swapped for another one: the
-    alternatives are listed, and the user selects one deliberately below.
+    Everything named here came from the readiness context; the section never
+    lists a model the backend did not report, and never presents a blocked
+    one as an option. The full catalogues stay behind expanders so the
+    primary view answers the request instead of enumerating the platform.
     """
-    if not isinstance(model_request, dict):
+    if not isinstance(presentation, dict):
         return
-    status = model_request.get("status")
-    if status in (None, "none", "runnable"):
-        return
-    alternatives = ", ".join(str(key) for key in model_request.get("alternatives", []))
-    st.warning(str(model_request.get("reason") or "The requested model is unavailable."))
-    if alternatives:
-        st.write(
-            f"Runnable alternatives: {alternatives}. Select one below to continue — "
-            "nothing was substituted for you."
-        )
-    else:
-        st.write("No model is runnable for this dataset and task right now.")
 
+    headline = str(presentation.get("headline") or "")
+    if headline:
+        if presentation.get("requires_confirmation"):
+            st.warning(headline)
+        else:
+            st.markdown(f"**{headline}**")
 
-def _render_suggestions(suggestions: dict[str, Any] | None) -> None:
-    """Show the agent's suggestions after the backend has filtered them."""
-    if not isinstance(suggestions, dict):
-        return
-    runnable = [str(key) for key in suggestions.get("runnable", [])]
-    blocked = [str(key) for key in suggestions.get("blocked", [])]
-    if runnable:
-        st.write(f"**Agent suggests (runnable now):** {', '.join(runnable)}")
-    if blocked:
+    for entry in presentation.get("blocked_focus", []):
+        missing = ", ".join(str(item) for item in entry.get("missing", []))
         st.write(
-            f"**Also mentioned, but blocked:** {', '.join(blocked)} — "
-            "these cannot be run; see the blocked models above for why."
+            f"- {entry.get('model')} — {entry.get('status', 'UNKNOWN')}"
+            + (f"; missing: {missing}" if missing else "")
         )
+        action = entry.get("recommended_action")
+        if action:
+            st.caption(str(action))
+
+    primary = presentation.get("primary", [])
+    if primary:
+        for entry in primary:
+            st.write(
+                f"- {entry.get('model_display') or entry.get('model')} "
+                f"({entry.get('status', 'READY')})"
+            )
+    elif presentation.get("mode") in (MODE_RECOMMENDATION, MODE_BROWSE):
+        st.info("No model is runnable for this dataset/task right now.")
+
+    for note in presentation.get("notes", []):
+        st.caption(str(note))
+
+    hidden_runnable = hidden_runnable_count(presentation)
+    if hidden_runnable:
+        with st.expander(
+            f"Show all compatible models ({hidden_runnable} more)", expanded=False
+        ):
+            for entry in presentation.get("all_runnable", []):
+                st.write(
+                    f"- {entry.get('model_display') or entry.get('model')} "
+                    f"({entry.get('status', 'READY')})"
+                )
+
+    hidden_blocked = hidden_blocked_count(presentation)
+    if hidden_blocked:
+        with st.expander(
+            f"Show all blocked models ({hidden_blocked})", expanded=False
+        ):
+            for entry in presentation.get("all_blocked", []):
+                missing = ", ".join(str(item) for item in entry.get("missing", []))
+                st.write(
+                    f"- {entry.get('model')} — {entry.get('status', 'UNKNOWN')}"
+                    + (f"; missing: {missing}" if missing else "")
+                )
 
 
 def _render_context(context: dict[str, Any]) -> None:
@@ -372,19 +410,14 @@ def _render_context(context: dict[str, Any]) -> None:
         st.warning(notice)
 
     runnable = context.get("runnable_models", [])
-    if runnable:
-        st.markdown("**Runnable models**")
-        st.write(", ".join(_display_name(entry) for entry in runnable))
-    else:
-        st.info("No model is runnable for this dataset/task right now.")
-
     blocked = blocked_model_entries(context)
-    if blocked:
-        st.markdown("**Blocked models** (not selectable for execution)")
-        for entry in blocked:
-            missing = ", ".join(str(item) for item in entry.get("missing", []))
-            reason = f" — missing: {missing}" if missing else ""
-            st.write(f"- {_display_name(entry)} — {entry.get('status', 'UNKNOWN')}{reason}")
+    st.caption(
+        f"{len(runnable)} model(s) runnable, {len(blocked)} blocked for this "
+        "dataset and task."
+    )
+    # Which models to *name* is decided by _render_model_presentation from
+    # what the request asked for. Listing every runnable model plus every
+    # blocked one here buried the answer under the catalogue.
 
     steps = [str(step) for step in context.get("recommended_next_steps", [])]
     if steps:
@@ -783,12 +816,19 @@ def render_agent_workflow() -> None:
 
     _render_intent(st.session_state.get("agent_intent"))
     _render_context(context)
-    _render_model_request(st.session_state.get("agent_model_request"))
-    _render_suggestions(st.session_state.get("agent_suggestions"))
+
+    presentation = build_model_presentation(
+        resolution=st.session_state.get("agent_intent"),
+        workflow_context=context,
+        model_request=st.session_state.get("agent_model_request"),
+        suggestions=st.session_state.get("agent_suggestions"),
+    )
+    _render_model_presentation(presentation)
 
     options = runnable_model_keys(context)
     plan: dict[str, Any] | None = None
     smoke = False
+    selected_key: str = NO_SELECTION
     inventory = _gpu_inventory()
     devices = device_options(inventory)
     device = devices[0]
@@ -796,16 +836,34 @@ def render_agent_workflow() -> None:
 
     if options:
         display_by_key = runnable_display_names(context)
-        if st.session_state.get("agent_model_choice") not in options:
+        choices = selectbox_options(presentation)
+        if st.session_state.get("agent_model_choice") not in choices:
             st.session_state.pop("agent_model_choice", None)
         default_key = st.session_state.get("agent_selected_model")
+        index = (
+            choices.index(default_key)
+            if default_key in choices
+            else default_option_index(presentation)
+        )
         selected_key = st.selectbox(
             "Model (runnable models only; blocked models cannot be selected)",
-            options=options,
-            index=options.index(default_key) if default_key in options else 0,
-            format_func=lambda key: display_by_key.get(key, key),
+            options=choices,
+            index=index,
+            format_func=lambda key: (
+                "— select a model —" if key == NO_SELECTION else display_by_key.get(key, key)
+            ),
             key="agent_model_choice",
         )
+    if options and selected_key == NO_SELECTION:
+        # The request named something unavailable, so nothing is chosen for
+        # the user. No plan is built, so Run is unreachable until they select
+        # a model themselves. The rest of the page still renders: an earlier
+        # run's results must not vanish because the new request needs a
+        # decision.
+        st.session_state.pop("agent_selected_model", None)
+        st.info("Select one of the runnable models above to build an execution plan.")
+
+    if options and selected_key != NO_SELECTION:
         st.session_state["agent_selected_model"] = str(selected_key)
 
         # Smoke mode first: it is what makes CPU the recommended default for
@@ -859,7 +917,10 @@ def render_agent_workflow() -> None:
                 signature=plan_signature(plan),
             )
         _render_plan(plan, device=str(device), seed=seed)
-    else:
+
+    if not options:
+        # The presentation above already named the blocked models and why;
+        # this says what it means for running anything at all.
         st.info(
             "No model can be executed for this dataset/task. Blocked models are "
             "displayed with their reason and cannot be run."

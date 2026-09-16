@@ -51,7 +51,7 @@ from .catalog import (
     resolve_catalog_model,
     resolve_catalog_task,
 )
-from .intent import resolve_workflow_intent
+from .intent import detect_recommendation_request, resolve_workflow_intent
 
 #: Keys an answer must never carry. Each names something only the backend
 #: may decide; seeing one is a signal the model tried to skip the gate.
@@ -140,6 +140,7 @@ def build_intent_prompt(user_request: str, catalog: Dict[str, Any]) -> str:
         '  "dataset": "<dataset name from the catalog>" or null,\n'
         '  "task": "<task label from the catalog>" or null,\n'
         '  "requested_model": "<model_key the user explicitly asked for>" or null,\n'
+        '  "recommendation_requested": true or false,\n'
         '  "needs_clarification": true or false,\n'
         '  "clarification_question": "<one short question>" or null,\n'
         '  "suggested_model_keys": ["<model_key>", ...],\n'
@@ -153,6 +154,8 @@ def build_intent_prompt(user_request: str, catalog: Dict[str, Any]) -> str:
         "the catalog tasks.\n"
         "- requested_model is only for a model the user actually named. If the "
         "name is not in the catalog, set it to null and name it in the rationale.\n"
+        "- recommendation_requested is true when the user asks which model to use, "
+        "or asks for the best or a suggested model, rather than naming one.\n"
         "- suggested_model_keys is your recommendation; it may be empty. The "
         "platform will drop any model that is not currently runnable, so "
         "suggest freely but never claim any of them can run."
@@ -217,6 +220,7 @@ def validate_llm_intent(
             "task": None,
             "requested_model": None,
             "requested_model_name": None,
+            "recommendation_requested": False,
             "needs_clarification": True,
             "clarification_question": None,
             "suggested_model_keys": [],
@@ -282,11 +286,20 @@ def validate_llm_intent(
     if dataset is None or task is None:
         needs = True
 
+    recommendation = payload.get("recommendation_requested")
+    if not isinstance(recommendation, bool):
+        if recommendation is not None:
+            warnings.append(
+                "recommendation_requested was not a boolean; treated as false."
+            )
+        recommendation = False
+
     return {
         "dataset": dataset,
         "task": task,
         "requested_model": requested_model,
         "requested_model_name": requested_model_name,
+        "recommendation_requested": bool(recommendation),
         "needs_clarification": bool(needs),
         "clarification_question": _clean_text(
             payload.get("clarification_question"), MAX_QUESTION_CHARS
@@ -351,6 +364,7 @@ def _deterministic_result(
         "task": task,
         "requested_model": mention,
         "requested_model_name": None,
+        "recommendation_requested": detect_recommendation_request(user_request),
         "needs_clarification": dataset is None or task is None,
         "clarification_question": (
             str(intent.get("message")) if (dataset is None or task is None) else None
@@ -411,15 +425,23 @@ def resolve_workflow_intent_with_llm(
     llm_available = caller is not None or credentials_present
 
     deterministic = resolve_workflow_intent(user_request)
+    wants_recommendation = detect_recommendation_request(user_request)
     if deterministic.get("dataset") and deterministic.get("task"):
         # Fast path: the phrase table already answered, so no tokens are
         # spent and the offline route and the LLM route agree by construction.
-        return _deterministic_result(
-            user_request,
-            working_catalog,
-            source="deterministic",
-            llm_available=llm_available,
-        )
+        #
+        # One exception: a request that asks *which* model to use is asking
+        # for a judgement the phrase table cannot make. When an LLM is
+        # available it is consulted even though the dataset and task are
+        # already resolved; its suggestions are still filtered by readiness
+        # afterwards, so it decides nothing.
+        if not (wants_recommendation and llm_available):
+            return _deterministic_result(
+                user_request,
+                working_catalog,
+                source="deterministic",
+                llm_available=llm_available,
+            )
 
     if caller is None:
         if not credentials_present:
@@ -492,6 +514,22 @@ def resolve_workflow_intent_with_llm(
         validated["requested_model"] = find_catalog_model_mention(
             user_request, working_catalog
         )
+    # The deterministic detector is additive, never subtractive: a request that
+    # plainly asks for a recommendation stays one even if the model said false.
+    validated["recommendation_requested"] = bool(
+        validated.get("recommendation_requested")
+    ) or wants_recommendation
+    # Also fall back to the resolved dataset/task where the model left them
+    # null but the phrase table had them, so an LLM answer is never worse than
+    # the deterministic one it replaced.
+    if validated.get("dataset") is None and deterministic.get("dataset"):
+        validated["dataset"] = deterministic["dataset"]
+    if validated.get("task") is None and deterministic.get("task"):
+        validated["task"] = deterministic["task"]
+    if validated.get("dataset") and validated.get("task"):
+        validated["needs_clarification"] = bool(
+            validated.get("clarification_question")
+        ) and bool(validated.get("needs_clarification"))
     return validated
 
 

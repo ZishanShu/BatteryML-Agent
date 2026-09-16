@@ -72,6 +72,43 @@ _RUL_PHRASES: List[str] = [
 _SOH_TOKEN = re.compile(r"\bsoh\b")
 _RUL_TOKEN = re.compile(r"\brul\b")
 
+#: Phrasings that ask the platform to choose a model rather than naming one.
+#: English and Chinese, matched case-insensitively as substrings; Chinese has
+#: no word boundaries, and the English entries are long enough that a
+#: substring match cannot fire inside an unrelated word.
+_RECOMMENDATION_PHRASES: List[str] = [
+    "recommend",
+    "recommendation",
+    "suggest a model",
+    "suggest which",
+    "which model",
+    "what model",
+    "best model",
+    "best available model",
+    "help me choose",
+    "choose a model",
+    "pick a model",
+    "推荐",
+    "选哪个模型",
+    "用哪个模型",
+    "哪个模型",
+    "该用什么模型",
+]
+
+
+def detect_recommendation_request(text: str) -> bool:
+    """Whether the request asks the platform to choose a model.
+
+    A recommendation request is answered differently from a request that
+    names a model: the platform proposes from what is runnable instead of
+    resolving one name. Detected here, deterministically, so the offline
+    route behaves the same way the LLM-assisted one does.
+    """
+    lowered = str(text or "").lower()
+    if not lowered:
+        return False
+    return any(phrase in lowered for phrase in _RECOMMENDATION_PHRASES)
+
 
 def _dataset_patterns() -> List[tuple[str, "re.Pattern[str]"]]:
     return [

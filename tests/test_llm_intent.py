@@ -449,6 +449,161 @@ class TestChineseRequests(unittest.TestCase):
         self.assertIsNone(result["dataset"])
 
 
+class TestRecommendationRequests(unittest.TestCase):
+    """F: asking which model to use is a different question, and is detected."""
+
+    def test_deterministic_detection_in_both_languages(self) -> None:
+        from batteryml_web.agent.intent import detect_recommendation_request
+
+        for asks in (
+            "Recommend a model to predict battery lifetime on MATR.",
+            "Which model should I use for MATR lifetime?",
+            "I want future capacity prediction with the best available model",
+            "帮我推荐一个能做电池寿命预测的模型",
+            "MATR 上用哪个模型做寿命预测",
+        ):
+            with self.subTest(text=asks):
+                self.assertTrue(detect_recommendation_request(asks))
+        for names_one in (
+            "Use CPTransformer on MATR to predict battery lifetime.",
+            "帮我用 MATR 做电池寿命预测",
+            "Try BatLiNet on my MATR cells",
+        ):
+            with self.subTest(text=names_one):
+                self.assertFalse(detect_recommendation_request(names_one))
+
+    def test_a_recommendation_reaches_the_llm_even_when_intent_resolves(self) -> None:
+        """The phrase table cannot judge which model is best; the LLM can."""
+        response = (
+            '{"dataset": "MATR", "task": "RUL prediction", "requested_model": null,'
+            ' "recommendation_requested": true, "needs_clarification": false,'
+            ' "suggested_model_keys": ["cptransformer", "xgb"],'
+            ' "user_facing_rationale": "Both have validated MATR configs."}'
+        )
+        result, stub = _resolve(
+            "Recommend a model to predict battery lifetime on MATR.", response
+        )
+        self.assertEqual(len(stub.calls), 1)
+        self.assertEqual(result["source"], "llm")
+        self.assertTrue(result["recommendation_requested"])
+        self.assertEqual(result["suggested_model_keys"], ["cptransformer", "xgb"])
+
+    def test_without_an_llm_the_recommendation_still_resolves_offline(self) -> None:
+        result = resolve_workflow_intent_with_llm(
+            "Recommend a model to predict battery lifetime on MATR.", catalog=CATALOG
+        )
+        self.assertEqual(result["source"], "deterministic")
+        self.assertTrue(result["recommendation_requested"])
+        self.assertEqual(result["dataset"], "MATR")
+        self.assertEqual(result["task"], TASK_RUL)
+        self.assertEqual(result["suggested_model_keys"], [])
+
+    def test_naming_a_model_still_takes_the_fast_path(self) -> None:
+        result, stub = _resolve("Use CPTransformer on MATR to predict battery lifetime.")
+        self.assertEqual(stub.calls, [])
+        self.assertFalse(result["recommendation_requested"])
+
+    def test_the_detector_is_additive_over_the_llm(self) -> None:
+        """A request that plainly asks for one stays one even if the model says no."""
+        response = (
+            '{"dataset": "MATR", "task": "RUL prediction", "requested_model": null,'
+            ' "recommendation_requested": false, "needs_clarification": false,'
+            ' "suggested_model_keys": [], "user_facing_rationale": "ok"}'
+        )
+        result, _ = _resolve("Which model should I use for MATR lifetime?", response)
+        self.assertTrue(result["recommendation_requested"])
+
+    def test_a_non_boolean_flag_is_refused(self) -> None:
+        result = validate_llm_intent(
+            {"dataset": "MATR", "task": "rul", "recommendation_requested": "yes"}, CATALOG
+        )
+        self.assertFalse(result["recommendation_requested"])
+        self.assertTrue(any("recommendation_requested" in w for w in result["warnings"]))
+
+
+class TestArbitraryPhrasingWithAMockedLlm(unittest.TestCase):
+    """F: informal English and Chinese map onto canonical identifiers."""
+
+    def _answer(self, dataset, task, model=None, recommend=False):
+        model_json = f'"{model}"' if model else "null"
+        return (
+            f'{{"dataset": "{dataset}", "task": "{task}", "requested_model": {model_json},'
+            f' "recommendation_requested": {str(recommend).lower()},'
+            ' "needs_clarification": false, "clarification_question": null,'
+            ' "suggested_model_keys": [], "user_facing_rationale": "ok"}'
+        )
+
+    def test_informal_english_maps_to_canonical_ids(self) -> None:
+        cases = [
+            ("Use transformer on MATR to predict life", "cptransformer"),
+            ("Use BatLiNet on my MATR cells", "batlinet"),
+            ("stick xgboost on the MATR cells for ageing", "xgb"),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                result, stub = _resolve(
+                    text, self._answer("MATR", TASK_RUL, expected)
+                )
+                self.assertEqual(len(stub.calls), 1)
+                self.assertEqual(result["dataset"], "MATR")
+                self.assertEqual(result["task"], TASK_RUL)
+                self.assertEqual(result["requested_model"], expected)
+
+    def test_chinese_maps_to_canonical_ids(self) -> None:
+        result, _ = _resolve(
+            "我想在 MATR 上跑一个模型看看电池还能用多久",
+            self._answer("MATR", TASK_RUL, "cptransformer"),
+        )
+        self.assertEqual(result["dataset"], "MATR")
+        self.assertEqual(result["task"], TASK_RUL)
+        self.assertEqual(result["requested_model"], "cptransformer")
+
+    def test_a_trajectory_request_keeps_its_own_task(self) -> None:
+        result, _ = _resolve(
+            "我想预测未来容量衰减轨迹 on MATR",
+            self._answer("MATR", TASK_TRAJ),
+        )
+        self.assertEqual(result["task"], TASK_TRAJ)
+
+    def test_an_invented_model_key_is_refused_not_used(self) -> None:
+        result, _ = _resolve(
+            "Use the new fancy net on MATR for life",
+            self._answer("MATR", TASK_RUL, "FancyNet9000"),
+        )
+        self.assertIsNone(result["requested_model"])
+        self.assertEqual(result["requested_model_name"], "FancyNet9000")
+        self.assertIn(
+            "unknown_model", {item["kind"] for item in result["rejected"]}
+        )
+
+    def test_the_llm_never_marks_a_blocked_model_executable(self) -> None:
+        """Readiness, not the answer, decides; PBT stays blocked."""
+        result, _ = _resolve(
+            "run the pretrained thing on MATR for life",
+            '{"dataset": "MATR", "task": "RUL prediction", "requested_model": "PBT",'
+            ' "recommendation_requested": false, "needs_clarification": false,'
+            ' "suggested_model_keys": ["PBT"], "user_facing_rationale": "PBT is best."}',
+        )
+        # The key resolves — PBT is a real catalog entry — but readiness decides.
+        self.assertEqual(result["requested_model"], "PBT")
+        self.assertEqual(resolve_model_request("PBT", CONTEXT, CATALOG)["status"], "blocked")
+        self.assertEqual(filter_suggestions(["PBT"], CONTEXT)["runnable"], [])
+        self.assertEqual(filter_suggestions(["PBT"], CONTEXT)["blocked"], ["PBT"])
+
+    def test_a_partial_answer_is_completed_from_the_phrase_table(self) -> None:
+        """An LLM answer is never worse than the deterministic one it replaced."""
+        result, _ = _resolve(
+            "Which model should I use for MATR lifetime?",
+            '{"dataset": null, "task": null, "requested_model": null,'
+            ' "recommendation_requested": true, "needs_clarification": true,'
+            ' "clarification_question": null, "suggested_model_keys": [],'
+            ' "user_facing_rationale": "unsure"}',
+        )
+        self.assertEqual(result["dataset"], "MATR")
+        self.assertEqual(result["task"], TASK_RUL)
+        self.assertFalse(result["needs_clarification"])
+
+
 class TestModelRequestAgainstReadiness(unittest.TestCase):
     """Readiness, not the LLM, decides what a requested model means."""
 

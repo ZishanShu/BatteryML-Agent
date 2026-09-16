@@ -65,6 +65,26 @@ class _Ctx:
         return False
 
 
+class _ExpanderCtx:
+    """A container whose contents are recorded separately from the page body.
+
+    The real page hides the full model catalogues inside expanders, so a test
+    that asks "is the catalogue in the primary view?" needs the fake to keep
+    the two apart.
+    """
+
+    def __init__(self, fake):
+        self._fake = fake
+
+    def __enter__(self):
+        self._fake.in_expander = True
+        return self
+
+    def __exit__(self, *exc_info):
+        self._fake.in_expander = False
+        return False
+
+
 class _Col:
     def __init__(self, rec: dict):
         self._rec = rec
@@ -128,7 +148,10 @@ class FakeStreamlit:
             "progress": [],
             "tabs": [],
             "toasts": [],
+            "expanders": [],
+            "expander_writes": [],
         }
+        self.in_expander = False
 
     # --- text/display -------------------------------------------------
     def markdown(self, text, **kwargs):
@@ -144,7 +167,9 @@ class FakeStreamlit:
         self.rec["writes"].append(str(text))
 
     def write(self, *args, **kwargs):
-        self.rec["writes"].append(" ".join(str(a) for a in args))
+        text = " ".join(str(a) for a in args)
+        bucket = "expander_writes" if self.in_expander else "writes"
+        self.rec[bucket].append(text)
 
     def info(self, text, **kwargs):
         self.rec["infos"].append(str(text))
@@ -191,7 +216,8 @@ class FakeStreamlit:
         self.rec["toasts"].append(str(message))
 
     def expander(self, label, **kwargs):
-        return _Ctx()
+        self.rec["expanders"].append(str(label))
+        return _ExpanderCtx(self)
 
     def spinner(self, label, **kwargs):
         return _Ctx()
@@ -1041,43 +1067,82 @@ class TestLlmAssistedIntentInTheUi(unittest.TestCase):
 
     def test_blocked_model_is_reported_and_not_substituted(self) -> None:
         fake = FakeStreamlit({})
+        presentation = ui.build_model_presentation(
+            resolution={"requested_model": "PBT"},
+            workflow_context=_MATR_CONTEXT,
+            model_request={
+                "requested": "PBT",
+                "status": "blocked",
+                "model_key": "PBT",
+                "model_display": "PBT",
+                "reason": "PBT is NEEDS_ASSETS for this dataset and task: provide assets.",
+                "alternatives": ["cptransformer", "batlinet"],
+                "requires_confirmation": True,
+            },
+        )
         with _fake_streamlit(fake):
-            ui._render_model_request(
-                {
-                    "requested": "PBT",
-                    "status": "blocked",
-                    "model_key": "PBT",
-                    "model_display": "PBT",
-                    "reason": "PBT is NEEDS_ASSETS for this dataset and task: provide assets.",
-                    "alternatives": ["cptransformer", "batlinet"],
-                    "requires_confirmation": True,
-                }
-            )
-        self.assertIn("NEEDS_ASSETS", " ".join(fake.rec["warnings"]))
-        joined = " ".join(fake.rec["writes"])
+            ui._render_model_presentation(presentation)
+        joined = " ".join(fake.rec["writes"] + fake.rec["warnings"] + fake.rec["captions"])
+        self.assertIn("NEEDS_ASSETS", joined)
         self.assertIn("cptransformer", joined)
-        self.assertIn("nothing was substituted for you", joined)
+        self.assertIn("Nothing was substituted", joined)
+        # The blocked model is never offered as a choice.
+        self.assertNotIn("PBT", ui.selectbox_options(presentation))
+        self.assertEqual(ui.selectbox_options(presentation)[0], ui.NO_SELECTION)
 
-    def test_runnable_request_renders_no_warning(self) -> None:
+    def test_a_requested_ready_model_is_shown_alone(self) -> None:
         fake = FakeStreamlit({})
+        presentation = ui.build_model_presentation(
+            resolution={"requested_model": "cptransformer"},
+            workflow_context=_MATR_CONTEXT,
+            model_request={
+                "requested": "cptransformer",
+                "status": "runnable",
+                "model_key": "cptransformer",
+                "model_display": "CPTransformer",
+                "reason": "",
+                "alternatives": ["batlinet"],
+                "requires_confirmation": False,
+            },
+        )
         with _fake_streamlit(fake):
-            ui._render_model_request(
-                {"requested": "batlinet", "status": "runnable", "model_key": "batlinet",
-                 "model_display": "BatLiNet", "reason": "", "alternatives": [],
-                 "requires_confirmation": False}
-            )
-        self.assertEqual(fake.rec["warnings"], [])
+            ui._render_model_presentation(presentation)
+        named = " ".join(fake.rec["writes"])
+        self.assertIn("CPTransformer", named)
+        # The other runnable model is not dumped into the primary view.
+        self.assertNotIn("BatLiNet", named)
+        self.assertIn("BatLiNet", " ".join(fake.rec["expander_writes"]))
+        self.assertEqual(presentation["default_model"], "cptransformer")
+
+    def test_the_full_list_appears_only_behind_an_expander(self) -> None:
+        fake = FakeStreamlit({})
+        presentation = ui.build_model_presentation(
+            resolution={"requested_model": "cptransformer"},
+            workflow_context=_MATR_CONTEXT,
+            model_request={
+                "requested": "cptransformer", "status": "runnable",
+                "model_key": "cptransformer", "model_display": "CPTransformer",
+                "reason": "", "alternatives": [], "requires_confirmation": False,
+            },
+        )
+        with _fake_streamlit(fake):
+            ui._render_model_presentation(presentation)
+        self.assertTrue(
+            any("Show all compatible models" in label for label in fake.rec["expanders"])
+        )
 
     def test_blocked_suggestions_are_never_offered_as_runnable(self) -> None:
         fake = FakeStreamlit({})
+        presentation = ui.build_model_presentation(
+            resolution={"recommendation_requested": True},
+            workflow_context=_MATR_CONTEXT,
+            suggestions={"runnable": ["cptransformer"], "blocked": ["PBT"], "unknown": ["MegaNet"]},
+        )
         with _fake_streamlit(fake):
-            ui._render_suggestions(
-                {"runnable": ["cptransformer"], "blocked": ["PBT"], "unknown": ["MegaNet"]}
-            )
-        joined = " ".join(fake.rec["writes"])
-        self.assertIn("runnable now:** cptransformer", joined)
-        self.assertIn("blocked:** PBT", joined)
-        self.assertIn("these cannot be run", joined)
+            ui._render_model_presentation(presentation)
+        self.assertEqual([e["model"] for e in presentation["primary"]], ["cptransformer"])
+        self.assertEqual([e["model"] for e in presentation["blocked_focus"]], ["PBT"])
+        self.assertNotIn("PBT", presentation["selectable"])
 
     def test_analysis_stores_canonical_state_and_never_executes(self) -> None:
         real_resolve = ui.resolve_workflow_intent_with_llm
