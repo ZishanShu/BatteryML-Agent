@@ -57,18 +57,34 @@ SIDEBAR_COMPACT_CSS = """
     padding-bottom: 1rem;
 }
 
-/* The gap Streamlit puts between every stacked element in the sidebar.
-   Not below 0.4rem: see the note above on the heading's overflow. */
+/* The gap Streamlit puts between every stacked element in the sidebar, and
+   the single value that sets the sidebar's vertical rhythm: measured in a
+   browser, *every* top-level block is separated by exactly this and nothing
+   else, from the project label down to the LLM status line.
+   0.4rem (6.4px) left the list looking loose against its own 40px buttons;
+   0.25rem (4px) is a visible tightening that still reads as separation
+   rather than as two controls touching.
+
+   The old floor of 0.4rem was not about rhythm. It existed because
+   Streamlit's sidebar heading overflows its container by ~16px, so a
+   smaller gap let the title land on its own caption. That overflow is now
+   pinned by the brand rule below, whose negative margin is kept equal and
+   opposite to this value — so the header's spacing is unchanged by anything
+   here. Change one and the other must change with it; the test and UI-01
+   both check the pair, not the number. */
 [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
-    gap: 0.4rem;
+    gap: 0.25rem;
 }
 
-/* Dividers: keep the rule, drop the air around it. Five dividers separate
-   the sidebar's sections, so this is worth several lines of height. */
+/* Dividers: keep the rule, drop the air around it. Held below the block gap
+   so the rule never adds height of its own — measured, these margins collapse
+   against the gap and contribute nothing, and the section break the divider
+   marks comes out at two gaps (8px) against the list's 4px. That contrast is
+   what still reads as a break rather than as one more row. */
 [data-testid="stSidebar"] hr,
 [data-testid="stSidebar"] [data-testid="stDivider"] {
-    margin-top: 0.3rem;
-    margin-bottom: 0.3rem;
+    margin-top: 0.2rem;
+    margin-bottom: 0.2rem;
 }
 
 /* "BatteryML", "Current project", "Protocol Workflow". Reduced, not zeroed. */
@@ -94,20 +110,20 @@ SIDEBAR_COMPACT_CSS = """
    touching the title's descenders.
 
    Replacing it with a known value lets the heading occupy the height it
-   actually draws. -0.4rem, not 0: the pair has to read as one, which means
+   actually draws. Negative, not 0: the pair has to read as one, which means
    the space inside it must be smaller than the space below it. At 0 both
-   came out at 6.4px and the subtitle was equally attached to the title above
-   it and to "Current project" below — no grouping at all. -0.4rem cancels
-   exactly one block gap, so the subtitle sits against the heading's own
-   0.2rem bottom padding instead. Measured after the change: 2.8px between
-   the two lines of text against 6.4px below them. That padding is what
-   guarantees the clearance, which is why this can tighten the pair without
-   ever reaching the title's ink.
+   came out the same and the subtitle was equally attached to the title above
+   it and to "Current project" below — no grouping at all.
 
-   The 0.4rem floor on the block gap is unchanged and still required — the
-   captions elsewhere in the sidebar carry the same -16px and rely on it.
-   This rule narrows the fix to the one element where the overflow landed on
-   a 28px heading instead of a 17px caption.
+   **This value is kept equal and opposite to the block gap above.** Cancelling
+   exactly one gap lands the subtitle against the heading's own 0.2rem bottom
+   padding whatever that gap is, so the brand lockup holds still while the
+   rest of the sidebar's rhythm is tuned: measured at 2.8px between the two
+   lines of text at gap 0.4rem, and the same 2.8px at 0.25rem. The heading's
+   padding is what guarantees that clearance, which is why this can tighten
+   the pair without ever reaching the title's ink. If the gap changes again,
+   change this with it — it is the pairing, not either number, that keeps the
+   title off its caption.
 
    Scoped by `:has(> h3)` because the sidebar contains exactly one heading —
    the brand title — so this cannot reach "Current project", "Protocol
@@ -116,7 +132,7 @@ SIDEBAR_COMPACT_CSS = """
    previous spacing, which is the same graceful failure as every other
    selector here. */
 [data-testid="stSidebar"] [data-testid="stMarkdownContainer"]:has(> h3) {
-    margin-bottom: -0.4rem;
+    margin-bottom: -0.25rem;
 }
 
 /* Captions — the grey secondary lines under each entry. Type size only.
@@ -143,9 +159,16 @@ SIDEBAR_COMPACT_CSS = """
     padding-top: 0.3rem;
     padding-bottom: 0.3rem;
 }
+/* The settings disclosure was the one block that broke the rhythm: it carried
+   0.15rem of its own margin on each side, so measured border-to-border it sat
+   6.4px from the Prev/Next row above and 6.4px from the status line below
+   while every other pair in the sidebar was 4px. Zeroed, not reduced — the
+   block gap already separates it, and a control that supplies its own margin
+   on top of that is the definition of an uneven list. Its own box, border and
+   padding are untouched, so the control is the same size it was. */
 [data-testid="stSidebar"] [data-testid="stExpander"] {
-    margin-top: 0.15rem;
-    margin-bottom: 0.15rem;
+    margin-top: 0;
+    margin-bottom: 0;
 }
 </style>
 """

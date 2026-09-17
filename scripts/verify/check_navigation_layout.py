@@ -14,9 +14,11 @@ second:
   contains every capability the two tabs had.
 * **`UX-10`** — the sidebar stylesheet adjusts spacing only, is scoped to
   the sidebar, hides nothing, relies on no generated class name, and keeps
-  the two values a browser run pinned down: the block gap at or above
-  `0.4rem` and a non-zero heading padding. Below those the sidebar heading,
-  which overflows its own container by ~16px, lands on top of its caption.
+  the values a browser run pinned down: the block gap at or above
+  `0.25rem`, a non-zero heading padding, and a brand margin that cancels
+  exactly one block gap. The sidebar heading overflows its own container by
+  ~16px; that last pairing is what stops it landing on its caption, and it
+  holds at any gap.
 
 This check renders nothing, starts no server and writes nothing outside its
 own report.
@@ -80,8 +82,14 @@ SIDEBAR_CAPTION_REM = (0.80, 0.85)
 #: clipped the second line of a wrapped caption behind the button beneath it.
 CAPTION_FORBIDDEN_ROOTS = {"margin", "padding", "height", "overflow"}
 
-#: Below this the sidebar heading overlaps its own caption. Measured, not guessed.
-MINIMUM_BLOCK_GAP_REM = 0.4
+#: The sidebar's whole vertical rhythm: measured in a browser, every
+#: top-level block is separated by this and nothing else. The floor is about
+#: legibility, not collision — below it the controls stop reading as separate
+#: rows. It used to be 0.4rem for a different reason: the heading's ~16px
+#: overflow had nothing else holding it back, so a smaller gap put the title
+#: on its own caption. The brand rule now cancels exactly one block gap, which
+#: holds the header steady at any value, and the pairing is checked below.
+MINIMUM_BLOCK_GAP_REM = 0.25
 
 _GENERATED_CLASS = re.compile(r"\.(css|st-emotion)-[0-9a-z]{4,}")
 
@@ -333,10 +341,31 @@ def _check_sidebar_stylesheet(root: Path, errors: list[str], observed: dict) -> 
         if float(gap.group(1)) < MINIMUM_BLOCK_GAP_REM:
             errors.append(
                 f"the sidebar block gap is {gap.group(1)}rem, below "
-                f"{MINIMUM_BLOCK_GAP_REM}rem. Streamlit's sidebar heading "
-                "overflows its container by ~16px, so a smaller gap puts the "
-                "title on top of its own caption (UX-10)."
+                f"{MINIMUM_BLOCK_GAP_REM}rem. This one value sets the spacing "
+                "between every block in the sidebar; below the floor the "
+                "controls stop reading as separate rows (UX-10)."
             )
+        brand = re.search(
+            r":has\(> h3\)\s*\{[^}]*margin-bottom:\s*(-?[0-9.]+)rem",
+            SIDEBAR_COMPACT_CSS,
+        )
+        if brand is None:
+            errors.append(
+                "the sidebar brand heading no longer pins its bottom margin. "
+                "Streamlit's heading overflows its container by ~16px, and "
+                "that rule is what stops the title landing on its own caption "
+                "(UX-10, UX-11)."
+            )
+        else:
+            observed["brand_margin_rem"] = float(brand.group(1))
+            if abs(float(brand.group(1)) + float(gap.group(1))) > 1e-4:
+                errors.append(
+                    f"the sidebar brand margin is {brand.group(1)}rem but the "
+                    f"block gap is {gap.group(1)}rem. The margin must cancel "
+                    "exactly one gap, or 'Protocol Navigator' drifts into or "
+                    "away from 'BatteryML' whenever the rhythm is retuned "
+                    "(UX-10, UX-11)."
+                )
 
     headings = re.search(r"stSidebar\"\]\s*h4\s*\{([^}]*)\}", SIDEBAR_COMPACT_CSS)
     if headings is None:

@@ -456,8 +456,40 @@ class TestSidebarIsCompact(unittest.TestCase):
         gap = re.search(r"stVerticalBlock\"\]\s*\{[^}]*gap:\s*([0-9.]+)rem", self.css)
         self.assertIsNotNone(gap, "the sidebar must still set the block gap")
         self.assertGreaterEqual(
-            float(gap.group(1)), 0.4,
-            "a gap below 0.4rem lets the sidebar heading overlap its caption",
+            float(gap.group(1)), 0.25,
+            "below 0.25rem the sidebar's controls stop reading as separate rows",
+        )
+
+    def test_the_brand_margin_stays_coupled_to_the_block_gap(self) -> None:
+        """What now keeps the title off its own caption, in place of a floor.
+
+        The gap used to be floored at 0.4rem because the heading's ~16px
+        overflow had nothing else holding it back. It does now: the brand
+        rule cancels exactly one block gap, which lands the subtitle against
+        the heading's own padding *whatever the gap is*. Measured in a
+        browser at both values — 2.8px between the two lines of text at
+        0.4rem, and the same 2.8px at 0.25rem.
+
+        So the invariant is the pairing, not either number, and this asserts
+        the pairing. Tuning the sidebar's rhythm without moving the brand
+        margin with it is the regression this catches — and it is a stronger
+        guarantee than the floor it replaces, because it holds at any gap.
+        """
+        gap = re.search(r"stVerticalBlock\"\]\s*\{[^}]*gap:\s*([0-9.]+)rem", self.css)
+        self.assertIsNotNone(gap, "the sidebar must still set the block gap")
+        brand = re.search(
+            r":has\(> h3\)\s*\{[^}]*margin-bottom:\s*(-?[0-9.]+)rem", self.css
+        )
+        self.assertIsNotNone(
+            brand, "the brand heading rule must still set a bottom margin"
+        )
+        self.assertAlmostEqual(
+            float(brand.group(1)), -float(gap.group(1)), places=4,
+            msg=(
+                f"the brand margin ({brand.group(1)}rem) no longer cancels the "
+                f"block gap ({gap.group(1)}rem); 'Protocol Navigator' will "
+                "drift into or away from 'BatteryML'"
+            ),
         )
         headings = re.search(
             r"stSidebar\"\]\s*h4\s*\{([^}]*)\}", self.css
