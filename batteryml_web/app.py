@@ -1387,6 +1387,53 @@ def render_llm_output_panel(output_key: str, title: str) -> None:
         st.markdown(output)
 
 
+def _render_run_model_without_datasets() -> None:
+    """Run Model with no dataset registered: say so, and point somewhere useful.
+
+    The page used to build its four tabs regardless. With nothing to offer,
+    the dataset selectbox returns ``None``, and the configuration summary
+    then did ``readiness[None]`` and killed the page with ``KeyError: None``
+    — an ordinary empty state presented as a crash.
+
+    The execution controls are omitted rather than shown disabled. There is
+    no dataset to configure a run against, and a Run button that can never
+    be pressed says less than a sentence naming what is missing. Nothing is
+    selected on the user's behalf: no dataset is invented to fill the gap,
+    and the session's dataset is left exactly as it was.
+
+    What stays is the way out: the two pages that create the missing
+    dataset, and the step navigation.
+    """
+    st.info("No datasets are currently available. Prepare or upload a dataset first.")
+    st.caption(
+        "Run Model executes a BatteryML run against a registered dataset, so "
+        "there is nothing to select, configure or run until one exists."
+    )
+    st.markdown("**Where to go next**")
+    st.write(
+        "- **Prepare Data** — preprocess a dataset already under `data/raw/`, "
+        "or upload your own raw cycling files under Custom Dataset / Schema "
+        "Mapping."
+    )
+    st.write("- **Home** — create or load a project first, if you have not yet.")
+    prepare_col, home_col = st.columns(2)
+    with prepare_col:
+        if st.button(
+            "Go to Prepare Data",
+            use_container_width=True,
+            key="run_empty_go_prepare_data",
+        ):
+            set_current_step("prepare_data")
+    with home_col:
+        if st.button(
+            "Go to Home",
+            use_container_width=True,
+            key="run_empty_go_home",
+        ):
+            set_current_step("home")
+    render_bottom_step_navigation()
+
+
 def render_run_model_page():
     st.header("🚀 Run Model", anchor=False)
     st.caption("Configure dataset, prediction task, model, device, and execute the deterministic BatteryML workflow.")
@@ -1394,6 +1441,13 @@ def render_run_model_page():
     datasets = _ui_dataset_options()
     tasks = ["RUL prediction", "SOH estimation"]
     readiness = {ds: _dataset_card(ds) for ds in datasets}
+
+    # Checked once, here, rather than inside each tab: every tab below reads a
+    # selected dataset, and `readiness` is keyed by the datasets that exist, so
+    # with none of them there is no key to look up and nothing to run.
+    if not datasets:
+        _render_run_model_without_datasets()
+        return
 
     tabs = st.tabs(["Configuration", "Dataset Readiness", "Command & Run", "Logs / Debug"])
 
