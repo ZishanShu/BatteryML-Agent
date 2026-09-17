@@ -183,12 +183,73 @@ class ConfigRegistry:
                 return ds
         return None
 
+    #: Label annotator class name -> canonical task. This is the authoritative
+    #: signal: the annotator *is* what the config trains against, so it cannot
+    #: disagree with the task the way a filename or a stray parameter can.
+    _TASK_BY_ANNOTATOR = {
+        "sohlabelannotator": "SOH estimation",
+        "cyclesohlabelannotator": "SOH estimation",
+        "rullabelannotator": "RUL prediction",
+    }
+
+    #: Parameter names that contain a task word but say nothing about the task.
+    #: ``eol_soh`` is RUL's end-of-life *threshold* — the SOH value at which a
+    #: cell is declared dead — and every RUL baseline config carries it.
+    _TASK_DECOYS = ("eol_soh",)
+
     def _infer_task(self, hay: str, data: dict[str, Any]) -> str | None:
-        label = data.get("label", {}) if isinstance(data, dict) else {}
-        label_name = str(label.get("name", "")).lower() if isinstance(label, dict) else ""
-        if any(x in hay or x in label_name for x in ("soh", "state of health")):
+        """The canonical task this config trains, from structure not substrings.
+
+        Substring matching over the whole YAML used to decide this, and it was
+        wrong for 42 of the 44 configs it called SOH: every RUL baseline sets
+        ``label: {name: RULLabelAnnotator, eol_soh: 0.9}``, and ``eol_soh``
+        contains ``soh``. Lifetime prediction was being advertised as state-of-
+        health estimation across the whole catalog.
+
+        The hierarchy is now:
+
+        1. an explicit ``task:`` field, when a config declares one;
+        2. the label annotator's registered class name;
+        3. the ``configs/<task>/`` directory, documented as a fallback for a
+           config that names neither.
+
+        A parameter name is never a signal.
+        """
+        if isinstance(data, dict):
+            declared = str(data.get("task", "") or "").strip()
+            if declared:
+                canonical = self._canonical_task(declared)
+                if canonical:
+                    return canonical
+
+            label = data.get("label", {})
+            if isinstance(label, dict):
+                annotator = str(label.get("name", "") or "").strip().lower()
+                if annotator in self._TASK_BY_ANNOTATOR:
+                    return self._TASK_BY_ANNOTATOR[annotator]
+                # An unregistered annotator whose own name states the task.
+                if annotator.startswith("soh") or "stateofhealth" in annotator:
+                    return "SOH estimation"
+                if annotator.startswith("rul"):
+                    return "RUL prediction"
+
+        # Fallback: the directory the repository files the config under. The
+        # decoy parameters are stripped first so they cannot leak back in.
+        path_hay = hay
+        for decoy in self._TASK_DECOYS:
+            path_hay = path_hay.replace(decoy, "")
+        if "configs/soh/" in path_hay or "configs\\soh\\" in path_hay:
             return "SOH estimation"
-        if any(x in hay or x in label_name for x in ("rul", "remaining useful life")):
+        if "configs/rul/" in path_hay or "configs\\rul\\" in path_hay:
+            return "RUL prediction"
+        return None
+
+    @staticmethod
+    def _canonical_task(declared: str) -> str | None:
+        lowered = declared.strip().lower()
+        if lowered.startswith("soh") or "state of health" in lowered:
+            return "SOH estimation"
+        if lowered.startswith("rul") or "remaining useful life" in lowered:
             return "RUL prediction"
         return None
 
