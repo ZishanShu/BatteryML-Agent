@@ -80,6 +80,45 @@ SIDEBAR_COMPACT_CSS = """
     padding-bottom: 0.2rem;
 }
 
+/* The brand block at the very top: "BatteryML" over "Protocol Navigator".
+   These two lines are one lockup and must read as one, which means the space
+   between them has to be smaller than the space below them — and, before
+   this rule, it was negative.
+
+   Streamlit gives every markdown container `margin-bottom: -16px`. On a
+   caption that is harmless; on the heading it collapses a 28px title into a
+   12px container, so the element after it starts *inside* the title's own
+   line box. Measured in a browser: the title's ink ran to y=84.0 while the
+   caption beneath it began at y=74.4 — a 9.6px overlap, which is why
+   "Protocol Navigator" sat jammed under "BatteryML" with its capitals
+   touching the title's descenders.
+
+   Replacing it with a known value lets the heading occupy the height it
+   actually draws. -0.4rem, not 0: the pair has to read as one, which means
+   the space inside it must be smaller than the space below it. At 0 both
+   came out at 6.4px and the subtitle was equally attached to the title above
+   it and to "Current project" below — no grouping at all. -0.4rem cancels
+   exactly one block gap, so the subtitle sits against the heading's own
+   0.2rem bottom padding instead. Measured after the change: 2.8px between
+   the two lines of text against 6.4px below them. That padding is what
+   guarantees the clearance, which is why this can tighten the pair without
+   ever reaching the title's ink.
+
+   The 0.4rem floor on the block gap is unchanged and still required — the
+   captions elsewhere in the sidebar carry the same -16px and rely on it.
+   This rule narrows the fix to the one element where the overflow landed on
+   a 28px heading instead of a 17px caption.
+
+   Scoped by `:has(> h3)` because the sidebar contains exactly one heading —
+   the brand title — so this cannot reach "Current project", "Protocol
+   Workflow", any caption or any navigation entry. Where `:has()` is
+   unsupported the rule simply does not match and the header keeps its
+   previous spacing, which is the same graceful failure as every other
+   selector here. */
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"]:has(> h3) {
+    margin-bottom: -0.4rem;
+}
+
 /* Captions — the grey secondary lines under each entry. Type size only.
 
    Their *spacing* is deliberately left alone: tightening a caption's margin
