@@ -32,8 +32,10 @@ from typing import Any, Dict, List, Optional
 
 from .result_views import (
     RUL_SCHEMA,
+    SOH_SCHEMA,
     TRAJECTORY_SCHEMA,
     build_rul_view,
+    build_soh_view,
     build_trajectory_view,
     detect_schema,
 )
@@ -47,6 +49,15 @@ SUPPORTED_PREVIEW_FORMATS: tuple[str, ...] = (
     "CSV tables (.csv)",
     "JSON documents (.json)",
 )
+
+#: What each recognised schema means, in one line a battery scientist reads.
+#: A dict rather than a conditional so a schema this module does not know
+#: says so instead of being described as the last branch of an if/else.
+_OUTPUT_KIND: Dict[str, str] = {
+    RUL_SCHEMA: "Scalar prediction per cell (lifetime / RUL)",
+    SOH_SCHEMA: "Scalar prediction per cycle of each cell (SOH ratio)",
+    TRAJECTORY_SCHEMA: "Sequence per cell (degradation trajectory)",
+}
 
 KIND_BATTERYML_PREDICTION = "batteryml_prediction"
 KIND_UNSUPPORTED_PICKLE = "unsupported_pickle"
@@ -133,7 +144,7 @@ def _is_prediction_payload(payload: Any) -> bool:
     """
     if not isinstance(payload, dict) or "prediction" not in payload:
         return False
-    return detect_schema(payload) in (RUL_SCHEMA, TRAJECTORY_SCHEMA)
+    return detect_schema(payload) in (RUL_SCHEMA, SOH_SCHEMA, TRAJECTORY_SCHEMA)
 
 
 def preview_prediction_file(path: str | Path) -> Dict[str, Any]:
@@ -155,6 +166,7 @@ def preview_prediction_file(path: str | Path) -> Dict[str, Any]:
         "summary": {},
         "structure": {},
         "rul": None,
+        "soh": None,
         "trajectory": None,
     }
 
@@ -186,8 +198,10 @@ def preview_prediction_file(path: str | Path) -> Dict[str, Any]:
     result["schema"] = schema
 
     rul = build_rul_view(payload) if schema == RUL_SCHEMA else None
+    soh = build_soh_view(payload) if schema == SOH_SCHEMA else None
     trajectory = build_trajectory_view(payload) if schema == TRAJECTORY_SCHEMA else None
     result["rul"] = rul
+    result["soh"] = soh
     result["trajectory"] = trajectory
 
     prediction = payload.get("prediction")
@@ -195,6 +209,8 @@ def preview_prediction_file(path: str | Path) -> Dict[str, Any]:
     count: Optional[int] = None
     if rul and rul.get("available"):
         count = int(rul["count"])
+    elif soh and soh.get("available"):
+        count = int(soh["count"])
     elif trajectory and trajectory.get("available"):
         count = int(trajectory["count"])
     elif hasattr(prediction, "__len__"):
@@ -204,13 +220,9 @@ def preview_prediction_file(path: str | Path) -> Dict[str, Any]:
             count = None
 
     result["summary"] = {
-        "Output kind": (
-            "Scalar prediction per cell (lifetime / RUL)"
-            if schema == RUL_SCHEMA
-            else "Sequence per cell (degradation trajectory)"
-        ),
+        "Output kind": _OUTPUT_KIND.get(schema, "Unrecognised prediction shape"),
         "Predictions": "Not available" if count is None else str(count),
-        "Ground truth stored": "Yes" if _has_ground_truth(rul, trajectory) else "No",
+        "Ground truth stored": "Yes" if _has_ground_truth(rul, soh, trajectory) else "No",
         "Seed recorded": str(payload.get("seed")) if payload.get("seed") is not None else "Not recorded",
         # Presence only. The values themselves stay with the canonical
         # result context; this panel does not restate or recompute them.
@@ -219,9 +231,15 @@ def preview_prediction_file(path: str | Path) -> Dict[str, Any]:
     return result
 
 
-def _has_ground_truth(rul: Optional[Dict[str, Any]], trajectory: Optional[Dict[str, Any]]) -> bool:
+def _has_ground_truth(
+    rul: Optional[Dict[str, Any]],
+    soh: Optional[Dict[str, Any]],
+    trajectory: Optional[Dict[str, Any]],
+) -> bool:
     if rul is not None:
         return bool(rul.get("available"))
+    if soh is not None:
+        return bool(soh.get("available"))
     if trajectory is not None:
         return bool(trajectory.get("observed"))
     return False

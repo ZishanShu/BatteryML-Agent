@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -119,7 +120,7 @@ from .settings_panel import (
     render_llm_configuration_prompt,
     request_llm_configuration,
 )
-from .errors import render_copy_control
+from .errors import format_details, render_copy_control, render_error
 from .feedback import (
     EVENT_EXPLANATION_READY,
     EVENT_PLAN_READY,
@@ -135,6 +136,11 @@ from .progress_utils import get_safe_runtime_env
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 RUN_BUTTON_LABEL = "Run"
+#: The same control after this page has executed something. Running a second
+#: time is a normal, expected act — a fresh run id, a fresh directory, the
+#: earlier run untouched in history — so the button says so instead of
+#: looking like the first run all over again.
+RUN_AGAIN_BUTTON_LABEL = "Run again"
 #: Offered for any run that is executing, whatever the model. Stopping is
 #: independent of whether that model can later be resumed — conflating them
 #: would hide Stop from exactly the long runs that need it. The backend state
@@ -151,7 +157,25 @@ PENDING_RUN_ID_KEY = "agent_pending_run_id"
 PENDING_RUN_SUBJECT_KEY = "agent_pending_run_subject"
 
 #: Session key holding the id of the run this page is currently watching.
+#: Set when Run is pressed and cleared the moment the run reaches a terminal
+#: state — before the results are read, so a failure to read them cannot
+#: leave the page believing a finished run is still in flight.
 ACTIVE_RUN_KEY = "agent_active_run_id"
+
+#: Session key holding why a *finished* run's results could not be read. The
+#: run still happened and its files are on disk; this says the reading
+#: failed, which is a different claim from the run failing.
+RESULT_ERROR_KEY = "agent_result_error"
+
+#: Session key recording that this page has launched at least one run, which
+#: is what turns "Run" into "Run again". Independent of whether that run
+#: succeeded: a failed or cancelled run is still a run that happened.
+EXECUTED_KEY = "agent_has_executed"
+
+#: Session key holding the signature of the plan the last Run executed, used
+#: to drop results that no longer describe the plan on screen. See
+#: :func:`executed_plan_signature` for why it is not the argv.
+RUN_SIGNATURE_KEY = "agent_run_signature"
 
 #: How often the progress fragment re-draws while a run is in flight. A
 #: polled refresh, not a rerun loop: the script is not re-executed whole.
@@ -894,7 +918,11 @@ def _analyze_request(trimmed: str) -> None:
         "agent_result_context",
         "agent_explanation",
         "agent_explanation_failure",
-        "agent_run_signature",
+        RUN_SIGNATURE_KEY,
+        RESULT_ERROR_KEY,
+        # A new request is a new subject, so the control reads "Run" again
+        # rather than offering to repeat an experiment nobody asked for.
+        EXECUTED_KEY,
         "agent_model_request",
         "agent_suggestions",
         # C5: a new request must not leave the previous run's identity or
@@ -1014,6 +1042,51 @@ def pending_run_subject(
     """
     return json.dumps(
         [dataset, model, str(seed), device, bool(smoke)], sort_keys=True
+    )
+
+
+def _has_executed(session_state) -> bool:
+    """Whether this page has already launched a run in this session."""
+    return bool(session_state.get(EXECUTED_KEY))
+
+
+def executed_plan_signature(
+    plan: dict[str, Any] | None,
+    *,
+    device: Any,
+    seed: Any,
+    smoke: bool,
+) -> str:
+    """Identify *which experiment* a plan describes, run identity excluded.
+
+    Deliberately not the plan's argv. The argv carries
+    ``--workspace <agent workspace>/<run_id>``, and the reserved run id is
+    re-minted on the very next script run after a launch (the reservation is
+    spent by pressing Run). A signature taken from the argv therefore
+    differs from the stored one on every rerun that follows a run, for a
+    plan nobody touched — so the staleness guard fired unconditionally and
+    deleted the finished run's results before the page could draw them.
+
+    What makes two runs the same experiment is the dataset, the task, the
+    model, the validated config, the epoch override, the device and the
+    seed. Those are compared here; the run's own identity is not part of the
+    question.
+    """
+    if not isinstance(plan, dict):
+        return ""
+    return json.dumps(
+        [
+            plan.get("dataset"),
+            plan.get("task"),
+            plan.get("model"),
+            plan.get("config_path"),
+            plan.get("epochs"),
+            str(device),
+            str(seed),
+            bool(smoke),
+        ],
+        sort_keys=True,
+        default=str,
     )
 
 
@@ -1187,44 +1260,108 @@ def _finish_active_run(run_id: str, snapshot: dict[str, Any], *, smoke: bool) ->
     A result context is built **only** for a run that completed. A cancelled
     or failed run has measured nothing, so none is built and no metric is
     offered for it.
+
+    **The run is released before any work that can fail.** This ordering is
+    the fix for "it runs once and then never again": reading the artifacts
+    used to come first, and ``ACTIVE_RUN_KEY`` was cleared at the very end.
+    Anything that raised in between — a result context the artifact loader
+    rejects, a value the state serializer will not take — reached the page
+    error boundary with the key still set, so the next script run re-entered
+    the same failing branch, and the Run button, which is drawn only when no
+    run is active, never came back. A terminal run is terminal whatever
+    happens to its results, so the lifecycle is settled first and the
+    reporting is fallible afterwards.
     """
     manager = get_run_manager()
     handle = manager.get(run_id)
+    # Read from the handle *before* dropping it; both are cheap and neither
+    # can raise. ``result`` is published together with the terminal status
+    # under the handle's lock, so a finished snapshot implies a real result.
     result = dict(getattr(handle, "result", None) or {})
+    run_dir = getattr(handle, "run_dir", None)
     status = str(snapshot.get("status") or "")
-    result_context = None
-    if status == rm.STATUS_COMPLETED and result.get("success"):
-        workspace = result.get("workspace")
-        plan = st.session_state.get("agent_execution_plan") or {}
-        if workspace:
-            result_context = build_result_context(
-                workspace,
-                dataset=plan.get("dataset"),
-                task=plan.get("task"),
-                model=plan.get("model"),
-                config_path=plan.get("config_path"),
-                run_status="SUCCESS",
-                execution_result=result,
-                smoke_run=smoke,
-            )
-            metrics = (result_context or {}).get("metrics") or {}
-            if metrics:
-                try:
-                    rm.update_manifest(
-                        handle.run_dir, {"metrics": dict(metrics)},
-                        enforce_transition=False,
-                    )
-                except (FileNotFoundError, ValueError):
-                    pass
-    _store_json_state("agent_execution_result", _compact_execution_output(result))
-    _store_json_state("agent_result_context", result_context)
+
+    # --- release first. Nothing below this point can wedge the page. ---
+    st.session_state.pop(ACTIVE_RUN_KEY, None)
+    st.session_state.pop(f"cancelling_{run_id}", None)
+    manager.forget(run_id)
+    # The ETA estimator exists only while its run does; keeping it would let
+    # a later run of the same id inherit another run's timing history.
+    timers = st.session_state.get("_agent_progress_timers")
+    if isinstance(timers, dict):
+        timers.pop(run_id, None)
     st.session_state["agent_run_serial"] = (
         int(st.session_state.get("agent_run_serial", 0)) + 1
     )
     st.session_state["last_run_status"] = status.lower()
     st.session_state["last_run_code"] = result.get("returncode")
-    st.session_state.pop(ACTIVE_RUN_KEY, None)
-    manager.forget(run_id)
+    st.session_state.pop(RESULT_ERROR_KEY, None)
+
+    # --- then report. A failure here costs the results, not the page. ---
+    try:
+        _store_json_state(
+            "agent_execution_result", _compact_execution_output(result)
+        )
+        _store_json_state(
+            "agent_result_context",
+            _result_context_for(
+                status, result, run_dir=run_dir, smoke=smoke
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+        # Loud, and named: the run itself finished and its files are on disk,
+        # so the honest message says the reading failed, not the run.
+        traceback.print_exc()
+        st.session_state.pop("agent_result_context", None)
+        st.session_state[RESULT_ERROR_KEY] = format_details(
+            exc,
+            context={
+                "run_id": run_id,
+                "run_status": status,
+                "workspace": result.get("workspace"),
+            },
+        )
+
+
+def _result_context_for(
+    status: str,
+    result: dict[str, Any],
+    *,
+    run_dir: Any,
+    smoke: bool,
+) -> dict[str, Any] | None:
+    """The backend result context for a finished run, or None.
+
+    Split out of :func:`_finish_active_run` so the fallible part is one
+    function with no session-state lifecycle in it. Returns None — rather
+    than raising — for a run that has nothing to report: cancelled, failed,
+    or completed without a workspace.
+    """
+    if status != rm.STATUS_COMPLETED or not result.get("success"):
+        return None
+    workspace = result.get("workspace")
+    if not workspace:
+        return None
+    plan = st.session_state.get("agent_execution_plan") or {}
+    context = build_result_context(
+        workspace,
+        dataset=plan.get("dataset"),
+        task=plan.get("task"),
+        model=plan.get("model"),
+        config_path=plan.get("config_path"),
+        run_status="SUCCESS",
+        execution_result=result,
+        smoke_run=smoke,
+    )
+    metrics = (context or {}).get("metrics") or {}
+    if metrics and run_dir is not None:
+        try:
+            rm.update_manifest(
+                run_dir, {"metrics": dict(metrics)}, enforce_transition=False,
+            )
+        except (FileNotFoundError, ValueError):
+            pass
+    return context
 
 
 def _render_active_run(
@@ -1233,12 +1370,18 @@ def _render_active_run(
     plan: dict[str, Any],
     smoke: bool,
     device: str,
-) -> None:
+) -> bool:
     """Status, live progress and a working Cancel for the run in flight.
 
     The refresh is a fragment on a timer, not a rerun loop: only this block
     re-executes, on a fixed interval, so the rest of the page (and the user's
     typing) is untouched and the server is not spun.
+
+    Returns whether a run is **still in flight**. False means this call
+    released the run, and the caller must draw the Run button on this same
+    script run: returning without either progress or a Run button is what
+    left the page with no execution control at all until the user happened
+    to click something else.
     """
     manager = get_run_manager()
     snapshot = manager.snapshot(run_id)
@@ -1251,12 +1394,16 @@ def _render_active_run(
             "recorded state is in Run History below."
         )
         st.session_state.pop(ACTIVE_RUN_KEY, None)
-        return
+        st.session_state.pop(f"cancelling_{run_id}", None)
+        return False
 
     if snapshot.get("finished"):
         _finish_active_run(run_id, snapshot, smoke=smoke)
+        # A full rerun so the results below are drawn from the state just
+        # stored. The lifecycle is already settled, so even if this rerun
+        # never happened the page would offer Run again.
         st.rerun()
-        return
+        return False
 
     st.caption(f"Run {run_id} is executing (started by an explicit user action).")
 
@@ -1264,6 +1411,10 @@ def _render_active_run(
     def _live() -> None:
         current = manager.snapshot(run_id)
         if current is None:
+            # The run vanished from the manager under us. A full-app rerun
+            # lets the outer branch above reconcile and offer Run again,
+            # rather than this fragment polling a run nobody tracks.
+            st.rerun()
             return
         event = current.get("event") or {}
         elapsed = float(current.get("elapsed_s") or 0.0)
@@ -1291,6 +1442,12 @@ def _render_active_run(
         if tail:
             st.code("\n".join(str(line) for line in tail[-LIVE_LOG_LINES:]), language="text")
         if current.get("finished"):
+            # A full-app rerun (the default scope), not a fragment-scoped
+            # one: the outer branch has to see the terminal snapshot to
+            # release the run. This poll is the *only* thing that detects
+            # the end of a run that reports no progress events at all — an
+            # sklearn fit such as Ridge emits none — so terminal detection
+            # deliberately reads the status, never the event stream.
             st.rerun()
 
     _live()
@@ -1306,6 +1463,9 @@ def _render_active_run(
         # Terminates this run's process group and nothing else.
         manager.cancel(run_id)
         st.rerun()
+
+    # Still executing: the caller must not draw Run beside a live Stop.
+    return True
 
 
 def _progress_timer(run_id: str) -> EpochTimer:
@@ -1329,10 +1489,16 @@ def _render_result_figures(result_context: dict[str, Any] | None) -> None:
     predictions_file = result_context.get("predictions_file")
     if not predictions_file:
         return
-    from ..agent.result_views import RUL_SCHEMA, TRAJECTORY_SCHEMA, load_view
+    from ..agent.result_views import (
+        RUL_SCHEMA,
+        SOH_SCHEMA,
+        TRAJECTORY_SCHEMA,
+        load_view,
+    )
     from .run_history import (
         render_prediction_table,
         render_rul_figures,
+        render_soh_figures,
         render_trajectory_figure,
     )
 
@@ -1348,6 +1514,12 @@ def _render_result_figures(result_context: dict[str, Any] | None) -> None:
     if views["schema"] == RUL_SCHEMA:
         render_rul_figures(views["rul"])
         render_prediction_table(views["rul"])
+    elif views["schema"] == SOH_SCHEMA:
+        # A cycle-level result: per-cell curves and the range diagnostic, and
+        # a table whose rows name the cell and the cycle rather than a
+        # position in an array.
+        render_soh_figures(views["soh"])
+        render_prediction_table(views["soh"])
     elif views["schema"] == TRAJECTORY_SCHEMA:
         render_trajectory_figure(views["trajectory"])
 
@@ -1611,22 +1783,37 @@ def render_agent_workflow() -> None:
     result_context = st.session_state.get("agent_result_context")
 
     if options and plan is not None:
-        current_signature = json.dumps(plan.get("command") or [], sort_keys=True, default=str)
-        stored_signature = st.session_state.get("agent_run_signature")
+        # Compared on the experiment, not on the argv: the argv's --workspace
+        # carries the reserved run id, which is re-minted after every launch,
+        # so an argv comparison never matched again and erased the results of
+        # the run that had just finished. See executed_plan_signature.
+        current_signature = executed_plan_signature(
+            plan, device=device, seed=seed, smoke=smoke
+        )
+        stored_signature = st.session_state.get(RUN_SIGNATURE_KEY)
         if stored_signature is not None and stored_signature != current_signature:
             # The plan changed since the last execution: results shown would
             # be stale, so they are dropped until an explicit new Run.
             st.session_state.pop("agent_execution_result", None)
             st.session_state.pop("agent_result_context", None)
+            st.session_state.pop(RESULT_ERROR_KEY, None)
             execution_result = None
             result_context = None
-        active_run_id = st.session_state.get(ACTIVE_RUN_KEY)
+        active_run_id = str(st.session_state.get(ACTIVE_RUN_KEY) or "")
+        run_in_flight = False
         if active_run_id:
             # A run this page started is in flight (or has just ended). The
             # script is not blocked on it, so Cancel below is a live control.
-            _render_active_run(str(active_run_id), plan=plan, smoke=smoke, device=device)
-        elif st.button(
-            RUN_BUTTON_LABEL,
+            run_in_flight = _render_active_run(
+                active_run_id, plan=plan, smoke=smoke, device=device
+            )
+        if not run_in_flight and st.button(
+            # Drawn whenever no run is in flight, including on the very run
+            # that released a finished one: a terminal run never withholds
+            # the control that starts the next one. The label says "Run
+            # again" once this page has executed something, so a second run
+            # is visibly offered rather than looking like the first.
+            RUN_AGAIN_BUTTON_LABEL if _has_executed(st.session_state) else RUN_BUTTON_LABEL,
             disabled=not run_is_enabled(plan),
             use_container_width=True,
             key="agent_run",
@@ -1643,8 +1830,22 @@ def render_agent_workflow() -> None:
             # Both keys, or the next rerun of this same plan would match the
             # stale subject, skip minting and read an id that is gone.
             clear_pending_run(st.session_state)
-            st.session_state["agent_run_signature"] = current_signature
+            st.session_state[RUN_SIGNATURE_KEY] = current_signature
+            st.session_state[EXECUTED_KEY] = True
             st.rerun()
+
+    result_error = st.session_state.get(RESULT_ERROR_KEY)
+    if result_error:
+        # The run itself reached a terminal state and its files are on disk;
+        # what failed is reading them back. Said in those words, because
+        # "the run failed" would be a different and false claim.
+        render_error(
+            "The run finished, but its results could not be read back into "
+            "this page. The run directory is intact — open it in Run History "
+            "below to inspect the artifacts directly.",
+            key="agent_result_read_failure",
+            details=str(result_error),
+        )
 
     serial = st.session_state.get("agent_run_serial", 0)
     if isinstance(execution_result, dict) and execution_result.get("success"):

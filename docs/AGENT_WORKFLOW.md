@@ -113,6 +113,47 @@ Whether a multi-GPU selection may run is a backend capability
 a multi-GPU choice disables Run with the reason rather than being downgraded
 to a single GPU. The audit behind that is `docs/GPU_MULTI_GPU_AUDIT.md`.
 
+## The run lifecycle, and running twice
+
+Pressing **Run** consumes the reserved run id, writes the manifest, starts the
+worker and stores the run id in `agent_active_run_id`. That key is what the
+page branches on: while it is set, the block shows live progress and **Stop
+run**; while it is clear, the block shows **Run** (or **Run again**, once this
+page has executed something).
+
+Two ordering rules make a second run possible, and both were repairs:
+
+1. **A terminal run is released before anything fallible reads its results.**
+   `_finish_active_run` clears `agent_active_run_id`, reaps the handle and
+   records the status *first*, then reads the artifacts inside a guard. The
+   original order was the reverse, and any failure in between — an
+   unreadable predictions artifact, a value the state serializer refused —
+   reached the page error boundary with the run still marked active. Every
+   later script run re-entered the same failing branch, so the Run button
+   never came back. A failure to read results is now reported as exactly
+   that, beside an intact run directory.
+
+2. **The staleness guard compares the experiment, not the argv.** The plan's
+   argv carries `--workspace <agent workspace>/<run_id>`, and the reserved
+   run id is re-minted on the rerun that follows every launch. Comparing
+   argv strings therefore reported "the plan changed" on every rerun after a
+   run, and deleted the finished run's results before the page could draw
+   them. `executed_plan_signature` compares dataset, task, model, config,
+   epochs, device and seed instead.
+
+`RunManager.forget` reaps on *terminal status*, not on thread liveness: the
+worker publishes its status and result together and then spends a moment
+writing the manifest, and a page reacting to that snapshot arrives inside
+exactly that window. Gating on `is_alive()` made the reap a silent no-op
+there.
+
+Terminal detection reads the recorded status and never the progress-event
+stream. An sklearn fit such as Ridge reports no epochs at all, so a lifecycle
+that waited for a progress event would never notice that it had finished.
+
+A second run of the same plan is an ordinary act: a new run id, a new
+directory, the earlier run untouched in Run History.
+
 ## Failures
 
 A failed run is never retried. A CUDA out-of-memory failure is named as a

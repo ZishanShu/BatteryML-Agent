@@ -285,6 +285,43 @@ Without `sample_index` a cycle-level prediction could not be traced to a cell
 at all, because the row number identifies nothing once a cell contributes many
 rows.
 
+## Reading the result in the web app
+
+An SOH artifact holds one scalar per *cycle sample*. Structurally that is
+indistinguishable from an RUL artifact's one scalar per cell, so the view
+layer decides which it is from the recorded `sample_index` and never from the
+numbers (`batteryml_web/agent/result_views.py`, `detect_schema`). A result
+with no index is read as RUL, as it was before; one with an index becomes the
+SOH view, whose rows name their cell and cycle and whose axes say
+*SOH (ratio)*.
+
+Three things are drawn:
+
+* **Observed vs estimated SOH**, with the `y = x` reference line.
+* **SOH across cycles**, for the first few test cells, observed and estimated
+  together — a parity scatter answers "is it calibrated", only a per-cell
+  curve answers "does it track degradation".
+* **The estimate range check**, below.
+
+### The range check is a reading, not a correction
+
+SOH is a ratio: a physically meaningful estimate lies above 0 and at or below
+1.0 (slightly above 1.0 is ordinary early-life behaviour, so 1.1 is where the
+report calls a value implausible). A linear model fitted on a 37-dimensional
+voltage-curve feature can and does produce estimates well outside that range,
+and an average error hides them completely.
+
+So the app **counts them and says so**: how many fall below 0, above 1.0 and
+above 1.1, the observed minimum and maximum, the fraction outside the range,
+and the ten largest absolute residuals with the cell and cycle each belongs
+to.
+
+Nothing is clipped, rescaled, dropped or reordered. The arrays plotted and
+counted are the arrays the canonical MAE and RMSE were computed from, value
+for value — which is the point: a diagnostic that quietly repaired the
+predictions would make the figures agree with a metric that no longer
+described them.
+
 ## Limitations
 
 * **This is a route, not a benchmark.** One feature path, one label

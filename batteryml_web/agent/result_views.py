@@ -53,7 +53,33 @@ UNAVAILABLE_MESSAGE = (
 
 RUL_SCHEMA = "rul_scalar"
 TRAJECTORY_SCHEMA = "trajectory"
+#: A scalar per *cycle sample* rather than per cell: the shape a cycle-level
+#: task such as SOH estimation produces. Structurally it is still one number
+#: per row, so it is told apart from RUL by the ``sample_index`` the
+#: evaluation step records beside the predictions — never by guessing from
+#: the numbers themselves.
+SOH_SCHEMA = "soh_cycle"
 UNKNOWN_SCHEMA = "unknown"
+
+#: SOH is a ratio of present to reference discharge capacity. A healthy new
+#: cell sits at 1.0 and a degraded one below it. These are the bounds a
+#: *display* diagnostic checks against; nothing is clipped to them.
+SOH_HEALTHY = 1.0
+#: Slightly above 1.0 is ordinary early-life behaviour on many chemistries
+#: (a cell can exceed its first measured discharge after formation), so the
+#: diagnostic separates "above 1.0" from "implausibly above 1.0".
+SOH_IMPLAUSIBLE_HIGH = 1.1
+
+#: Said beside every out-of-range count. The canonical predictions are what
+#: the metrics were computed from and what the artifact holds; this is a
+#: reading of them, and reading is all it is.
+RANGE_NOTE = (
+    "Diagnostic only. SOH is a ratio, so a physically meaningful estimate "
+    "lies at or below 1.0 and above 0. Predictions outside that range are "
+    "counted here and left exactly as the model produced them: nothing is "
+    "clipped, rescaled or excluded, and the reported metrics are computed "
+    "from these same values."
+)
 
 
 def _to_list(values: Any) -> Optional[List[float]]:
@@ -134,19 +160,55 @@ def observed_labels(payload: Dict[str, Any]) -> Any:
     return getattr(test_data, "label", None)
 
 
+def cycle_sample_index(payload: Optional[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+    """The per-row ``(cell_id, cycle_index)`` identities, or None.
+
+    Written by ``Pipeline.evaluate`` for a cycle-level run and by nothing
+    else, which is what makes it a reliable marker: a cell-level RUL artifact
+    never carries one. Validated strictly — a record missing either field
+    makes the whole index unusable rather than half-labelling a figure.
+    """
+    if not isinstance(payload, dict):
+        return None
+    records = payload.get("sample_index")
+    if not isinstance(records, (list, tuple)) or not records:
+        return None
+    out: List[Dict[str, Any]] = []
+    for record in records:
+        if (
+            not isinstance(record, dict)
+            or "cell_id" not in record
+            or "cycle_index" not in record
+        ):
+            return None
+        try:
+            cycle = int(record["cycle_index"])
+        except (TypeError, ValueError):
+            return None
+        out.append({"cell_id": str(record["cell_id"]), "cycle_index": cycle})
+    return out
+
+
 def detect_schema(payload: Optional[Dict[str, Any]]) -> str:
     """What kind of result this artifact holds.
 
-    A scalar per sample is an RUL/lifetime result. A sequence per sample is a
-    trajectory. The distinction is structural, so an RUL scalar can never be
-    re-read as a trajectory.
+    A scalar per sample is an RUL/lifetime result, unless the artifact also
+    carries a cycle-level sample index — then each scalar belongs to one
+    cycle of one cell, which is an SOH-shaped result. A sequence per sample
+    is a trajectory. Every distinction here is structural, read from what the
+    artifact records about itself: an RUL scalar can never be re-read as a
+    trajectory, and a per-cell result is never relabelled per-cycle.
     """
     if not isinstance(payload, dict):
         return UNKNOWN_SCHEMA
     prediction = payload.get("prediction")
     if prediction is None:
         return UNKNOWN_SCHEMA
-    if _to_list(prediction) is not None:
+    flat = _to_list(prediction)
+    if flat is not None:
+        index = cycle_sample_index(payload)
+        if index is not None and len(index) == len(flat):
+            return SOH_SCHEMA
         return RUL_SCHEMA
     rows = _trajectory_rows(prediction)
     return TRAJECTORY_SCHEMA if rows is not None else UNKNOWN_SCHEMA
@@ -261,6 +323,154 @@ def build_rul_view(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def build_soh_view(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Observed, predicted, residual and identity for a cycle-level SOH run.
+
+    The same shape as :func:`build_rul_view` plus the two things that make a
+    cycle-level result readable: ``cell_ids`` and ``cycle_indices``, one per
+    row, taken from the index the evaluation step recorded. It also carries
+    ``range`` — the display-only out-of-range summary described in
+    :func:`soh_range_diagnostics`.
+
+    Refuses an artifact whose schema is not cycle-level SOH rather than
+    reinterpreting a per-cell result as a per-cycle one.
+    """
+    empty: Dict[str, Any] = {
+        "available": False,
+        "reason": UNAVAILABLE_MESSAGE,
+        "observed": [],
+        "predicted": [],
+        "residuals": [],
+        "cell_ids": [],
+        "cycle_indices": [],
+        "sample_ids": None,
+        "count": 0,
+        "n_cells": 0,
+        "inverse_transformed": False,
+        "note": "",
+        "range": soh_range_diagnostics([]),
+    }
+    if not isinstance(payload, dict):
+        return empty
+    if detect_schema(payload) != SOH_SCHEMA:
+        return dict(empty, reason=(
+            "This run's predictions carry no per-cycle sample index, so they "
+            "are not a cycle-level SOH result and are not shown as one."
+        ))
+    index = cycle_sample_index(payload) or []
+
+    raw_labels = observed_labels(payload)
+    if raw_labels is None:
+        return dict(empty, reason=(
+            "The saved artifact carries no observed SOH labels, so estimates "
+            "cannot be compared against ground truth. Nothing is plotted "
+            "rather than plotting predictions against themselves."
+        ))
+
+    bundle = payload.get("data")
+    transformed = getattr(bundle, "label_transformation", None) is not None
+    observed = _to_list(_inverse_transform(raw_labels, payload))
+    predicted = _to_list(_inverse_transform(payload.get("prediction"), payload))
+    if observed is None or predicted is None:
+        return empty
+    if not (len(observed) == len(predicted) == len(index)):
+        return dict(empty, reason=(
+            f"The artifact holds {len(observed)} observed value(s), "
+            f"{len(predicted)} prediction(s) and {len(index)} sample "
+            "identity record(s); they cannot be paired."
+        ))
+    if not observed:
+        return empty
+
+    cell_ids = [record["cell_id"] for record in index]
+    return {
+        "available": True,
+        "reason": "",
+        "observed": observed,
+        "predicted": predicted,
+        # A display of two stored values, not a recomputed score.
+        "residuals": [p - o for o, p in zip(observed, predicted)],
+        "cell_ids": cell_ids,
+        "cycle_indices": [record["cycle_index"] for record in index],
+        # Readable row labels for the table: a real cell and a real cycle.
+        "sample_ids": [
+            f"{record['cell_id']} @ cycle {record['cycle_index']}"
+            for record in index
+        ],
+        "count": len(observed),
+        "n_cells": len(set(cell_ids)),
+        "inverse_transformed": transformed,
+        "note": TRANSFORM_NOTE if transformed else "",
+        "range": soh_range_diagnostics(predicted),
+    }
+
+
+def soh_range_diagnostics(predicted: Any) -> Dict[str, Any]:
+    """How far the estimates fall outside the physical range of a ratio.
+
+    **Display only, and non-destructive.** The canonical predictions are the
+    numbers the metrics were computed from and the numbers the artifact
+    holds. This counts how many of them a battery scientist would call
+    physically impossible, and reports the extremes, so a run whose RMSE
+    looks acceptable cannot hide estimates of -4.3 or 2.1 behind an average.
+    Nothing here clips, rescales, drops or reorders a value, and no count
+    produced here is a metric.
+
+    Returns ``{"count", "below_zero", "above_one", "above_implausible",
+    "min", "max", "out_of_range", "fraction_out_of_range", "note"}``. The
+    two extremes are None for an empty series rather than a placeholder
+    number.
+    """
+    values = _to_list(predicted) or []
+    below = sum(1 for value in values if value < 0.0)
+    above = sum(1 for value in values if value > SOH_HEALTHY)
+    implausible = sum(1 for value in values if value > SOH_IMPLAUSIBLE_HIGH)
+    out_of_range = below + above
+    return {
+        "count": len(values),
+        "below_zero": below,
+        "above_one": above,
+        "above_implausible": implausible,
+        "min": min(values) if values else None,
+        "max": max(values) if values else None,
+        "out_of_range": out_of_range,
+        "fraction_out_of_range": (out_of_range / len(values)) if values else 0.0,
+        "note": RANGE_NOTE,
+    }
+
+
+def largest_residuals(
+    view: Dict[str, Any], *, limit: int = 10
+) -> List[Dict[str, Any]]:
+    """The rows where the estimate misses the observed value by the most.
+
+    Ordered by ``abs(residual)``, descending, so the worst cases are the ones
+    a reviewer reads first. A *selection* of stored rows — the residuals were
+    already computed as ``predicted - observed`` when the view was built, and
+    nothing is recomputed, aggregated or scored here.
+
+    Ties keep their original order, so the table is deterministic for a given
+    artifact.
+    """
+    if not view.get("available"):
+        return []
+    residuals = view.get("residuals") or []
+    order = sorted(range(len(residuals)), key=lambda i: (-abs(residuals[i]), i))
+    ids = view.get("sample_ids")
+    rows: List[Dict[str, Any]] = []
+    for index in order[: max(int(limit), 0)]:
+        row: Dict[str, Any] = {}
+        if ids:
+            row["Sample"] = ids[index]
+        else:
+            row["#"] = index
+        row["Observed"] = view["observed"][index]
+        row["Predicted"] = view["predicted"][index]
+        row["Residual"] = residuals[index]
+        rows.append(row)
+    return rows
+
+
 def build_trajectory_view(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Per-sample predicted (and observed, where stored) trajectories.
 
@@ -329,5 +539,6 @@ def load_view(predictions_file: str | Path) -> Dict[str, Any]:
     return {
         "schema": schema,
         "rul": build_rul_view(payload),
+        "soh": build_soh_view(payload),
         "trajectory": build_trajectory_view(payload),
     }

@@ -80,11 +80,24 @@ SIDEBAR_COMPACT_CSS = """
     padding-bottom: 0.2rem;
 }
 
-/* Section descriptions and captions are deliberately NOT given their own
-   rule. Tightening their margin was measured in a browser and clipped the
-   second line of a wrapped caption ("...works offline, with no API key.")
-   behind the button beneath it. They are tightened by the block gap above,
-   which is enough and cannot collide. */
+/* Captions — the grey secondary lines under each entry. Type size only.
+
+   Their *spacing* is deliberately left alone: tightening a caption's margin
+   was measured in a browser and clipped the second line of a wrapped caption
+   ("...works offline, with no API key.") behind the button beneath it. So
+   no margin, no height, no overflow here, and the line-height stays above 1
+   so a wrapped caption still has room for both its lines. The block gap
+   above does the spacing, and it cannot collide.
+
+   Scoped to the sidebar. st.caption is used across the whole application —
+   under metrics, beside figures, for the transform note on a result — and
+   shrinking it globally would re-typeset pages this milestone is not
+   about. */
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"],
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {
+    font-size: 0.82rem;
+    line-height: 1.35;
+}
 
 /* Navigation buttons: same size type, less box. */
 [data-testid="stSidebar"] .stButton > button {

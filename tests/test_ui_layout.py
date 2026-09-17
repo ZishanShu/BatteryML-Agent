@@ -472,11 +472,34 @@ class TestSidebarIsCompact(unittest.TestCase):
                 float(value), 0.0,
                 "zeroing the heading padding collapses its box onto the caption",
             )
-        self.assertNotIn(
-            "stCaptionContainer",
-            self.css,
-            "a caption margin rule clipped wrapped captions behind the next button",
+        # The caption rule may set type, never space: a caption
+        # ``margin-bottom`` is what clipped a wrapped caption behind the
+        # button beneath it, so the selector is allowed back but those
+        # properties are not.
+        caption_rules = re.findall(
+            r"stCaptionContainer[^{]*\{([^}]*)\}", self._declaration_body()
         )
+        for body in caption_rules:
+            declared = {
+                declaration.split(":", 1)[0].strip()
+                for declaration in body.split(";")
+                if ":" in declaration
+            }
+            for property_name in declared:
+                # Matched on the property, not on a substring: "line-height"
+                # is type, and must not be read as a "height".
+                root = property_name.split("-")[0]
+                self.assertNotIn(
+                    root, {"margin", "height", "overflow", "padding"},
+                    f"a caption {property_name} rule clipped wrapped captions "
+                    "behind the next button",
+                )
+            line_height = re.search(r"line-height:\s*([0-9.]+)", body)
+            if line_height:
+                self.assertGreater(
+                    float(line_height.group(1)), 1.0,
+                    "a line-height at or below 1 crops a wrapped caption",
+                )
 
     def _declaration_body(self) -> str:
         """The stylesheet with its comments removed.
@@ -502,8 +525,16 @@ class TestSidebarIsCompact(unittest.TestCase):
             with self.subTest(selector=selector):
                 self.assertIn("stSidebar", selector)
 
-    def test_only_spacing_properties_are_set(self) -> None:
-        """Nothing here may change type, colour or behaviour."""
+    def test_only_spacing_and_type_size_properties_are_set(self) -> None:
+        """Nothing here may change colour, content or behaviour.
+
+        ``font-size`` joined the allowed list when the sidebar's grey
+        secondary lines were reduced to 0.82rem. It is a size, not a
+        disappearance: the text is still rendered, still selectable and still
+        wraps. Colour, ``display``, ``visibility``, ``content`` and
+        ``overflow`` remain out — those are the properties that can remove a
+        control rather than fit one.
+        """
         body = self._declaration_body()
         properties = {
             declaration.split(":", 1)[0].strip()
@@ -515,14 +546,25 @@ class TestSidebarIsCompact(unittest.TestCase):
         allowed = {
             "padding", "padding-top", "padding-bottom", "padding-left", "padding-right",
             "margin", "margin-top", "margin-bottom", "margin-left", "margin-right",
-            "gap", "line-height", "height", "min-height",
+            "gap", "line-height", "height", "min-height", "font-size",
         }
         self.assertTrue(properties, "the stylesheet declares nothing")
         self.assertEqual(
             properties - allowed,
             set(),
-            "the sidebar stylesheet may only adjust spacing",
+            "the sidebar stylesheet may only adjust spacing and type size",
         )
+
+    def test_the_sidebar_secondary_text_is_smaller_but_still_readable(self) -> None:
+        """The brief's range, and a floor so it cannot shrink into illegibility."""
+        sizes = re.findall(
+            r"stCaptionContainer[^{]*\{[^}]*font-size:\s*([0-9.]+)rem",
+            self._declaration_body(),
+        )
+        self.assertTrue(sizes, "the sidebar caption size rule is missing")
+        for size in sizes:
+            self.assertGreaterEqual(float(size), 0.80)
+            self.assertLessEqual(float(size), 0.85)
 
     def test_the_forehead_is_reduced_to_fit_its_control(self) -> None:
         """The top band, measured in a browser at 60px before this change.
@@ -572,7 +614,7 @@ class TestSidebarIsCompact(unittest.TestCase):
                 )
 
     def test_dividers_are_tighter_than_the_block_gap_allows_alone(self) -> None:
-        """Five dividers separate the sidebar's sections."""
+        """The rules that remain still separate the sidebar's sections."""
         match = re.search(
             r"stDivider\"\]\s*\{([^}]*)\}", self.css, re.DOTALL
         )
@@ -589,6 +631,104 @@ class TestSidebarIsCompact(unittest.TestCase):
             re.search(r"\.(css|st-emotion)-[0-9a-z]{4,}", self.css),
             "use stable data-testid selectors, not generated class names",
         )
+
+
+class _SidebarRecorder:
+    """Records the sidebar's element sequence, in order.
+
+    A stand-in rather than a source scan: what matters is the order the
+    elements come out in, which is the thing a reader sees and the thing a
+    refactor can break without touching any of the strings a scan looks for.
+    """
+
+    def __init__(self, session: dict) -> None:
+        self.session_state = session
+        self.sequence: list[tuple[str, str]] = []
+        self.sidebar = self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def markdown(self, text="", **kwargs):
+        self.sequence.append(("markdown", str(text)))
+
+    def caption(self, text="", **kwargs):
+        self.sequence.append(("caption", str(text)))
+
+    def divider(self, **kwargs):
+        self.sequence.append(("divider", ""))
+
+    def button(self, label="", **kwargs):
+        self.sequence.append(("button", str(label)))
+        return False
+
+    def columns(self, spec, **kwargs):
+        count = spec if isinstance(spec, int) else len(spec)
+        return [self for _ in range(count)]
+
+
+class TestSidebarStructure(unittest.TestCase):
+    """The rules that remain mark real boundaries; the others are gone.
+
+    Three dividers around the header, Home and Agent Workflow said "a
+    different kind of thing follows" three times for boundaries that do not
+    exist — those four entries are one block. The rules that stay separate
+    the numbered protocol list, the Prev/Next pair, settings, and status.
+    """
+
+    def _render(self) -> list[tuple[str, str]]:
+        from batteryml_web.ui import workflow_sidebar as sidebar
+
+        recorder = _SidebarRecorder({"current_step": "home"})
+        saved = (sidebar.st, sidebar.render_layout_css,
+                 sidebar.render_sidebar_settings)
+        sidebar.st = recorder
+        sidebar.render_layout_css = lambda: None
+        sidebar.render_sidebar_settings = lambda: None
+        try:
+            sidebar.render_sidebar_workflow()
+        finally:
+            (sidebar.st, sidebar.render_layout_css,
+             sidebar.render_sidebar_settings) = saved
+        return recorder.sequence
+
+    def test_no_rule_separates_the_header_from_home_or_the_agent_entry(self) -> None:
+        sequence = self._render()
+        kinds = [kind for kind, _ in sequence]
+        labels = [text for _, text in sequence]
+        agent = labels.index("Agent Workflow")
+        # Everything from the title down to the Agent Workflow entry is one
+        # uninterrupted block.
+        self.assertNotIn("divider", kinds[:agent + 1])
+
+    def test_the_protocol_list_and_the_blocks_after_it_keep_their_rules(self) -> None:
+        sequence = self._render()
+        kinds = [kind for kind, _ in sequence]
+        labels = [text for _, text in sequence]
+        heading = labels.index("**Protocol Workflow**")
+        # A rule immediately precedes the numbered list: that boundary is
+        # real, and losing it would be the opposite regression.
+        self.assertEqual(kinds[heading - 1], "divider")
+        # Prev/Next, settings and status each still get one.
+        self.assertEqual(kinds.count("divider"), 4)
+
+    def test_every_navigation_entry_is_still_reachable(self) -> None:
+        """Non-vacuity: removing rules must not remove destinations."""
+        from batteryml_web.ui import workflow_sidebar as sidebar
+
+        labels = [text for _, text in self._render()]
+        for step in sidebar.NAV_STEPS:
+            expected = sidebar.nav_label(step)
+            with self.subTest(step=step["key"]):
+                # Home is the current step here, so it is bold text rather
+                # than a button; every other entry is a button.
+                self.assertTrue(
+                    expected in labels or f"**{expected}**" in labels,
+                    f"{expected} is no longer drawn in the sidebar",
+                )
 
 
 if __name__ == "__main__":

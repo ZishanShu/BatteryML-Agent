@@ -136,7 +136,12 @@ class RunManager:
         directory = Path(run_dir)
         handle = RunHandle(run_id, directory, plan)
         with self._lock:
-            if run_id in self._runs and self._runs[run_id].is_alive():
+            existing = self._runs.get(str(run_id))
+            if (
+                existing is not None
+                and existing.is_alive()
+                and existing.status not in rm.TERMINAL_STATUSES
+            ):
                 raise RuntimeError(f"Run {run_id} is already running.")
             self._runs[str(run_id)] = handle
 
@@ -355,10 +360,27 @@ class RunManager:
             ]
 
     def forget(self, run_id: str) -> None:
-        """Drop a finished run from memory. Its manifest stays on disk."""
+        """Drop a finished run from memory. Its manifest stays on disk.
+
+        Terminal status, not thread liveness, is the condition. The worker
+        publishes the terminal status and the result together and only then
+        writes the manifest and calls back, so a caller that reacts to the
+        terminal snapshot arrives while the thread is still finishing those
+        last steps. Gating on ``is_alive()`` made this a silent no-op in
+        exactly that window — the window every page uses — so handles
+        accumulated for the lifetime of the process and ``forget`` could not
+        be relied on to reap anything.
+
+        Dropping the handle does not touch the worker: it holds its own
+        reference and finishes writing the manifest regardless. What is
+        dropped is only this manager's ability to hand out a snapshot of a
+        run that has already ended, which is what the manifest is for.
+        """
         with self._lock:
             handle = self._runs.get(str(run_id))
-            if handle is not None and not handle.is_alive():
+            if handle is None:
+                return
+            if handle.status in rm.TERMINAL_STATUSES or not handle.is_alive():
                 del self._runs[str(run_id)]
 
 

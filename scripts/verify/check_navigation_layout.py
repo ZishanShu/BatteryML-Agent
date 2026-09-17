@@ -65,7 +65,20 @@ ALLOWED_CSS_PROPERTIES = {
     "padding", "padding-top", "padding-bottom", "padding-left", "padding-right",
     "margin", "margin-top", "margin-bottom", "margin-left", "margin-right",
     "gap", "line-height", "height", "min-height",
+    # Type size, for the sidebar's grey secondary lines (UX-11). A size is
+    # not a disappearance: the text still renders, still wraps and is still
+    # selectable. Colour, display, visibility, content and overflow stay out
+    # — those are the properties that can remove a control.
+    "font-size",
 }
+
+#: The band UX-11 fixes the sidebar's secondary text to. A floor as well as a
+#: ceiling: below this it stops being readable, above it nothing was gained.
+SIDEBAR_CAPTION_REM = (0.80, 0.85)
+
+#: Rules the sidebar caption selector may never carry — the properties that
+#: clipped the second line of a wrapped caption behind the button beneath it.
+CAPTION_FORBIDDEN_ROOTS = {"margin", "padding", "height", "overflow"}
 
 #: Below this the sidebar heading overlaps its own caption. Measured, not guessed.
 MINIMUM_BLOCK_GAP_REM = 0.4
@@ -275,7 +288,41 @@ def _check_sidebar_stylesheet(root: Path, errors: list[str], observed: dict) -> 
             if prop not in ALLOWED_CSS_PROPERTIES:
                 errors.append(
                     f"sidebar rule {selector!r} sets {prop!r}, which is not a "
-                    "spacing property. This stylesheet adjusts layout only (UX-10)."
+                    "spacing or type-size property. This stylesheet adjusts "
+                    "layout only (UX-10, UX-11)."
+                )
+
+    caption_rules = [
+        (selector, declarations)
+        for selector, declarations in rules
+        if "stCaptionContainer" in selector
+    ]
+    if not caption_rules:
+        errors.append(
+            "the sidebar stylesheet no longer sets the secondary text size "
+            "(UX-11)."
+        )
+    for selector, declarations in caption_rules:
+        for declaration in declarations.split(";"):
+            if ":" not in declaration:
+                continue
+            prop = declaration.split(":", 1)[0].strip()
+            # Matched on the property root, so "line-height" is read as type
+            # rather than as a "height".
+            if prop.split("-")[0] in CAPTION_FORBIDDEN_ROOTS:
+                errors.append(
+                    f"sidebar caption rule sets {prop!r}; a caption spacing "
+                    "rule clipped wrapped captions behind the next button "
+                    "(UX-11)."
+                )
+        sizes = re.findall(r"font-size:\s*([0-9.]+)rem", declarations)
+        observed["sidebar_caption_rem"] = sizes
+        low, high = SIDEBAR_CAPTION_REM
+        for size in sizes:
+            if not (low <= float(size) <= high):
+                errors.append(
+                    f"the sidebar secondary text is {size}rem, outside the "
+                    f"{low}-{high}rem band UX-11 fixes."
                 )
 
     gap = re.search(r"stVerticalBlock\"\]\s*\{[^}]*gap:\s*([0-9.]+)rem", SIDEBAR_COMPACT_CSS)

@@ -163,11 +163,14 @@ def render_sidebar_workflow():
         st.markdown("**Current project**")
         st.caption(current_project_label())
 
-        st.divider()
-        _nav_button(NAV_STEPS[0], st.session_state.get("current_step", "home"))
-
-        st.divider()
+        # No rule between the header, Home and Agent Workflow. A divider
+        # says "a different kind of thing follows", and three of them around
+        # two single-line entries said it three times for no boundary that
+        # exists: the header, the project, Home and Agent Workflow are one
+        # block. The rules that remain mark real boundaries — the numbered
+        # protocol list, the Prev/Next pair, settings and status.
         current_step = st.session_state.get("current_step", "home")
+        _nav_button(NAV_STEPS[0], current_step)
         for step in AGENT_STEPS:
             _nav_button(step, current_step)
 

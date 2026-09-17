@@ -484,6 +484,10 @@ def render_home_agent_entry() -> None:
                 "agent_suggestions",
                 "agent_model_choice",
                 "agent_run_signature",
+                # Run state for the previous request: why its results could
+                # not be read, and that it had executed at all.
+                "agent_result_error",
+                "agent_has_executed",
                 # The Agent Workflow page's own text box, so it shows this
                 # request rather than one typed there on an earlier visit.
                 # Safe to delete here: that widget is not rendered on Home.
@@ -573,6 +577,8 @@ def render_home_page():
                     "agent_result_context",
                     "agent_run_context",
                     "agent_run_signature",
+                    "agent_result_error",
+                    "agent_has_executed",
                 ):
                     st.session_state.pop(key, None)
                 st.rerun()

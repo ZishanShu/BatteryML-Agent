@@ -402,7 +402,12 @@ def _render_scientific_views(manifest: Dict[str, Any]) -> None:
     reader; nothing here recomputes a metric, and a run whose artifact does
     not carry the needed values gets the reason rather than a chart.
     """
-    from ..agent.result_views import RUL_SCHEMA, TRAJECTORY_SCHEMA, load_view
+    from ..agent.result_views import (
+        RUL_SCHEMA,
+        SOH_SCHEMA,
+        TRAJECTORY_SCHEMA,
+        load_view,
+    )
 
     files = (manifest.get("artifacts") or {}).get("prediction_files") or []
     if not files:
@@ -423,6 +428,9 @@ def _render_scientific_views(manifest: Dict[str, Any]) -> None:
     if views["schema"] == RUL_SCHEMA:
         render_rul_figures(views["rul"])
         render_prediction_table(views["rul"])
+    elif views["schema"] == SOH_SCHEMA:
+        render_soh_figures(views["soh"])
+        render_prediction_table(views["soh"])
     elif views["schema"] == TRAJECTORY_SCHEMA:
         render_trajectory_figure(views["trajectory"])
     else:
@@ -492,6 +500,125 @@ def render_rul_figures(view: Dict[str, Any]) -> None:
             axes.set_ylabel("Residual")
 
         st.pyplot(_figure(_residuals), clear_figure=True)
+
+
+def render_soh_figures(view: Dict[str, Any], *, max_cells: int = 6) -> None:
+    """SOH against cycle, observed vs estimated, plus the range diagnostic.
+
+    A cycle-level result is read per cell: a scatter of all samples answers
+    "is the model calibrated", but only a per-cell curve answers "does it
+    track degradation". Both are drawn, from the stored arrays alone.
+
+    The diagnostic below them is the honest part. A ratio below 0 or well
+    above 1 is physically impossible, and an average error can hide a few of
+    them completely. They are *counted and shown*, never clipped away: the
+    values plotted are the values the metrics came from.
+    """
+    if not view.get("available"):
+        st.info(str(view.get("reason") or "This visualization is unavailable."))
+        return
+    if view.get("note"):
+        st.caption(str(view["note"]))
+
+    observed = view["observed"]
+    predicted = view["predicted"]
+    cell_ids = view.get("cell_ids") or []
+    cycles = view.get("cycle_indices") or []
+    st.caption(
+        f"{view['count']:,} cycle-level sample(s) across "
+        f"{view.get('n_cells', 0)} test cell(s)."
+    )
+
+    left, right = st.columns(2)
+    with left:
+        st.caption("Observed vs estimated SOH (ratio)")
+
+        def _scatter(axes) -> None:
+            axes.scatter(observed, predicted, s=8, alpha=0.4)
+            low = min(min(observed), min(predicted))
+            high = max(max(observed), max(predicted))
+            axes.plot([low, high], [low, high], linestyle="--", linewidth=1)
+            axes.set_xlabel("Observed SOH (ratio)")
+            axes.set_ylabel("Estimated SOH (ratio)")
+
+        st.pyplot(_figure(_scatter), clear_figure=True)
+    with right:
+        st.caption(f"SOH across cycles, first {max_cells} test cell(s)")
+
+        def _per_cell(axes) -> None:
+            # Insertion order, so the cells shown are the first the run
+            # actually evaluated rather than an alphabetical sample of them.
+            selected: List[str] = []
+            for cell in cell_ids:
+                if cell not in selected:
+                    selected.append(cell)
+                if len(selected) >= max_cells:
+                    break
+            for position, cell in enumerate(selected):
+                rows = [i for i, name in enumerate(cell_ids) if name == cell]
+                rows.sort(key=lambda i: cycles[i])
+                axes.plot(
+                    [cycles[i] for i in rows], [observed[i] for i in rows],
+                    linewidth=1,
+                    label="observed" if position == 0 else None,
+                )
+                axes.plot(
+                    [cycles[i] for i in rows], [predicted[i] for i in rows],
+                    linewidth=1, linestyle="--",
+                    label="estimated" if position == 0 else None,
+                )
+            axes.set_xlabel("Cycle")
+            axes.set_ylabel("SOH (ratio)")
+            if selected:
+                axes.legend(loc="best", fontsize="small")
+
+        st.pyplot(_figure(_per_cell), clear_figure=True)
+
+    render_soh_range_diagnostics(view)
+
+
+def render_soh_range_diagnostics(view: Dict[str, Any]) -> None:
+    """How many estimates fall outside the physical range of a ratio.
+
+    Shown for every SOH run, including a clean one: "0 outside the range" is
+    information, and a panel that appears only when something is wrong
+    teaches the reader that its absence means nothing was checked.
+    """
+    from ..agent.result_views import largest_residuals
+
+    summary = view.get("range") or {}
+    if not summary.get("count"):
+        return
+    st.markdown("**Estimate range check**")
+    columns = st.columns(4)
+    figures = (
+        ("Below 0", summary.get("below_zero", 0)),
+        ("Above 1.0", summary.get("above_one", 0)),
+        ("Above 1.1", summary.get("above_implausible", 0)),
+        ("Outside range", summary.get("out_of_range", 0)),
+    )
+    for column, (label, value) in zip(columns, figures):
+        with column:
+            st.metric(label, f"{int(value):,}")
+    low, high = summary.get("min"), summary.get("max")
+    if low is not None and high is not None:
+        st.caption(
+            f"Estimated SOH spans {low:.4f} to {high:.4f} across "
+            f"{int(summary['count']):,} sample(s); "
+            f"{summary.get('fraction_out_of_range', 0.0) * 100:.2f}% lie "
+            "outside (0, 1.0]."
+        )
+    st.caption(str(summary.get("note") or ""))
+
+    rows = largest_residuals(view, limit=10)
+    if rows:
+        st.markdown("**Largest absolute residuals**")
+        st.caption(
+            "The ten samples where the estimate misses the observed SOH by "
+            "the most. A selection of stored rows, ordered; no value is "
+            "recomputed."
+        )
+        st.dataframe(rows, hide_index=True, use_container_width=True)
 
 
 def render_trajectory_figure(view: Dict[str, Any], *, limit: int = 8) -> None:
@@ -774,7 +901,7 @@ def render_predictions_panel(manifest: Dict[str, Any]) -> None:
         SUPPORTED_PREVIEW_FORMATS,
         preview_prediction_file,
     )
-    from ..agent.result_views import RUL_SCHEMA, TRAJECTORY_SCHEMA
+    from ..agent.result_views import RUL_SCHEMA, SOH_SCHEMA, TRAJECTORY_SCHEMA
 
     files = [
         str(path)
@@ -803,6 +930,9 @@ def render_predictions_panel(manifest: Dict[str, Any]) -> None:
         if preview["schema"] == RUL_SCHEMA and preview["rul"]:
             render_rul_figures(preview["rul"])
             render_prediction_table(preview["rul"])
+        elif preview["schema"] == SOH_SCHEMA and preview.get("soh"):
+            render_soh_figures(preview["soh"])
+            render_prediction_table(preview["soh"])
         elif preview["schema"] == TRAJECTORY_SCHEMA and preview["trajectory"]:
             render_trajectory_figure(preview["trajectory"])
     elif preview["kind"] in (KIND_UNSUPPORTED_PICKLE, KIND_UNREADABLE):
