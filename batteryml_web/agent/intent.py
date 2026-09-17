@@ -36,6 +36,14 @@ _TRAJECTORY_PHRASES: List[str] = [
     "degradation trajectory",
     "future capacity trajectory",
     "capacity trajectory",
+    # Forecasting phrased without the word "trajectory". These ask what
+    # happens *next*, which is neither a current-cycle SOH estimate nor a
+    # lifetime; they are listed so they resolve to trajectory rather than
+    # falling through to whichever other table matches a stray word.
+    "future degradation",
+    "forecast degradation",
+    "how will capacity change",
+    "capacity over the next",
     "trajectory",
     # Chinese. Listed here, not in a separate resolver, so the offline route
     # (no API key, CLAUDE.md §1 Route B) understands the same phrases the
@@ -49,13 +57,33 @@ _TRAJECTORY_PHRASES: List[str] = [
 
 _SOH_PHRASES: List[str] = [
     "state of health",
+    # "How healthy is this cell now / at cycle N" is the canonical SOH
+    # question asked without the acronym. "battery health" alone is enough:
+    # the phrase is about condition, where the lifetime family asks about
+    # duration, and the two tables cannot both match the same words.
+    "battery health",
+    "cell health",
+    "health at cycle",
+    "health now",
+    "current health",
     "健康状态",
     "健康度",
     "荷电健康",
+    "电池健康",
+    "当前健康",
 ]
 
 _RUL_PHRASES: List[str] = [
     "remaining useful life",
+    # "How many cycles are left" is the lifetime question asked in plain
+    # words. It is about how long the cell lasts, not how healthy it is now,
+    # and must never reach the SOH route.
+    "cycles are left",
+    "how many cycles",
+    "cycles left",
+    "cycles remaining",
+    "remaining cycles",
+    "how much longer",
     "cycle life",
     "battery lifetime",
     "battery life",
@@ -133,9 +161,23 @@ def resolve_dataset(text: str) -> Optional[str]:
     return None
 
 
+#: "…until end of life at 80% SOH" names the *threshold* an RUL label uses,
+#: exactly as ``eol_soh`` does in a config. The sentence is a lifetime
+#: question, so this mention is removed before the SOH tables are consulted —
+#: the same decoy, in natural language rather than YAML.
+#:
+#: The gap between the two may contain a decimal point ("at 0.8 SOH") but not
+#: a sentence end, so the mention is only stripped while it is still part of
+#: the same clause. A period followed by whitespace stops the match; a period
+#: inside a number does not.
+_EOL_SOH_CONTEXT = re.compile(
+    r"\b(?:end[\s-]of[\s-]life|eol)\b(?:(?!\.\s)[^;!?]){0,32}?\bsoh\b"
+)
+
+
 def resolve_task(text: str) -> Optional[str]:
     """Return the platform task named in ``text``, or None when none is named."""
-    lowered = str(text or "").lower()
+    lowered = _EOL_SOH_CONTEXT.sub(" ", str(text or "").lower())
     if any(phrase in lowered for phrase in _TRAJECTORY_PHRASES):
         return TASK_TRAJECTORY
     if any(phrase in lowered for phrase in _SOH_PHRASES) or _SOH_TOKEN.search(lowered):

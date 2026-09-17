@@ -78,6 +78,51 @@ cells; a per-cell error chart shows whether one outlier carries the RMSE. The
 
 ---
 
+## SOH — state-of-health estimation
+
+Rationale for the group: SOH is the second scientific task the platform
+supports, and it is the one most easily confused with the first. "State of
+health" appears inside RUL's own vocabulary — `eol_soh` is the threshold an RUL
+label uses — and before this group the platform advertised 42 lifetime configs
+as SOH estimation on the strength of that substring. The requirements below
+exist to keep the two tasks apart at every layer: the label, the sample, the
+split, the config, the artifact, the figure and the agent.
+
+SOH is also the platform's first **cycle-level** task. One cell yields one
+sample per observed cycle, which breaks the one-row-per-cell assumption the
+pipeline was built on, and creates a leakage route (splitting expanded rows
+instead of cells) that produces a good-looking score and no visible symptom.
+
+| ID | Requirement | Status | Implementation |
+| --- | --- | --- | --- |
+| `SOH-01` | SOH estimation is a distinct task: the health of a cell **at an observed cycle**, from information available at or before it. It is not next-cycle capacity forecasting, not RUL, not lifetime, and not degradation-trajectory forecasting. A config's task is read from its label annotator, never from a substring — in particular `eol_soh`, an RUL end-of-life threshold, never implies SOH. | `IMPLEMENTED-STATIC` | `batteryml_web/core/config_registry.py` (`_infer_task`), `docs/SOH_PROTOCOL.md` |
+| `SOH-02` | The canonical label is a ratio, `SOH(cell, t) = Q_discharge(t) / Q_ref(cell)`, with `Q_ref` fixed for the whole run by `reference_capacity_mode` and applied to every cell. No per-cell fallback: a cell that cannot satisfy the configured mode is excluded and counted, never relabelled under another. Invalid cycles are dropped, never interpolated; ratios above 1.0 are kept, never clipped. A UI may display a percentage; the stored value stays a ratio. | `IMPLEMENTED-STATIC` | `batteryml/label/soh.py` (`CycleSOHLabelAnnotator`, `reference_capacity`) |
+| `SOH-03` | One cell yields one sample per observed cycle the sample policy accepts, and every row carries its `(cell_id, cycle_index)`. The label annotator owns the cycle list and the feature extractor is asked for exactly those cycles, so feature rows and label rows align by construction. Existing one-sample-per-cell RUL workflows are unchanged. | `IMPLEMENTED-STATIC` | `batteryml/data/sample_index.py`, `batteryml/task.py` (`_build_cycle_level`), `batteryml/{feature,label}/base.py` |
+| `SOH-04` | Cells are split before they are expanded into cycles, checked rather than assumed: `assert_disjoint_cells` runs on the loaded cells before any expansion and names every cell found in more than one split. A test constructs the leakage-prone alternative — expand all cells, then split rows — and proves it is rejected. | `IMPLEMENTED-STATIC` | `batteryml/data/sample_index.py` (`assert_disjoint_cells`), `tests/test_soh_core.py` |
+| `SOH-05` | The SOH feature is the voltage curve observed at cycle `t`: a fixed-width resampling plus five summary scalars, reading cycles `<= t` only. Discharge capacity is deliberately excluded — it is the label's numerator, and a full discharge measurement already answers the question. Causality is proved by mutating every later cycle and requiring the row to be unchanged, with a companion test that mutates cycle `t` and requires it to change. | `IMPLEMENTED-STATIC` | `batteryml/feature/soh_cycle.py`, `tests/test_soh_pipeline.py` |
+| `SOH-06` | SOH eligibility is decided by opening the processed cells and counting what a run would get, through the same annotator and extractor. Verdicts are SOH-specific, so a dataset can be ready for RUL and not for SOH. A dataset with nothing on disk reports zero and says so; no count is ever fabricated. | `IMPLEMENTED-STATIC` | `batteryml_web/core/soh_readiness.py`, `scripts/audit_soh_readiness.py` |
+| `SOH-07` | The prediction artifact carries `sample_index` (one `{cell_id, cycle_index}` per prediction) and `task_metadata` (label annotator, reference-capacity mode, sample policy, feature extractor). Canonical metrics are MAE and RMSE on the ratio scale; MAPE is not inherited from the RUL set. The loader validates the recorded identity before anything plots it. | `IMPLEMENTED-STATIC` | `batteryml/pipeline.py` (`_task_metadata`), `batteryml_web/viz/loaders.py`, `batteryml_web/agent/execution.py` (`metrics_for_task`) |
+| `SOH-08` | The SOH result views are the existing parity and residual figures plus `soh_vs_cycle`, which groups measured and estimated SOH by real `cell_id` from the saved artifact and states how many of how many cells it shows. Every point is an at-cycle estimate; it is never presented as a trajectory forecast. | `IMPLEMENTED-STATIC` | `batteryml_web/viz/figures.py` (`soh_vs_cycle_figure`), `batteryml_web/viz/contract.py`, `batteryml_web/viz/cli.py` |
+| `SOH-09` | No dataset is claimed SOH-ready and no dataset SOH config exists until `scripts/audit_soh_readiness.py` is run on real processed data. The legacy `configs/soh/dummy/*` examples are marked `legacy_example: true` and withheld from the runnable catalog rather than advertised as SOH support. | `IMPLEMENTED-STATIC` | `configs/soh/dummy/*.yaml`, `batteryml_web/core/config_registry.py` (`_parse_entry`) |
+| `SOH-10` | Agent intent maps SOH language (English and Chinese) to SOH estimation and lifetime, RUL and trajectory language away from it. "End of life at 80% SOH" is the `eol_soh` decoy in natural language and resolves to RUL. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/intent.py`, `tests/test_soh_agent_results.py` |
+
+### Notes on the SOH group
+
+* `SOH-01` and `SOH-04` are the two that would fail silently. A mislabelled
+  task runs the wrong science and reports it under the right name; a leaked
+  cell inflates the score and looks entirely normal. Both are enforced by
+  tests that construct the failure deliberately rather than by inspection.
+* No SOH requirement may be marked `VERIFIED` from this environment. It has no
+  `data/`, so no dataset has been shown SOH-eligible and no SOH run has
+  executed on real cells. The command block is in `docs/SOH_PROTOCOL.md`.
+* This group implements an SOH **route**, not an SOH benchmark: one feature
+  path, one label convention, and models chosen for being task-agnostic rather
+  than for SOH performance. `docs/SOH_PROTOCOL.md` states the limitations.
+* The upstream core changes it required are `UP-04`, `UP-05` and `UP-06` in
+  `docs/UPSTREAM_PATCHES.md`.
+
+---
+
 ## EXEC — execution runtime (smoke runs, devices, failures)
 
 Rationale for the group: the platform's one irreversible action is starting a

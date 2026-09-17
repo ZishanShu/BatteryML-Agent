@@ -92,16 +92,37 @@ class TestRealConfigsAreClassifiedByStructure(unittest.TestCase):
             "scan found almost none, so it is not testing what it claims",
         )
 
-    def test_the_genuine_soh_configs_are_soh(self) -> None:
-        soh = [e for e in self.entries if e.task == TASK_SOH]
-        self.assertTrue(soh, "no SOH config is registered at all")
-        for entry in soh:
+    def test_any_soh_entry_trains_an_soh_annotator(self) -> None:
+        """Whatever the catalog offers as SOH must actually be SOH."""
+        for entry in (e for e in self.entries if e.task == TASK_SOH):
             annotator = _annotator_of(Path(entry.config_path))
             self.assertIn(
                 "SOH", annotator,
                 f"{entry.config_path.as_posix()} is classified SOH but trains "
                 f"{annotator!r}",
             )
+
+    def test_the_legacy_dummy_configs_are_not_offered_as_soh_support(self) -> None:
+        """They exist on disk; they are not the platform's SOH capability.
+
+        configs/soh/dummy/* train DummyRegressor on one label per cell. Listing
+        them would claim SOH support the platform does not have yet. The real
+        config is written after scripts/audit_soh_readiness.py names an
+        eligible dataset, so an empty SOH catalog here is the honest state,
+        not a bug.
+        """
+        offered = [
+            entry.config_path.as_posix() for entry in self.entries
+            if "configs/soh/dummy/" in entry.config_path.as_posix()
+        ]
+        self.assertEqual(offered, [], f"legacy examples are in the catalog: {offered}")
+
+        for name in ("matr_1.yaml", "matr_1_with_soh_filepath.yaml"):
+            path = REPO_ROOT / "configs" / "soh" / "dummy" / name
+            self.assertTrue(path.is_file(), f"{name} was deleted rather than withheld")
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("legacy_example: true", text)
+            self.assertIn("LEGACY EXAMPLE", text)
 
     def test_the_catalog_is_overwhelmingly_rul(self) -> None:
         """A sanity floor: the repository is an RUL benchmark with SOH added.

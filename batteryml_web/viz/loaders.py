@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import pickle
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -67,7 +67,12 @@ CHECKABLE_METRICS = ("RMSE", "MAE", "MAPE")
 # How a label annotator's output should be described on an axis.
 LABEL_UNITS = {
     "RULLabelAnnotator": "cycles",
-    "SOHLabelAnnotator": "SOH (ratio of nominal capacity)",
+    # A ratio, not a percentage, and not "of nominal capacity": the reference
+    # is whatever the run's reference_capacity_mode says, which the artifact
+    # records in task_metadata. Naming nominal capacity here would have
+    # asserted a convention the run may not have used.
+    "SOHLabelAnnotator": "SOH (ratio)",
+    "CycleSOHLabelAnnotator": "SOH (ratio)",
 }
 
 
@@ -134,6 +139,20 @@ class PredictionArtifact:
     score_check: dict[str, dict[str, float]]
     label_transformations: list[str]
     cells: CellIdResolution
+    #: For a cycle-level task, one ``{"cell_id", "cycle_index"}`` per
+    #: prediction in row order, written by ``Pipeline.evaluate`` (UP-06).
+    #: ``None`` for a whole-cell task such as RUL, where the row order is the
+    #: cell order and there is no cycle to record. This is the *recorded*
+    #: identity, not the one ``cells`` infers from the splitter.
+    sample_index: list[dict[str, Any]] | None = None
+    #: The label conventions the run used — ``reference_capacity_mode`` and
+    #: the sample policy for SOH. Empty when the artifact records none.
+    task_metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_cycle_level(self) -> bool:
+        """Whether each prediction names an observed cycle, not just a cell."""
+        return bool(self.sample_index)
 
     @property
     def n_predictions(self) -> int:
@@ -144,6 +163,47 @@ class PredictionArtifact:
     def residuals(self) -> np.ndarray:
         """``y_pred - y_true``. A display quantity, never a reported metric."""
         return self.y_pred - self.y_true
+
+
+def _sample_index_of(payload: Any, source: Path, n_rows: int) -> list[dict[str, Any]] | None:
+    """The recorded ``(cell_id, cycle_index)`` per prediction, or None.
+
+    Validated rather than trusted: a sample index whose length disagrees with
+    the predictions would silently mislabel every point of an SOH-vs-cycle
+    plot, which is exactly the class of error this module exists to prevent.
+    A whole-cell artifact records none and gets ``None`` — that is normal, not
+    a fault.
+    """
+    if not isinstance(payload, dict):
+        return None
+    records = payload.get("sample_index")
+    if records is None:
+        return None
+    if not isinstance(records, (list, tuple)):
+        raise VizDataError(
+            f"{source}: 'sample_index' is {type(records).__name__}, expected a "
+            "list of {{cell_id, cycle_index}} records. The artifact was not "
+            "written by this platform's evaluate step."
+        )
+    if len(records) != n_rows:
+        raise VizDataError(
+            f"{source}: 'sample_index' has {len(records)} record(s) but the "
+            f"artifact holds {n_rows} prediction(s). Every prediction must "
+            "name the cell and cycle it was made for; a mismatch would "
+            "mislabel every point of a per-cycle view."
+        )
+    out: list[dict[str, Any]] = []
+    for position, record in enumerate(records):
+        if not isinstance(record, dict) or "cell_id" not in record or "cycle_index" not in record:
+            raise VizDataError(
+                f"{source}: sample_index[{position}] = {record!r} is missing "
+                "'cell_id' or 'cycle_index'."
+            )
+        out.append({
+            "cell_id": str(record["cell_id"]),
+            "cycle_index": int(record["cycle_index"]),
+        })
+    return out
 
 
 def sha256_of(path: Path) -> str:
@@ -758,4 +818,7 @@ def load_prediction_artifact(
         score_check=score_check,
         label_transformations=chain,
         cells=cells,
+        sample_index=_sample_index_of(payload, artifact_path, len(y_true)),
+        task_metadata=dict(payload.get('task_metadata') or {})
+        if isinstance(payload.get('task_metadata'), dict) else {},
     )

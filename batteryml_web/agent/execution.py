@@ -27,8 +27,26 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..core.device_inventory import validate_device
+from ..core.readiness import TASK_SOH
 from .intent import resolve_workflow_intent
 from .prompts import build_agent_workflow_context
+
+#: Metrics requested per task. Not one list for everything: MAPE is a
+#: percentage error, which is informative for a cycle count of order 100 and
+#: close to meaningless for an SOH ratio of order 1, where it merely restates
+#: MAE. SOH therefore asks for MAE and RMSE only, rather than inheriting the
+#: RUL set because it happens to be the default.
+TASK_METRICS: Dict[str, Tuple[str, ...]] = {
+    TASK_SOH: ("MAE", "RMSE"),
+}
+
+#: What every other task asks for — BatteryML's own CLI default.
+DEFAULT_METRICS: Tuple[str, ...] = ("RMSE", "MAE", "MAPE")
+
+
+def metrics_for_task(task: str | None) -> Tuple[str, ...]:
+    """The canonical metric list for ``task``."""
+    return TASK_METRICS.get(str(task or ""), DEFAULT_METRICS)
 
 WRAPPER = "batteryml_web/core/run_batteryml_cli.py"
 
@@ -316,6 +334,8 @@ def build_execution_plan(
             device_value,
             "--seed",
             str(seed),
+            "--metric",
+            ",".join(metrics_for_task(resolved_task)),
         ]
         if epochs_value is not None:
             command.extend(["--epochs", str(epochs_value)])

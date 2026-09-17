@@ -140,6 +140,18 @@ def _smoke_render(figures: Any, spec_id: str, theme: Any) -> Any:
             list(_SYNTHETIC_SMOKE_CELLS), np.abs(residuals), theme=theme, title="smoke",
             subtitle="synthetic smoke input", unit_label="cycles", dpi=72.0,
         )
+    if spec_id == "soh_vs_cycle":
+        # Two cells, three observed cycles each, on the SOH ratio scale. The
+        # figure needs one (cell, cycle) per point, so the smoke input is
+        # built that way rather than reusing the per-cell arrays above.
+        cells = ["cell-a"] * 3 + ["cell-b"] * 3
+        cycles = np.array([10, 20, 30, 10, 20, 30])
+        observed = np.array([0.99, 0.94, 0.88, 0.97, 0.90, 0.81])
+        predicted = observed + np.array([0.01, -0.02, 0.015, -0.01, 0.02, -0.005])
+        return figures.soh_vs_cycle_figure(
+            cells, cycles, observed, predicted, theme=theme, title="smoke",
+            subtitle="synthetic smoke input", unit_label="SOH (ratio)", dpi=72.0,
+        )
     if spec_id == "metrics_summary":
         return figures.metric_summary_figure(
             dict(_SYNTHETIC_SMOKE_SCORES), theme=theme, title="smoke",

@@ -162,6 +162,14 @@ class ConfigRegistry:
                 data = loaded
         except Exception:
             pass
+        # A config that declares itself a legacy example is not offered as a
+        # runnable choice. configs/soh/dummy/* demonstrate label plumbing with
+        # DummyRegressor and one label per cell; listing them as the platform's
+        # SOH support would claim a capability that does not exist yet. The
+        # files stay, and the notebook that uses them keeps working — they are
+        # only withheld from the catalog.
+        if isinstance(data, dict) and bool(data.get("legacy_example")):
+            return None
         hay = f"{path} {path.name} {text}".lower()
         dataset = self._infer_dataset(hay, data)
         task = self._infer_task(hay, data)

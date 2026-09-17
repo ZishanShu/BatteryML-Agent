@@ -5,6 +5,7 @@
 # label per cell at a single cycle, and RUL features from earlier
 # cycles. The canonical cycle-level SOH route uses
 # CycleSOHLabelAnnotator; see docs/SOH_PROTOCOL.md.
+legacy_example: true
 model:
     name: 'DummyRULPredictor'
 train_test_split:
