@@ -227,12 +227,14 @@ class FakeStreamlit:
         checkbox_values: dict[str, bool] | None = None,
         multiselect_values: dict[str, list] | None = None,
         radio_values: dict[str, str] | None = None,
+        selectbox_values: dict[str, str] | None = None,
     ):
         self.session_state = session
         self._clicked = set(clicked_buttons or ())
         self._checkbox_values = dict(checkbox_values or {})
         self._multiselect_values = dict(multiselect_values or {})
         self._radio_values = dict(radio_values or {})
+        self._selectbox_values = dict(selectbox_values or {})
         self.rec: dict[str, list] = {
             "markdown": [],
             "captions": [],
@@ -319,7 +321,9 @@ class FakeStreamlit:
     def selectbox(self, label, options, index=0, **kwargs):
         opts = list(options)
         self.rec["selectboxes"].append({"label": str(label), "options": [str(o) for o in opts]})
-        return opts[index if index is not None else 0]
+        if str(label) in self._selectbox_values:
+            return self._selectbox_values[str(label)]
+        return opts[index if index is not None else 0] if opts else None
 
     def checkbox(self, label, **kwargs):
         return bool(self._checkbox_values.get(str(label), False))
@@ -574,8 +578,12 @@ def _render(
     checkboxes: dict[str, bool] | None = None,
     multiselect_values: dict[str, list] | None = None,
     radio_values: dict[str, str] | None = None,
+    selectbox_values: dict[str, str] | None = None,
 ) -> FakeStreamlit:
-    fake = FakeStreamlit(session, clicked, checkboxes, multiselect_values, radio_values)
+    fake = FakeStreamlit(
+        session, clicked, checkboxes, multiselect_values, radio_values,
+        selectbox_values,
+    )
     with _fake_streamlit(fake):
         try:
             ui.render_agent_workflow()
@@ -1053,17 +1061,29 @@ class TestBatLiNetSmokeRender(unittest.TestCase):
         _render(session, checkboxes={ui.SMOKE_CHECKBOX_LABEL: False})
         self.assertIsNone(self._plan_calls[-1]["epochs"])
 
-    def test_gpu_inventory_is_displayed_not_invented(self) -> None:
-        # The inventory table belongs to GPU mode; CPU mode does not show it.
+    def test_gpu_information_is_displayed_not_invented(self) -> None:
+        """Runtime facts still reach the user — now in the selector itself.
+
+        The separate inventory table was dropped when the device UX was
+        simplified to CPU / one GPU: the option labels already carry index,
+        name, free memory and utilization, and a second table repeated them.
+        What must remain true is that every figure comes from the enumerated
+        device rather than from a constant.
+        """
         fake = _render(
             self._batlinet_session(),
             radio_values={ui.COMPUTE_LABEL: "GPU"},
-            multiselect_values={"GPUs to use": ["cuda:0"]},
+            selectbox_values={ui.GPU_SELECT_LABEL: "cuda:0"},
         )
-        rows = [row for frame in fake.rec["dataframes"] if isinstance(frame, list) for row in frame]
-        gpu_rows = [row for row in rows if isinstance(row, dict) and "GPU" in row]
-        self.assertEqual([row["Device"] for row in gpu_rows], ["cuda:0", "cuda:1"])
-        self.assertEqual(gpu_rows[0]["Free (MiB)"], "2076")
+        boxes = [s for s in fake.rec["selectboxes"] if s["label"] == ui.GPU_SELECT_LABEL]
+        self.assertEqual(boxes[0]["options"], ["cuda:0", "cuda:1"])
+
+        inventory = _FAKE_GPU_INVENTORY["devices"]
+        for device in inventory:
+            label = ui.gpu_option_label(device["device"], _FAKE_GPU_INVENTORY)
+            self.assertIn(str(device["name"]), label)
+            self.assertIn(f"{device['memory_free_mib'] / 1024:.1f} GB free", label)
+            self.assertIn(f"{device['utilization_pct']}% util", label)
 
     def test_cuda_oom_result_shows_actionable_message_and_keeps_stderr(self) -> None:
         session = self._batlinet_session()
@@ -1657,7 +1677,7 @@ class TestRequestAreaIsOneControl(unittest.TestCase):
         self.assertEqual(areas[0]["placeholder"], REQUEST_TEMPLATE_STRUCTURE)
         # The slots are visible in the hint; the filled values arrive only
         # when the user asks for them.
-        for slot in ("[method]", "[dataset]", "[task]"):
+        for slot in ("[Model]", "[dataset]", "[task]"):
             self.assertIn(slot, areas[0]["placeholder"])
         self.assertEqual(areas[0]["value"], "")
 
@@ -1778,124 +1798,6 @@ class TestRequestAreaIsOneControl(unittest.TestCase):
         rendered = repr(_render({"gpu_inventory": _FAKE_GPU_INVENTORY}).rec)
         self.assertNotIn("Press Tab", rendered)
         self.assertNotIn("press Tab", rendered)
-
-
-class TestGpuMultiSelectRender(unittest.TestCase):
-    """G: CPU / one GPU / several, with Run gated on backend capability."""
-
-    def setUp(self) -> None:
-        self._real_build = ui.build_execution_plan
-        self._real_stream = ui.execute_plan_streaming
-        self._real_llm = ui.is_llm_configured
-        self.plans: list[dict] = []
-        self.executed: list = []
-
-        def stub_build(dataset, task, model, **kwargs):
-            self.plans.append({"model": model, **kwargs})
-            return _ok_plan(model, epochs=kwargs.get("epochs"))
-
-        ui.build_execution_plan = stub_build
-        ui.execute_plan_streaming = lambda plan, **kw: self.executed.append(plan)
-        ui.is_llm_configured = lambda: False
-
-    def tearDown(self) -> None:
-        ui.build_execution_plan = self._real_build
-        ui.execute_plan_streaming = self._real_stream
-        ui.is_llm_configured = self._real_llm
-
-    def _session(self) -> dict:
-        return {
-            "agent_workflow_context": _MATR_CONTEXT,
-            "agent_original_request": "Use BatLiNet on MATR to predict battery lifetime.",
-            "agent_selected_model": "batlinet",
-            "gpu_inventory": _FAKE_GPU_INVENTORY,
-        }
-
-    def test_no_gpu_selected_runs_on_cpu(self) -> None:
-        session = self._session()
-        fake = _render(session, radio_values={ui.COMPUTE_LABEL: "CPU"})
-        self.assertEqual(session["agent_device_selection"], {"mode": "cpu", "gpu_ids": []})
-        self.assertEqual(self.plans[-1]["device"], "cpu")
-        run_buttons = [b for b in fake.rec["buttons"] if b["label"] == ui.RUN_BUTTON_LABEL]
-        self.assertTrue(run_buttons and run_buttons[0]["disabled"] is False)
-
-    def test_one_gpu_selected_stays_executable(self) -> None:
-        session = self._session()
-        fake = _render(
-            session,
-            radio_values={ui.COMPUTE_LABEL: "GPU"},
-            multiselect_values={"GPUs to use": ["cuda:1"]},
-        )
-        self.assertEqual(
-            session["agent_device_selection"], {"mode": "single_gpu", "gpu_ids": [1]}
-        )
-        self.assertEqual(self.plans[-1]["device"], "cuda:1")
-        run_buttons = [b for b in fake.rec["buttons"] if b["label"] == ui.RUN_BUTTON_LABEL]
-        self.assertTrue(run_buttons and run_buttons[0]["disabled"] is False)
-
-    def test_several_gpus_disable_run_with_the_exact_message(self) -> None:
-        session = self._session()
-        fake = _render(
-            session,
-            radio_values={ui.COMPUTE_LABEL: "GPU"},
-            multiselect_values={"GPUs to use": ["cuda:0", "cuda:1"]},
-        )
-        # The selection is kept exactly as chosen, not reduced to one GPU.
-        self.assertEqual(
-            session["agent_device_selection"], {"mode": "multi_gpu", "gpu_ids": [0, 1]}
-        )
-        # No plan was built, so no device string was needed.
-        self.assertEqual(self.plans, [])
-        self.assertEqual(self.executed, [])
-        errors = " ".join(fake.rec["errors"])
-        self.assertIn(
-            "True multi-GPU execution is not yet supported for this model/runtime.",
-            errors,
-        )
-        self.assertEqual(
-            ui.MULTI_GPU_NOTICE,
-            "True multi-GPU execution is not yet supported for this model/runtime.",
-        )
-        run_buttons = [b for b in fake.rec["buttons"] if b["label"] == ui.RUN_BUTTON_LABEL]
-        self.assertTrue(run_buttons)
-        self.assertTrue(all(button["disabled"] for button in run_buttons))
-
-    def test_a_multi_gpu_selection_cannot_be_executed_by_clicking(self) -> None:
-        session = self._session()
-        _render(
-            session,
-            clicked={ui.RUN_BUTTON_LABEL},
-            radio_values={ui.COMPUTE_LABEL: "GPU"},
-            multiselect_values={"GPUs to use": ["cuda:0", "cuda:1"]},
-        )
-        self.assertEqual(self.executed, [])
-
-    def test_the_capability_fields_are_shown(self) -> None:
-        session = self._session()
-        fake = _render(
-            session,
-            radio_values={ui.COMPUTE_LABEL: "GPU"},
-            multiselect_values={"GPUs to use": ["cuda:0", "cuda:1"]},
-        )
-        captions = " ".join(fake.rec["captions"])
-        self.assertIn("supports_multi_gpu: False", captions)
-        self.assertIn("multi_gpu_strategy: None", captions)
-
-    def test_the_inventory_table_shows_utilization(self) -> None:
-        fake = _render(
-            self._session(),
-            radio_values={ui.COMPUTE_LABEL: "GPU"},
-            multiselect_values={"GPUs to use": ["cuda:0"]},
-        )
-        rows = [
-            row
-            for frame in fake.rec["dataframes"]
-            if isinstance(frame, list)
-            for row in frame
-            if isinstance(row, dict) and "GPU" in row
-        ]
-        self.assertTrue(rows)
-        self.assertIn("Utilization (%)", rows[0])
 
 
 class TestTheFakeCoversTheRealSurface(unittest.TestCase):
@@ -2057,12 +1959,20 @@ def _inventory_with(count: int) -> dict:
 
 
 class TestComputeDeviceSelector(unittest.TestCase):
-    """CPU is a choice the user makes, not the absence of one."""
+    """The product supports CPU and one GPU. Nothing else is offered.
+
+    Multi-GPU selection was removed from the normal UI: no model can execute
+    a distributed run (docs/DDP_CONTRACT.md), so offering the choice put an
+    error box in front of anyone who tried it. The DDP infrastructure and its
+    tests remain; only the user-facing offer is gone.
+    """
 
     def setUp(self) -> None:
         self._real_build = ui.build_execution_plan
         self._real_stream = ui.execute_plan_streaming
         self._real_llm = ui.is_llm_configured
+        self._real_manager = ui.get_run_manager
+        self._real_write = ui.write_manifest
         self.plans: list[dict] = []
         ui.build_execution_plan = lambda d, t_, m, **kw: (
             self.plans.append({"model": m, **kw})
@@ -2070,11 +1980,15 @@ class TestComputeDeviceSelector(unittest.TestCase):
         )
         ui.execute_plan_streaming = lambda plan, **kw: None
         ui.is_llm_configured = lambda: False
+        ui.get_run_manager = lambda: _FakeRunManager()
+        ui.write_manifest = lambda run_dir, manifest: None
 
     def tearDown(self) -> None:
         ui.build_execution_plan = self._real_build
         ui.execute_plan_streaming = self._real_stream
         ui.is_llm_configured = self._real_llm
+        ui.get_run_manager = self._real_manager
+        ui.write_manifest = self._real_write
 
     def _session(self, inventory: dict) -> dict:
         return {
@@ -2084,116 +1998,115 @@ class TestComputeDeviceSelector(unittest.TestCase):
             "project_root": "runs/web_projects/alpha",
         }
 
-    def test_cpu_is_an_explicit_visible_choice(self) -> None:
+    def test_the_only_compute_choices_are_cpu_and_gpu(self) -> None:
         fake = _render(self._session(_inventory_with(2)))
         modes = [b for b in fake.rec["radios"] if b["label"] == ui.COMPUTE_LABEL]
         self.assertEqual(modes[0]["options"], ["CPU", "GPU"])
 
-    def test_cpu_needs_no_empty_gpu_selection(self) -> None:
+    def test_cpu_needs_no_gpu_interaction(self) -> None:
         session = self._session(_inventory_with(2))
         fake = _render(session, radio_values={ui.COMPUTE_LABEL: "CPU"})
-        # No GPU control is shown at all in CPU mode.
         self.assertEqual(
-            [m for m in fake.rec["multiselects"] if m["label"] == "GPUs to use"], []
+            [s for s in fake.rec["selectboxes"] if s["label"] == ui.GPU_SELECT_LABEL], []
         )
-        self.assertEqual(session["agent_device_selection"]["mode"], "cpu")
+        self.assertEqual(session["agent_device_selection"], {"mode": "cpu", "gpu_ids": []})
         self.assertEqual(self.plans[-1]["device"], "cpu")
 
-    def test_gpu_mode_reveals_exactly_the_discovered_gpus(self) -> None:
+    def test_gpu_mode_offers_exactly_the_discovered_gpus(self) -> None:
         for count in (1, 4, 8):
             with self.subTest(gpus=count):
                 self.plans.clear()
                 fake = _render(
                     self._session(_inventory_with(count)),
                     radio_values={ui.COMPUTE_LABEL: "GPU"},
-                    multiselect_values={"GPUs to use": ["cuda:0"]},
                 )
-                box = [m for m in fake.rec["multiselects"] if m["label"] == "GPUs to use"]
-                self.assertEqual(len(box[0]["options"]), count)
-                self.assertEqual(
-                    box[0]["options"], [f"cuda:{i}" for i in range(count)]
-                )
+                boxes = [
+                    s for s in fake.rec["selectboxes"] if s["label"] == ui.GPU_SELECT_LABEL
+                ]
+                self.assertEqual(len(boxes), 1, "exactly one GPU control")
+                self.assertEqual(boxes[0]["options"], [f"cuda:{i}" for i in range(count)])
 
-    def test_a_machine_with_no_gpu_defaults_to_cpu(self) -> None:
-        """CPU is the default, so an unenumerated machine simply runs."""
-        session = self._session(di.empty_inventory("nvidia-smi was not found"))
-        _render(session)
-        self.assertEqual(session["agent_device_selection"], {"mode": "cpu", "gpu_ids": []})
-        self.assertEqual(self.plans[-1]["device"], "cpu")
-
-    def test_an_unenumerated_machine_invents_no_gpus(self) -> None:
-        """Nothing enumerated means nothing claimed.
-
-        The single ``cuda:0`` entry is the deliberate manual override from
-        milestone A requirement 3 (``device_choices_with_manual_gpu``): a
-        user who knows the machine has a GPU can still pick one when
-        ``nvidia-smi`` is unreadable. What must never happen is the page
-        *inventing* an inventory — a list of GPUs, memory figures or
-        utilisation that the driver never reported. So: at most the one
-        override, the inventory error shown, and the unknown availability
-        stated in a warning.
-        """
-        error = "nvidia-smi was not found"
-        session = self._session(di.empty_inventory(error))
-        fake = _render(session, radio_values={ui.COMPUTE_LABEL: "GPU"})
-
-        box = [m for m in fake.rec["multiselects"] if m["label"] == "GPUs to use"]
-        self.assertEqual(box[0]["options"], [di.MANUAL_CUDA_DEVICE])
-        self.assertIn(error, " ".join(fake.rec["captions"]))
-        self.assertTrue(
-            any("not enumerated" in w for w in fake.rec["warnings"]),
-            fake.rec["warnings"],
+    def test_no_multi_gpu_widget_is_rendered_at_all(self) -> None:
+        fake = _render(
+            self._session(_inventory_with(4)), radio_values={ui.COMPUTE_LABEL: "GPU"}
         )
-        # No fabricated memory or utilisation figures anywhere on the page.
-        rendered = repr(fake.rec)
-        for invented in ("MiB free", "% util", "GB free"):
-            self.assertNotIn(invented, rendered)
+        self.assertEqual(fake.rec["multiselects"], [])
 
-    def test_gpu_labels_come_from_the_runtime_inventory(self) -> None:
-        inventory = _inventory_with(2)
-        label = ui.gpu_option_label("cuda:1", inventory)
-        self.assertIn("GPU 1", label)
-        self.assertIn(str(inventory["devices"][1]["name"]), label)
-        self.assertIn("free", label)
-        self.assertIn("util", label)
-
-    def test_a_single_gpu_resolves_to_cuda_n(self) -> None:
+    def test_exactly_one_gpu_is_selected_and_becomes_cuda_n(self) -> None:
         session = self._session(_inventory_with(4))
         _render(
             session,
             radio_values={ui.COMPUTE_LABEL: "GPU"},
-            multiselect_values={"GPUs to use": ["cuda:2"]},
+            selectbox_values={ui.GPU_SELECT_LABEL: "cuda:2"},
         )
         self.assertEqual(
             session["agent_device_selection"], {"mode": "single_gpu", "gpu_ids": [2]}
         )
         self.assertEqual(self.plans[-1]["device"], "cuda:2")
 
-    def test_several_gpus_keep_their_structure_and_block_run(self) -> None:
-        session = self._session(_inventory_with(4))
-        fake = _render(
-            session,
-            radio_values={ui.COMPUTE_LABEL: "GPU"},
-            multiselect_values={"GPUs to use": ["cuda:0", "cuda:3"]},
-        )
-        self.assertEqual(
-            session["agent_device_selection"], {"mode": "multi_gpu", "gpu_ids": [0, 3]}
-        )
-        self.assertEqual(self.plans, [])  # no plan, so no device string was needed
-        self.assertIn(ui.MULTI_GPU_NOTICE, " ".join(fake.rec["errors"]))
-        runs = [b for b in fake.rec["buttons"] if b["label"] == ui.RUN_BUTTON_LABEL]
-        self.assertTrue(runs and all(b["disabled"] for b in runs))
-
-    def test_no_multi_device_string_is_ever_built(self) -> None:
+    def test_no_multi_device_string_can_be_built(self) -> None:
         session = self._session(_inventory_with(8))
         _render(
             session,
             radio_values={ui.COMPUTE_LABEL: "GPU"},
-            multiselect_values={"GPUs to use": ["cuda:0", "cuda:1"]},
+            selectbox_values={ui.GPU_SELECT_LABEL: "cuda:3"},
         )
         blob = repr(session) + repr(self.plans)
         self.assertNotIn("cuda:0,1", blob)
-        self.assertNotIn("cuda:0,cuda:1", blob)
+        self.assertNotIn(",cuda:", blob)
+
+    def test_no_ddp_warning_reaches_an_ordinary_user(self) -> None:
+        """§9: the distributed internals belong in docs, not on the page."""
+        fake = _render(
+            self._session(_inventory_with(4)),
+            radio_values={ui.COMPUTE_LABEL: "GPU"},
+            selectbox_values={ui.GPU_SELECT_LABEL: "cuda:1"},
+        )
+        rendered = repr(fake.rec)
+        for leak in (
+            "multi-GPU", "multi_gpu", "DDP_CONTRACT", "supports_multi_gpu",
+            "rank", "sharding", "torchrun",
+        ):
+            self.assertNotIn(leak, rendered)
+
+    def test_a_machine_with_no_gpu_defaults_to_cpu(self) -> None:
+        session = self._session(di.empty_inventory("nvidia-smi was not found"))
+        _render(session)
+        self.assertEqual(session["agent_device_selection"], {"mode": "cpu", "gpu_ids": []})
+        self.assertEqual(self.plans[-1]["device"], "cpu")
+
+    def test_gpu_labels_come_from_the_runtime_inventory(self) -> None:
+        inventory = _inventory_with(2)
+        label = ui.gpu_option_label("cuda:1", inventory)
+        self.assertTrue(label.startswith("cuda:1"))
+        self.assertIn(str(inventory["devices"][1]["name"]), label)
+        self.assertIn("free", label)
+        self.assertIn("util", label)
+
+    def test_a_healthy_gpu_gets_a_caption_not_a_warning_box(self) -> None:
+        """§10: a full-width warning for an idle GPU trains people to ignore them."""
+        # _FAKE_GPU_INVENTORY's cuda:1 reports ~10 GB free of 24 GB.
+        session = dict(self._session(_FAKE_GPU_INVENTORY))
+        fake = _render(
+            session,
+            radio_values={ui.COMPUTE_LABEL: "GPU"},
+            selectbox_values={ui.GPU_SELECT_LABEL: "cuda:1"},
+        )
+        captions = " ".join(fake.rec["captions"])
+        self.assertIn("cuda:1", captions)
+        self.assertIn("GB free", captions)
+        self.assertIn("availability may change", captions)
+        self.assertNotIn("cuda:1", " ".join(fake.rec["warnings"]))
+
+    def test_a_nearly_full_gpu_does_warn(self) -> None:
+        # ...while its cuda:0 reports ~2 GB free of 24 GB, which does.
+        fake = _render(
+            dict(self._session(_FAKE_GPU_INVENTORY)),
+            radio_values={ui.COMPUTE_LABEL: "GPU"},
+            selectbox_values={ui.GPU_SELECT_LABEL: "cuda:0"},
+        )
+        self.assertIn("cuda:0", " ".join(fake.rec["warnings"]))
+        self.assertNotIn("cuda:0", " ".join(fake.rec["captions"]))
 
 
 class TestProjectDeterminesTheWorkspaceInTheUi(unittest.TestCase):

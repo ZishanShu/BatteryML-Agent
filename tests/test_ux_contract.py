@@ -106,7 +106,7 @@ class TestRequestTemplate(unittest.TestCase):
     """A: one template helper, filled from the backend."""
 
     def test_the_visible_structure_keeps_its_slots(self) -> None:
-        for slot in ("[method]", "[dataset]", "[task]"):
+        for slot in ("[Model]", "[dataset]", "[task]"):
             self.assertIn(slot, REQUEST_TEMPLATE_STRUCTURE)
 
     def test_the_filled_template_follows_the_installation(self) -> None:
@@ -135,7 +135,7 @@ class TestRequestTemplate(unittest.TestCase):
 
     def test_an_empty_catalog_keeps_the_placeholders_rather_than_inventing(self) -> None:
         filled = build_request_template({})
-        self.assertIn("[method]", filled)
+        self.assertIn("[Model]", filled)
         self.assertIn("[dataset]", filled)
         # ...and names nothing this installation does not have.
         for invented in ("MATR", "CPTransformer", "BatLiNet"):
@@ -345,10 +345,17 @@ class TestProviderPresets(unittest.TestCase):
         self.assertNotIn("disabled=True", code)
 
     def test_the_supported_api_note_is_precise_about_compatibility(self) -> None:
+        """Still a compatibility claim, now in one line.
+
+        The caveat about provider-specific features moved into the constant's
+        own comment when the helper copy was shortened: a maintainer needs
+        the precision, a user needs to know which endpoints work.
+        """
         note = settings.SUPPORTED_API_NOTE.lower()
         self.assertIn("openai-compatible", note)
-        # A compatibility claim, not a feature-parity claim.
-        self.assertIn("not implemented", note)
+        self.assertIn("custom", note)
+        source = Path(settings.__file__).read_text(encoding="utf-8")
+        self.assertIn("are not\n#: implemented", source)
 
     def test_the_api_key_is_masked(self) -> None:
         code = _code_without_prose(UI_DIR / "settings_panel.py")

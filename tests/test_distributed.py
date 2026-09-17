@@ -303,8 +303,14 @@ class TestCapabilityGating(unittest.TestCase):
         reason = MULTI_GPU_BLOCKERS["batlinet"]
         self.assertIn("support", reason.lower())
 
-    def test_the_ui_names_no_model_when_deciding_capability(self) -> None:
-        """Capability comes from the backend, never from an if in the page."""
+    def test_the_page_offers_no_multi_gpu_path_at_all(self) -> None:
+        """The UI was simplified to CPU / one GPU.
+
+        It no longer consults multi-GPU capability because it no longer
+        offers the choice: a user cannot reach a distributed run, so no
+        capability check or warning belongs on the page. The capability
+        metadata still exists for the backend and for future work.
+        """
         import ast
 
         source = (REPO_ROOT / "batteryml_web/ui/agent_workflow.py").read_text(
@@ -323,7 +329,9 @@ class TestCapabilityGating(unittest.TestCase):
         code = ast.unparse(tree)
         for name in ("CPTransformer", "cptransformer", "batlinet", "BatLiNet"):
             self.assertNotIn(name, code)
-        self.assertIn("multi_gpu_capability", code)
+        # Neither a model name nor a capability lookup: the offer is gone.
+        self.assertNotIn("multi_gpu_capability", code)
+        self.assertNotIn("st.multiselect", code)
 
 
 if __name__ == "__main__":

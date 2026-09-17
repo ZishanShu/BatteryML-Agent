@@ -124,6 +124,62 @@ def smoke_device_recommendation(
     }
 
 
+#: Fraction of a GPU's own memory below which its free figure is worth a
+#: warning rather than a caption. Relative to that card's total, never an
+#: absolute floor: this platform does not know any model's memory
+#: requirement, and inventing one would be a claim it cannot support.
+LOW_MEMORY_FRACTION = 0.10
+
+
+def gpu_status_line(
+    device: str,
+    inventory: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """A compact status for the selected GPU, and how loudly to say it.
+
+    Returns ``{"text", "severity"}`` where severity is ``"caption"`` for the
+    ordinary case and ``"warning"`` when the figure deserves attention — the
+    card is nearly full, or nothing was enumerated for it.
+
+    The long paragraph this replaces said the same thing in four lines and
+    used a warning box even when the GPU was empty, which trains people to
+    ignore warning boxes.
+    """
+    from ..core.device_inventory import find_device
+
+    name = str(device or "").strip()
+    if not name or name == CPU_DEVICE:
+        return {"text": "", "severity": "caption"}
+
+    entry = find_device(name, inventory)
+    if entry is None:
+        return {
+            "text": (
+                f"{name} was not enumerated on this machine; its availability "
+                "is unknown. The run is still sent to it exactly as selected."
+            ),
+            "severity": "warning",
+        }
+
+    label = str(entry.get("name") or name)
+    free = entry.get("memory_free_mib")
+    total = entry.get("memory_total_mib")
+    if not isinstance(free, int):
+        return {
+            "text": f"{name} · {label} · free memory not reported by nvidia-smi.",
+            "severity": "warning",
+        }
+
+    text = f"{name} · {label} · {free / 1024:.1f} GB free"
+    utilization = entry.get("utilization_pct")
+    if isinstance(utilization, int):
+        text += f" · {utilization}% util"
+    text += " (shared GPU; availability may change)"
+
+    low = isinstance(total, int) and total > 0 and (free / total) < LOW_MEMORY_FRACTION
+    return {"text": text, "severity": "warning" if low else "caption"}
+
+
 def gpu_memory_advisory(
     device: str,
     inventory: Optional[Dict[str, Any]],

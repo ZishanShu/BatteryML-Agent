@@ -63,12 +63,9 @@ from ..agent.recommendation import (
 from ..agent.result_agent import explain_run_result
 from ..agent.results import METRIC_KEYS, SMOKE_RUN_WARNING, build_result_context
 from ..agent.run_policy import (
-    MULTI_GPU_UNSUPPORTED_MESSAGE,
     SMOKE_EPOCHS,
     SMOKE_NOTICE,
-    execution_blockers,
-    gpu_memory_advisory,
-    multi_gpu_capability,
+    gpu_status_line,
     smoke_device_recommendation,
     smoke_epochs_for,
 )
@@ -137,7 +134,11 @@ from .progress_utils import get_safe_runtime_env
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 RUN_BUTTON_LABEL = "Run"
-CANCEL_BUTTON_LABEL = "Cancel run"
+#: Offered for any run that is executing, whatever the model. Stopping is
+#: independent of whether that model can later be resumed — conflating them
+#: would hide Stop from exactly the long runs that need it. The backend state
+#: remains CANCELLED; this is the user-facing word for it.
+CANCEL_BUTTON_LABEL = "Stop run"
 
 #: Session key holding the run id reserved for the *prepared* plan. It is
 #: minted once a runnable plan exists, so the page can show which run it is
@@ -188,10 +189,10 @@ LIVE_LOG_LINES = 12
 #: The two compute modes, as the user picks them.
 COMPUTE_MODES: tuple[str, str] = ("CPU", "GPU")
 COMPUTE_LABEL = "Compute device"
-#: Shown when more GPUs are selected than the runtime can actually execute
-#: on. Re-exported from the backend rather than restated: the page and the
-#: planner must not be able to disagree about whether multi-GPU works.
-MULTI_GPU_NOTICE = MULTI_GPU_UNSUPPORTED_MESSAGE
+#: Label of the single-GPU selector. The product supports CPU and one GPU;
+#: distributed execution stays experimental infrastructure and is not offered
+#: here (docs/DDP_CONTRACT.md).
+GPU_SELECT_LABEL = "GPU"
 EXPLAIN_BUTTON_LABEL = "Explain computed result"
 
 
@@ -265,11 +266,6 @@ def smoke_device_note(model_key: str, smoke: bool) -> str:
         model_key, smoke=smoke, available_devices=["cpu"]
     )
     return str(advice.get("reason") or "")
-
-
-def selection_blockers(model_key: str, selection: dict[str, Any]) -> list[str]:
-    """Reasons the Run button must stay disabled for this device selection."""
-    return execution_blockers(model_key, selection)
 
 
 def raw_only_notice(context: dict[str, Any]) -> str | None:
@@ -944,7 +940,13 @@ def request_template() -> str:
         return cached
     context = st.session_state.get("agent_workflow_context")
     runnable = runnable_model_keys(context) if isinstance(context, dict) else None
-    template = build_request_template(build_intent_catalog(), runnable_keys=runnable)
+    # The task comes from the resolved workflow when there is one, so the
+    # filled sentence names the task actually in play rather than assuming
+    # every request is a lifetime prediction.
+    task = context.get("task") if isinstance(context, dict) else None
+    template = build_request_template(
+        build_intent_catalog(), runnable_keys=runnable, task=task
+    )
     st.session_state["agent_request_template"] = str(template)
     return str(template)
 
@@ -1186,7 +1188,7 @@ def _render_active_run(
     _live()
 
     if st.session_state.get(f"cancelling_{run_id}"):
-        st.warning("Cancelling this run…")
+        st.warning("Stopping this run…")
     if st.button(
         CANCEL_BUTTON_LABEL,
         key=f"agent_cancel_{run_id}",
@@ -1398,50 +1400,42 @@ def render_agent_workflow() -> None:
             )
             mode = "CPU"
 
-        chosen_gpus: list[str] = []
+        chosen_gpu: str | None = None
         if mode == "GPU":
-            _render_gpu_inventory(inventory)
-            chosen_gpus = st.multiselect(
-                "GPUs to use",
+            # Exactly one GPU. The product supports CPU and a single GPU;
+            # distributed execution is experimental infrastructure and is not
+            # offered here (docs/DDP_CONTRACT.md). Offering a multi-select for
+            # something no model can execute put an error box in front of
+            # every user who tried it.
+            chosen_gpu = st.selectbox(
+                GPU_SELECT_LABEL,
                 gpu_options,
-                default=gpu_options[:1],
+                index=0,
                 format_func=lambda name: gpu_option_label(name, inventory),
-                key=f"agent_gpu_select_{selected_key}_{int(bool(smoke))}",
+                key=f"agent_gpu_choice_{selected_key}_{int(bool(smoke))}",
             )
-            if not chosen_gpus:
-                st.info("Select at least one GPU, or switch back to CPU.")
 
-        selection = selection_from_devices(chosen_gpus)
+        selection = selection_from_devices([chosen_gpu] if chosen_gpu else [])
         _store_json_state("agent_device_selection", selection)
-        device_label_text = describe_selection(selection)
-        st.caption(f"Selected: {device_label_text}")
-
         device_value = device_string_for_selection(selection)
-        blockers = selection_blockers(str(selected_key), selection)
-        for name in chosen_gpus:
-            advisory = gpu_memory_advisory(str(name), inventory)
-            if advisory:
-                st.warning(advisory)
+        # The readable form for the provenance block ("CPU", "GPU 3"), which
+        # is separate from the executable --device string below.
+        device_label_text = describe_selection(selection)
 
-        if blockers or device_value is None:
-            # The selection is left exactly as chosen — never quietly reduced
-            # to one GPU — and Run is unreachable instead.
-            st.error(MULTI_GPU_NOTICE)
-            for blocker in blockers:
-                st.caption(blocker)
-            capability = multi_gpu_capability(str(selected_key))
-            st.caption(
-                "supports_multi_gpu: "
-                f"{capability['supports_multi_gpu']}; multi_gpu_strategy: "
-                f"{capability['multi_gpu_strategy']}"
-            )
-            st.button(
-                RUN_BUTTON_LABEL,
-                disabled=True,
-                use_container_width=True,
-                key="agent_run_blocked",
-            )
+        if chosen_gpu:
+            # One compact line. A warning box only when the figure deserves
+            # one — a full-width warning for an idle GPU teaches people to
+            # ignore warnings.
+            status = gpu_status_line(str(chosen_gpu), inventory)
+            if status["text"]:
+                if status["severity"] == "warning":
+                    st.warning(status["text"])
+                else:
+                    st.caption(status["text"])
         else:
+            st.caption(device_label_text)
+
+        if device_value is not None:
             device = str(device_value)
             st.session_state["agent_device"] = device
             # The run this page is about to create. Reserved (not created):

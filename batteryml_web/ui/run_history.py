@@ -24,6 +24,9 @@ from ..ui.formatting import compact_metric
 
 HISTORY_TITLE = "Run history"
 
+#: Shown only for a run that can actually be continued.
+RESUME_LABEL = "Resume training"
+
 #: Column order for the history table.
 COLUMNS: tuple[str, ...] = (
     "Run ID",
@@ -207,84 +210,64 @@ def render_run_detail(manifest: Dict[str, Any]) -> None:
 
 
 def _render_resume_offer(manifest: Dict[str, Any]) -> None:
-    """Offer Resume only where the backend says the model can resume.
+    """Offer Resume only where it genuinely works, and keep it small.
 
-    Two independent conditions, both backend-derived: the model's training
-    loop must persist enough state (``resume_capability``), and a *resumable*
-    checkpoint must actually exist (``classify_checkpoint``). A weights-only
-    ``.ckpt`` — which every older neural run has — is explicitly not enough,
-    and the reason is shown rather than the control being silently absent.
+    Two backend-derived conditions, both required: the model's training loop
+    must persist enough state (``resume_capability``), and a *resumable*
+    checkpoint must exist (``classify_checkpoint``). A weights-only ``.ckpt``
+    — which every older neural run has — is not enough.
+
+    When either is missing the control is simply absent. Explaining optimizer
+    and RNG state to someone who only wanted to look at a result is noise;
+    the reasons live in docs/TRAINING_STATE_AUDIT.md and in the technical
+    details, not on the normal page. No model is named here: the capability
+    comes from the backend.
     """
     from ..agent.run_policy import resume_capability
-    from ..core.training_checkpoint import (
-        KIND_RESUMABLE,
-        classify_checkpoint,
-    )
+    from ..core.training_checkpoint import KIND_RESUMABLE, classify_checkpoint
 
     model_key = str(manifest.get("model_key") or "")
-    capability = resume_capability(model_key, family=str(manifest.get("model_family") or ""))
+    capability = resume_capability(
+        model_key, family=str(manifest.get("model_family") or "")
+    )
+    if not capability["supports_resume"]:
+        return
 
-    checkpoints = [
-        str(path)
-        for path in (manifest.get("artifacts") or {}).get("checkpoint_files") or []
-    ]
     resumable = [
         verdict
-        for verdict in (classify_checkpoint(path) for path in checkpoints)
+        for verdict in (
+            classify_checkpoint(path)
+            for path in (manifest.get("artifacts") or {}).get("checkpoint_files") or []
+        )
         if verdict["kind"] == KIND_RESUMABLE
     ]
-
-    if not capability["supports_resume"]:
-        if checkpoints:
-            st.caption(f"Resume is not available: {capability['resume_reason']}")
-        return
     if not resumable:
-        if checkpoints:
-            st.caption(
-                "This run has checkpoint files, but none of them carries the "
-                "optimizer, epoch and RNG state a continuation needs. They can "
-                "still be used for inference or an explicit warm start."
-            )
         return
 
     latest = max(resumable, key=lambda v: v.get("epoch") or 0)
     completed = int(latest.get("epoch") or 0)
-    with st.expander("Resume training", expanded=False):
-        st.caption(
-            "A resume starts a new run that continues this one. This run is "
-            "never modified."
-        )
+    stored_target = int(latest.get("target_total_epochs") or 0)
+    with st.expander(RESUME_LABEL, expanded=False):
+        st.caption(f"Last resumable checkpoint: epoch {completed}")
         target = st.number_input(
             "Target total epochs",
             min_value=completed + 1,
-            value=max(completed + 1, int(latest.get("target_total_epochs") or completed + 1)),
+            value=max(completed + 1, stored_target),
             step=1,
             key=f"resume_target_{manifest.get('run_id')}",
         )
-        st.dataframe(
-            [
-                {"Field": "Source run", "Value": str(manifest.get("run_id"))},
-                {"Field": "Checkpoint", "Value": str(latest.get("path"))},
-                {"Field": "Completed epochs", "Value": str(completed)},
-                {"Field": "Target total epochs", "Value": str(int(target))},
-                {"Field": "Remaining", "Value": str(int(target) - completed)},
-                {"Field": "Dataset", "Value": str(manifest.get("dataset"))},
-                {"Field": "Model", "Value": str(manifest.get("model_display") or model_key)},
-                {"Field": "Seed", "Value": str(manifest.get("seed"))},
-                {"Field": "Device", "Value": str(manifest.get("device"))},
-            ],
-            hide_index=True,
-            use_container_width=True,
+        st.caption(
+            f"Continues from epoch {completed + 1} in a new run. This run is "
+            "not modified."
         )
         st.button(
-            "Confirm resume",
+            "Resume",
             key=f"resume_confirm_{manifest.get('run_id')}",
             use_container_width=True,
             disabled=True,
             help=(
                 "Launching a resumed run from this page is not wired up yet. "
-                "The checkpoint above is a valid resume point; see "
-                "docs/RESUME_AUDIT.md for what remains."
+                "The checkpoint above is a valid resume point."
             ),
         )
 

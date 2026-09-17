@@ -99,15 +99,15 @@ PROVIDER_LABEL = "Provider"
 #: state as the credentials themselves.
 PROVIDER_KEY = "llm_provider_preset"
 
-#: What this client actually supports, stated precisely. It speaks the
-#: OpenAI chat-completions protocol; that is an endpoint-compatibility claim
-#: and not a promise of any provider's own extensions.
+#: One line, because it is a hint and not a specification. The precise claim
+#: it summarises: this client speaks the OpenAI chat-completions protocol, so
+#: any endpoint offering that protocol works; presets only fill the Base URL,
+#: and provider-specific features beyond chat completions are not
+#: implemented. That detail belongs here, where a maintainer reads it, rather
+#: than in four lines above every settings form.
 SUPPORTED_API_NOTE = (
-    "This client speaks the OpenAI-compatible chat-completions API. Any "
-    "endpoint offering that protocol works — OpenAI, Gemini, Claude, Kimi "
-    "and GLM all publish one, as do most self-hosted gateways. Presets only "
-    "fill the Base URL; provider-specific features beyond chat completions "
-    "are not implemented."
+    "Supports OpenAI-compatible APIs: OpenAI, Gemini, Claude, Kimi, GLM, and "
+    "custom endpoints."
 )
 
 #: Field labels. The names come from the existing contract, not a new one.
@@ -290,9 +290,8 @@ def render_llm_settings_form(
         key=f"{key_prefix}_model",
     )
     st.caption(
-        "Optional. Without it the platform still runs the full deterministic "
-        "workflow. The key is held for this session only and is never written "
-        "to a file, a log or the debug view."
+        "Optional — the deterministic workflow works without an LLM. "
+        "API keys stay in this session only."
     )
 
     columns = st.columns(2)

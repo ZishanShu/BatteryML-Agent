@@ -395,19 +395,36 @@ def example_model(
 #: The shape shown to the user, with the slots left visible. Deliberately
 #: generic: it teaches the sentence pattern without pretending to be a
 #: curated example, and it is the same whatever this installation holds.
-REQUEST_TEMPLATE_STRUCTURE = "Use [method] on [dataset] to [task]."
+REQUEST_TEMPLATE_STRUCTURE = "Use [Model] on [dataset] to predict [task]."
 
-#: Task phrase used when filling the template. The canonical RUL task label
-#: reads awkwardly inside the sentence, so this is the plain-English form of
-#: the same task, not a second task.
-DEFAULT_TASK_PHRASE = "predict battery lifetime"
+#: How each canonical task reads inside that sentence. The canonical labels
+#: are the backend's ("RUL prediction"), which do not fit after "predict";
+#: these are the same tasks in the sentence's grammar, not extra tasks. A
+#: task with no entry falls back to its canonical label rather than being
+#: rewritten into something this platform does not run.
+TASK_PHRASES: Dict[str, str] = {
+    TASK_RUL: "battery lifetime",
+    TASK_SOH: "state of health",
+    TASK_TRAJECTORY: "the degradation trajectory",
+}
+
+
+def task_phrase_for(task: Optional[str]) -> str:
+    """How ``task`` reads inside the request sentence.
+
+    Falls back to the canonical label, so a task this table does not know is
+    named as the backend names it rather than silently becoming another one.
+    """
+    if not task:
+        return TASK_PHRASES[TASK_RUL]
+    return TASK_PHRASES.get(str(task), str(task))
 
 
 def build_request_template(
     catalog: Dict[str, Any],
     *,
     runnable_keys: Optional[Sequence[str]] = None,
-    task_phrase: str = DEFAULT_TASK_PHRASE,
+    task: Optional[str] = None,
 ) -> str:
     """Fill :data:`REQUEST_TEMPLATE_STRUCTURE` from this installation.
 
@@ -427,8 +444,8 @@ def build_request_template(
     model = example_model(catalog, dataset, runnable_keys=runnable_keys) if dataset else None
     return (
         REQUEST_TEMPLATE_STRUCTURE
-        .replace("[method]", model or "[method]")
+        .replace("[Model]", model or "[Model]")
         .replace("[dataset]", dataset or "[dataset]")
-        .replace("[task]", task_phrase)
+        .replace("[task]", task_phrase_for(task))
     )
 

@@ -289,7 +289,9 @@ def gpu_option_label(device: str, inventory: Optional[Dict[str, Any]]) -> str:
     entry = find_device(name, inventory)
     if entry is None:
         return f"{name} (not enumerated)"
-    parts = [f"GPU {entry.get('index')}", str(entry.get("name") or name)]
+    # Led by the device string the run actually receives, so the option the
+    # user picks and the ``--device`` value in the plan read the same.
+    parts = [name, str(entry.get("name") or name)]
     free = entry.get("memory_free_mib")
     if isinstance(free, int):
         parts.append(f"{free / 1024:.1f} GB free")

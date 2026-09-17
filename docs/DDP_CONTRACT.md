@@ -4,10 +4,17 @@ Milestone B asked for true multi-GPU execution. This records exactly what
 exists, what it guarantees, and what must happen on the server before any
 model may be marked DDP-capable.
 
-**Status: the launch contract and the distributed runtime rules are
-implemented and tested. No model is marked `supports_multi_gpu = true`, and
-true multi-GPU training is therefore still NOT available to a user.** The
-gate is deliberate, not an oversight; §6 says what lifts it.
+**Status: distributed multi-GPU training is experimental and is not exposed
+in the current Web interface.** The launch contract and the distributed
+runtime rules are implemented and tested; no model is marked
+`supports_multi_gpu = true`; and the normal product UI now offers CPU and a
+single GPU only, so a user cannot reach a distributed run at all.
+
+That last point is a deliberate simplification. While the UI offered a
+multi-GPU multiselect, anyone who used it met an error box explaining ranks
+and sharding — an unfinished capability advertised to people who could not
+use it. The selector is gone; everything below is retained for the work that
+would finish it. §6 says what lifts the gate.
 
 ---
 
