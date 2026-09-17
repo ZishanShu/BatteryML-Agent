@@ -148,6 +148,67 @@ and their siblings qualify — the `RUL` in `XGBoostRULPredictor` is naming only
 The UI shows the generic display name (`XGBoost`, `Ridge Regression`), never
 "XGBoost RUL", for an SOH run.
 
+### The compatible baselines
+
+Five estimators have a config under `configs/soh/`. They are **compatible SOH
+baselines**, not a ranking: no controlled comparison has been run, and nothing
+here says which of them estimates SOH better.
+
+| Model | Class | Config | Why it qualifies |
+| --- | --- | --- | --- |
+| Ridge Regression | `RidgeRULPredictor` | `configs/soh/ridge/matr.yaml` | L2-penalized linear. The first route, run on the server. |
+| Lasso Regression | `LassoRULPredictor` | `configs/soh/lasso/matr.yaml` | Pure L1; selects a subset of the 37 dimensions. Extension model. |
+| Elastic Net Regression | `ElasticNetRULPredictor` | `configs/soh/elastic_net/matr.yaml` | L1+L2; stabilises the choice among correlated neighbouring voltage points. |
+| Random Forest | `RandomForestRULPredictor` | `configs/soh/rf/matr.yaml` | First non-linear estimator: says whether the linear error is the feature's limit or the model's. |
+| XGBoost | `XGBoostRULPredictor` | `configs/soh/xgb/matr.yaml` | Boosted trees, built against the running residual. |
+
+Every one of them reaches the data through `SklearnModel`, which is the whole
+reason a cycle-level SOH bundle can be handed to them unchanged.
+
+**Each config is byte-identical to the Ridge config outside its `model:`
+block** — same split, same reference convention, same sample policy, same
+feature extractor, same transformations. That is what makes two SOH numbers
+comparable at all, and `tests/test_soh_baseline_pack.py` compares the configs
+field by field rather than re-asserting the expected values one at a time.
+
+None of the four added configs declares a hyperparameter: library defaults
+only, matching every corresponding config in `configs/baselines/`. A value
+chosen by looking at a score would make the pack a badly-run comparison
+instead of a compatibility statement.
+
+`random_state` is deliberately not pinned in any of them. The seed reaches
+sklearn through `batteryml.pipeline.set_seed`, called immediately before
+`fit`; pinning `random_state` in the config would fix the estimator's
+randomness regardless of `--seed` and make the recorded seed untrue.
+
+### Reproducibility, measured
+
+`[VERIFIED]` in a development container, on a synthetic bundle of the same
+37-wide cycle-level shape — **not** on MATR:
+
+| Model | Two runs at seed 0 | Seed 0 vs seed 1 | Fit time at route scale |
+| --- | --- | --- | --- |
+| Ridge | identical | identical (no stochastic component) | < 1 s |
+| Lasso | identical | identical (`selection='cyclic'`, unshuffled KFold) | < 1 s |
+| Elastic Net | identical | identical (same reason) | < 1 s |
+| Random Forest | identical | **different** | ~18 s |
+| XGBoost | identical | identical | < 1 s |
+
+Random Forest is the only entry whose result the seed actually moves, which is
+exactly why its `random_state` must stay unpinned. XGBoost at its defaults has
+no stochastic component at all — `subsample` and `colsample_bytree` are 1.0 and
+the histogram method is deterministic — so its result is seed-invariant. That
+is a property to record, per `CLAUDE.md` §8, not one to paper over.
+
+### Audited and rejected
+
+| Model | Why not |
+| --- | --- |
+| MLP (`MLPRULPredictor`) | An `NNModel`, not a `SklearnModel`. Its constructor requires `input_height` and `input_width`, and `forward` unpacks `B, _, H, W = feature.size()`. A flat 37-wide SOH row has no such geometry, and `fit` raises `ValueError: not enough values to unpack (expected 4, got 2)`. Reshaping the SOH feature to suit the model would be changing the science to fit the model. |
+
+Deep sequence models (CNN, LSTM, Transformer, BatLiNet, CPTransformer) are out
+of scope here for the same class of reason and were not audited.
+
 ## Which datasets are eligible
 
 **Do not assume any.** Eligibility is an empirical question about the processed
@@ -255,6 +316,61 @@ ratio of order 1, where it merely restates MAE. The Agent's execution plan
 passes the same list for an SOH task.
 
 Ridge on roughly 28k x 37 is cheap; this is a smoke, not a benchmark run.
+
+### The other four baselines
+
+Same command, one word changed in two places. Run them one at a time and read
+each artifact before starting the next: four runs that all failed the same way
+are four times the output and none of the information.
+
+```bash
+conda run -n batteryml python batteryml_web/core/run_batteryml_cli.py run \
+    configs/soh/lasso/matr.yaml \
+    --workspace runs/soh_smoke_matr_lasso \
+    --train --eval \
+    --device cpu --seed 0 \
+    --metric MAE,RMSE
+
+conda run -n batteryml python batteryml_web/core/run_batteryml_cli.py run \
+    configs/soh/elastic_net/matr.yaml \
+    --workspace runs/soh_smoke_matr_elastic_net \
+    --train --eval \
+    --device cpu --seed 0 \
+    --metric MAE,RMSE
+
+conda run -n batteryml python batteryml_web/core/run_batteryml_cli.py run \
+    configs/soh/rf/matr.yaml \
+    --workspace runs/soh_smoke_matr_rf \
+    --train --eval \
+    --device cpu --seed 0 \
+    --metric MAE,RMSE
+
+conda run -n batteryml python batteryml_web/core/run_batteryml_cli.py run \
+    configs/soh/xgb/matr.yaml \
+    --workspace runs/soh_smoke_matr_xgb \
+    --train --eval \
+    --device cpu --seed 0 \
+    --metric MAE,RMSE
+```
+
+`--device cpu` for all four. None of these estimators uses a GPU: the three
+sklearn ones cannot, and XGBoost is not built here for it.
+
+What to expect, and what would mean something is wrong:
+
+* The reading stages should report the **same** `41` train and `42` test cells
+  as the Ridge run, and the artifact the **same 6116 test predictions across
+  42 cells**. A different count means a config diverged from the protocol —
+  stop and diff it against `configs/soh/ridge/matr.yaml`, rather than
+  reporting the metric.
+* `Random Forest` is the slow one, of order tens of seconds to fit against
+  well under a second for the rest. It is the only one for which a progress
+  stage sits still for a noticeable time.
+* `Lasso` needs the CLI wrapper, as every invocation does anyway: it is an
+  extension model, and `bin/batteryml.py` on its own would raise
+  `KeyError: LassoRULPredictor is not registered to Models!`.
+* Metrics are MAE and RMSE on the ratio scale. Do not compare them to the
+  Ridge numbers as a ranking — one run each, one seed, no repeats.
 
 ## After the run: inspect the artifact
 

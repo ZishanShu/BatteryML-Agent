@@ -251,13 +251,73 @@ class TestTheAgentOffersOnlySOHModelsForSOH(unittest.TestCase):
             if entry.get("status") != "UNREGISTERED"
         )
 
-    def test_soh_offers_ridge_and_nothing_else(self) -> None:
-        self.assertEqual(self._configured_models(TASK_SOH), ["ridge"])
+    def test_soh_offers_exactly_the_audited_baselines(self) -> None:
+        """The five estimators that passed the compatibility audit, and no more.
+
+        Each one is a scalar regressor reached through ``SklearnModel``, whose
+        ``fit`` is ``model.fit(feature.view(n, -1), label)`` — no lifetime,
+        end-of-life or cycle semantics anywhere — and each has a config under
+        ``configs/soh/`` declaring the identical protocol. Compatible
+        baselines, not a ranking: no claim is made here about which estimates
+        SOH better. See docs/SOH_PROTOCOL.md.
+        """
+        self.assertEqual(
+            self._configured_models(TASK_SOH),
+            ["elastic_net", "lasso", "rf", "ridge", "xgb"],
+        )
+
+    def test_the_soh_menu_is_exactly_what_configs_soh_declares(self) -> None:
+        """Backend-authoritative: the menu is the configs, not a UI list.
+
+        Adding a directory under ``configs/soh/`` is the only way a model can
+        reach the SOH menu, and it is sufficient — nothing enumerates model
+        names in the frontend.
+        """
+        from batteryml_web.core.config_registry import get_config_registry
+
+        registry = get_config_registry(str(REPO_ROOT))
+        from_configs = sorted(
+            {
+                entry.model_key
+                for entry in registry.get_entries(dataset="MATR", task=TASK_SOH)
+            }
+        )
+        self.assertEqual(self._configured_models(TASK_SOH), from_configs)
 
     def test_no_rul_only_model_appears_under_soh(self) -> None:
+        """The models that carry RUL-specific assumptions stay out.
+
+        ``xgb`` and ``rf`` are deliberately absent from this list now: they are
+        task-agnostic regressors that passed the audit and have their own SOH
+        configs, so they appear under both tasks — which is correct. The models
+        below are the ones that must not: sequence and inter-cell architectures
+        built around early-cycle lifetime prediction, and the dummy baseline.
+        """
         soh = set(self._configured_models(TASK_SOH))
-        for rul_only in ("xgb", "cnn", "lstm", "transformer", "batlinet", "dummy"):
-            self.assertNotIn(rul_only, soh)
+        for rul_only in (
+            "cnn", "lstm", "transformer", "batlinet", "cptransformer",
+            "dummy", "svm", "gpr", "plsr", "pcr", "knn", "huber",
+            "kernel_ridge", "extra_trees", "linear_regression",
+            "discharge_model", "full_model", "variance_model",
+        ):
+            with self.subTest(model=rul_only):
+                self.assertNotIn(rul_only, soh)
+
+    def test_mlp_is_not_offered_for_soh(self) -> None:
+        """Audited and rejected, for a reason that is about the features.
+
+        ``MLPRULPredictor`` is an ``NNModel`` whose ``forward`` unpacks
+        ``B, _, H, W = feature.size()``, so it requires a 3- or 4-dimensional
+        feature. An SOH row is the flat 37-wide voltage-curve vector, and
+        ``fit`` raises ``ValueError: not enough values to unpack (expected 4,
+        got 2)`` on it. Reshaping the SOH feature to satisfy the model would be
+        changing the science to fit the UI, so MLP has no SOH config.
+        """
+        self.assertNotIn("mlp", set(self._configured_models(TASK_SOH)))
+        self.assertFalse(
+            (REPO_ROOT / "configs" / "soh" / "mlp").exists(),
+            "an SOH config for MLP exists; the audit rejected it",
+        )
 
     def test_the_rul_menu_is_unchanged(self) -> None:
         rul = self._configured_models(TASK_RUL)
