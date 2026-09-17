@@ -300,6 +300,20 @@ run; none may be marked VERIFIED from unit tests.
 | BB | Force a CUDA OOM: a clear message, a suggested action, no retry and no device switch |
 | BC | Restart Streamlit: completed history is still visible, and any run that was active is INTERRUPTED, not COMPLETED |
 
+Compute infrastructure. Resume is implemented and unit-proved; DDP
+orchestration is implemented and launch-proved on CPU/gloo, but **no model is
+marked DDP-capable**, so BF–BI are the audit that would lift that gate rather
+than a check of a shipped feature.
+
+| # | Check |
+| --- | --- |
+| BD | Train a small NN model (CNN/LSTM/MLP/Transformer) far enough to write a resumable checkpoint, then confirm `python -c "from batteryml_web.core.training_checkpoint import classify_checkpoint; print(classify_checkpoint('<path>'))"` reports `resumable` with the right epoch |
+| BE | Point the same call at an **older** `.ckpt` from a previous run: it must report `weights_only`, and the UI must not offer Resume for it |
+| BF | Confirm the two-rank launch on real GPUs: `CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nnodes=1 --nproc_per_node=2 -m batteryml_web.core.distributed_runner --config <cfg> --workspace <dir> --seed 0 --describe-only` — expect two JSON lines, `world_size: 2`, ranks 0 and 1, `backend: nccl`, devices `cuda:0` and `cuda:1`, exactly one `is_primary: true` |
+| BG | Repeat BF with `CUDA_VISIBLE_DEVICES=5,6`; the ranks must still report `cuda:0` / `cuda:1` (the renumbering is the point) and `nvidia-smi` must show the load on GPUs 5 and 6 |
+| BH | While BF runs, confirm with `nvidia-smi` that two worker processes occupy the two selected GPUs and nothing else on the box was touched |
+| BI | Read `third_party/BatteryLife/models/CPTransformer.py` and confirm nothing in its forward/loss assumes a global batch, a fixed rank count, or cross-sample state — the audit `docs/DDP_CONTRACT.md` §6 needs before CPTransformer may be enabled |
+
 **True multi-GPU execution is still not implemented.** T checks that the
 platform says so rather than attempting one.
 

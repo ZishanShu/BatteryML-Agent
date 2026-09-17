@@ -216,15 +216,25 @@ class TestDeviceValidation(unittest.TestCase):
                 "MATR", "RUL prediction", "batlinet", device="cuda:0,1", epochs=1
             )
 
-    def test_no_multi_gpu_machinery_is_exposed_by_the_web_layer(self) -> None:
-        """The audit concludes there is none; no code may use one.
+    def test_no_multi_gpu_machinery_leaks_outside_the_distributed_modules(self) -> None:
+        """Distributed machinery exists now, but only where it belongs.
 
-        Checked on the parsed syntax tree — names called and names imported —
-        so the prose in run_policy.py that explains why there is no torchrun
-        path does not count as one.
+        The launch contract and runner are real (docs/DDP_CONTRACT.md), so
+        their names are no longer forbidden outright. What must stay true is
+        that nothing else — the page, the planner, the single-process
+        executor — starts a distributed job, and that nn.DataParallel appears
+        nowhere at all: splitting a batch inside one process is not
+        multi-GPU training and must never be presented as it.
+
+        Checked on the parsed syntax tree, so the prose explaining why a
+        model is still gated does not count as machinery.
         """
         import ast
 
+        distributed_modules = {
+            "batteryml_web/core/distributed_plan.py",
+            "batteryml_web/core/distributed_runner.py",
+        }
         forbidden = {
             "DataParallel",
             "DistributedDataParallel",
@@ -234,6 +244,9 @@ class TestDeviceValidation(unittest.TestCase):
         }
         offenders: list[str] = []
         for path in sorted((REPO_ROOT / "batteryml_web").rglob("*.py")):
+            relative = path.relative_to(REPO_ROOT).as_posix()
+            if relative in distributed_modules:
+                continue
             tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
             for node in ast.walk(tree):
                 if isinstance(node, ast.Call):

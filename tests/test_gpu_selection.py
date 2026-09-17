@@ -212,7 +212,17 @@ class TestMultiGpuCapabilityGate(unittest.TestCase):
                 self.assertFalse(capability["supports_multi_gpu"])
                 self.assertIsNone(capability["multi_gpu_strategy"])
                 self.assertIn(MULTI_GPU_UNSUPPORTED_MESSAGE, capability["reason"])
-                self.assertIn("GPU_MULTI_GPU_AUDIT", capability["reason"])
+                # The reason must point at a document that explains it. The
+                # DDP work moved that explanation from the original audit to
+                # docs/DDP_CONTRACT.md; what matters is that one is cited, not
+                # which filename is current.
+                self.assertTrue(
+                    any(
+                        doc in capability["reason"]
+                        for doc in ("DDP_CONTRACT", "GPU_MULTI_GPU_AUDIT")
+                    ),
+                    capability["reason"],
+                )
 
     def test_cpu_and_single_gpu_are_not_blocked(self) -> None:
         for ids in ([], [0], [7]):

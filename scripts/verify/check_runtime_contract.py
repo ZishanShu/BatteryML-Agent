@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import ast
 import inspect
+import re
 from pathlib import Path
 from typing import Any
 
@@ -128,15 +129,28 @@ def _device_inventory_problems(module: Any) -> list[str]:
     return problems
 
 
-#: Names that would mean a multi-GPU execution path exists. The audit in
-#: docs/GPU_MULTI_GPU_AUDIT.md concludes there is none and that none may be
-#: advertised; this list keeps a fake one from appearing by accident.
-_MULTI_GPU_TOKENS = (
-    "DataParallel",
-    "DistributedDataParallel",
+#: The shortcut that must never appear. ``nn.DataParallel`` splits a batch
+#: across GPUs inside one process; adopting it and calling the result
+#: multi-GPU support is exactly the shortcut docs/DDP_CONTRACT.md refuses.
+#: Matched as a whole word, because ``DistributedDataParallel`` — the correct
+#: mechanism — contains it as a substring and is the opposite thing.
+_FORBIDDEN_PARALLEL_PATTERN = re.compile(r"(?<!Distributed)\bDataParallel\s*\(")
+
+#: Distributed machinery that legitimately exists now. Its presence is no
+#: longer a defect: the launch contract, rank mapping and sharding are
+#: implemented and tested (docs/DDP_CONTRACT.md §7). What must stay true is
+#: that it lives in the distributed modules rather than leaking into the
+#: page, and that no model is *advertised* as capable until it is verified.
+_DISTRIBUTED_MODULES = (
+    "batteryml_web/core/distributed_plan.py",
+    "batteryml_web/core/distributed_runner.py",
+)
+
+_DISTRIBUTED_TOKENS = (
     "init_process_group",
     "torchrun",
     "nproc_per_node",
+    "DistributedDataParallel",
 )
 
 
@@ -188,13 +202,22 @@ def _device_validation_problems(device_module: Any, execution: Any) -> list[str]
     web_root = repo_root() / "batteryml_web"
     for path in sorted(web_root.rglob("*.py")):
         text = path.read_text(encoding="utf-8", errors="ignore")
-        for token in _MULTI_GPU_TOKENS:
-            # The audit document may name them; the code may not use them.
+        relative = path.relative_to(repo_root()).as_posix()
+        if _FORBIDDEN_PARALLEL_PATTERN.search(text):
+            problems.append(
+                f"{relative} uses nn.DataParallel. Splitting a batch inside one "
+                "process is not multi-GPU training and must not be presented "
+                "as it; see docs/DDP_CONTRACT.md."
+            )
+        if relative in _DISTRIBUTED_MODULES:
+            # The distributed modules are where this machinery belongs.
+            continue
+        for token in _DISTRIBUTED_TOKENS:
             if f"{token}(" in text:
                 problems.append(
-                    f"{path.relative_to(repo_root()).as_posix()} uses {token}; the web "
-                    "layer must not expose a multi-GPU run (see "
-                    "docs/GPU_MULTI_GPU_AUDIT.md)."
+                    f"{relative} uses {token}; distributed machinery belongs in "
+                    f"{' or '.join(_DISTRIBUTED_MODULES)}, not in the page or "
+                    "the single-process execution path."
                 )
     return problems
 
@@ -203,11 +226,16 @@ def _multi_gpu_gate_problems(policy: Any, device_module: Any) -> list[str]:
     """No model claims multi-GPU, and a multi-GPU choice blocks Run."""
     problems: list[str] = []
     if policy.MULTI_GPU_CAPABLE_MODELS:
+        # The launch contract now exists, so a capable model is no longer
+        # impossible — but registering one is still a claim that it was run
+        # and checked on real GPUs. That evidence is recorded in
+        # docs/DDP_CONTRACT.md §8, not in this check, which is why enabling a
+        # model here must be a deliberate, reviewed act.
         problems.append(
             "a model is registered as multi-GPU capable "
-            f"({sorted(policy.MULTI_GPU_CAPABLE_MODELS)}), but no DDP or DataParallel "
-            "path exists. Registering one is a claim that it works; see "
-            "docs/GPU_MULTI_GPU_AUDIT.md."
+            f"({sorted(policy.MULTI_GPU_CAPABLE_MODELS)}). That is a claim it "
+            "has been verified under DDP on real GPUs; record the evidence in "
+            "docs/DDP_CONTRACT.md §8 and update this check deliberately."
         )
     for ids in ([], [0], [5]):
         blockers = policy.execution_blockers(

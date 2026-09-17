@@ -440,6 +440,29 @@ MULTI_GPU_CAPABLE_MODELS: frozenset[str] = frozenset()
 #: :data:`MULTI_GPU_CAPABLE_MODELS`; empty for the same reason.
 MULTI_GPU_STRATEGIES: Dict[str, str] = {}
 
+#: Why each known model is not DDP-capable. Per model, because the reasons
+#: genuinely differ — and a shared "not supported yet" would hide that
+#: BatLiNet's blocker is scientific while CPTransformer's is an audit gap.
+MULTI_GPU_BLOCKERS: Dict[str, str] = {
+    "batlinet": (
+        "BatLiNet draws an inter-cell support set for every batch from the "
+        "full training tensor (batteryml_web/models/batlinet.py:884). Under "
+        "DDP each rank holds one shard, so either the support set is drawn "
+        "only from that shard — changing which inter-cell comparisons the "
+        "model ever sees, and so the objective — or every rank keeps the whole "
+        "tensor, which removes the memory benefit and still changes the "
+        "sampling distribution. Distributing it requires a redesign of the "
+        "support semantics, not a sampler. See docs/DDP_CONTRACT.md §6."
+    ),
+    "cptransformer": (
+        "CPTransformer's network source lives in third_party/BatteryLife, "
+        "which is not present in the environment this build was audited in, "
+        "so its forward and loss could not be read and its DDP-safety could "
+        "not be established. It is gated rather than assumed; see "
+        "docs/DDP_CONTRACT.md for the audit that would enable it."
+    ),
+}
+
 #: Shown when a multi-GPU selection is made for a model that cannot use one.
 #: Exact wording, because it is what the user reads instead of a Run button.
 MULTI_GPU_UNSUPPORTED_MESSAGE = (
@@ -469,10 +492,14 @@ def multi_gpu_capability(model_key: str) -> Dict[str, Any]:
             if supported
             else (
                 MULTI_GPU_UNSUPPORTED_MESSAGE
-                + " BatteryML sends a single torch device through the whole run "
-                "and the dataset is placed on it in one piece, so no model is "
-                "registered as multi-GPU capable yet. See "
-                "docs/GPU_MULTI_GPU_AUDIT.md."
+                + " "
+                + MULTI_GPU_BLOCKERS.get(
+                    key.lower(),
+                    "The distributed launch contract, rank mapping, sharding "
+                    "and rank-0 rules are implemented and tested, but no "
+                    "model has been verified DDP-safe against its own source "
+                    "on real GPUs yet. See docs/DDP_CONTRACT.md.",
+                )
             )
         ),
     }
