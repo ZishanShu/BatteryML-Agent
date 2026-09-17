@@ -119,6 +119,7 @@ from .settings_panel import (
     render_llm_configuration_prompt,
     request_llm_configuration,
 )
+from .errors import render_copy_control
 from .feedback import (
     EVENT_EXPLANATION_READY,
     EVENT_PLAN_READY,
@@ -145,6 +146,9 @@ CANCEL_BUTTON_LABEL = "Stop run"
 #: about to create, and consumed when Run is pressed. Nothing is written to
 #: disk until then: a reservation that is never used names no execution.
 PENDING_RUN_ID_KEY = "agent_pending_run_id"
+#: The plan the reserved id belongs to. Paired with PENDING_RUN_ID_KEY and
+#: only ever written or cleared together with it; see clear_pending_run.
+PENDING_RUN_SUBJECT_KEY = "agent_pending_run_subject"
 
 #: Session key holding the id of the run this page is currently watching.
 ACTIVE_RUN_KEY = "agent_active_run_id"
@@ -739,11 +743,43 @@ def _render_execution_status(
             st.code(" ".join(str(part) for part in command), language="bash")
         if result.get("error"):
             st.caption("Executor error")
-            st.text(str(result["error"]))
+            st.text(redact(str(result["error"])))
         st.caption("stdout")
-        st.text(result.get("stdout") or "No stdout captured.")
+        st.text(redact(result.get("stdout") or "No stdout captured."))
         st.caption("stderr (full traceback, as produced by the run)")
-        st.text(result.get("stderr") or "No stderr captured.")
+        st.text(redact(result.get("stderr") or "No stderr captured."))
+        # One copy affordance for the whole block, with the same transient
+        # confirmation every other copy in the app uses. Redacted before it
+        # reaches the clipboard, not only before it reaches the screen.
+        st.caption(
+            "Redacted: API keys and other credentials are removed before this "
+            "is shown or copied."
+        )
+        render_copy_control(
+            _run_failure_details(result),
+            key="agent_run_failure_copy",
+        )
+
+
+def _run_failure_details(result: dict[str, Any]) -> str:
+    """The failed run's technical block as one redacted, copyable text."""
+    command = result.get("command")
+    sections = [
+        f"returncode: {result.get('returncode', 'N/A')}",
+        "",
+        "command:",
+        " ".join(str(part) for part in command) if command else "(not recorded)",
+        "",
+        "error:",
+        str(result.get("error") or "(none)"),
+        "",
+        "stdout:",
+        str(result.get("stdout") or "(empty)"),
+        "",
+        "stderr:",
+        str(result.get("stderr") or "(empty)"),
+    ]
+    return redact("\n".join(sections))
 
 
 def _explain_result(result_context: dict[str, Any]) -> None:
@@ -864,10 +900,11 @@ def _analyze_request(trimmed: str) -> None:
         # C5: a new request must not leave the previous run's identity or
         # provenance on screen beside a fresh selection.
         "agent_run_context",
-        PENDING_RUN_ID_KEY,
-        "agent_pending_run_subject",
     ):
         st.session_state.pop(key, None)
+    # The reservation belongs to the previous request. Released through the
+    # one helper, so the id and its subject go together.
+    clear_pending_run(st.session_state)
     if st.session_state.get("agent_model_choice") is not None:
         st.session_state.pop("agent_model_choice", None)
 
@@ -961,7 +998,40 @@ def accept_template(template: str, current_request: str) -> bool:
     return bool(str(template or "").strip()) and not str(current_request or "").strip()
 
 
-def _reserved_run_id(
+def pending_run_subject(
+    *,
+    dataset: str,
+    model: str,
+    seed: Any,
+    device: str,
+    smoke: bool,
+) -> str:
+    """What makes this plan *this* plan, as a comparable string.
+
+    Pure, so the invalidation rule is testable without Streamlit. Two plans
+    with the same subject are the same experiment and may share a reserved
+    id; any difference means a different run.
+    """
+    return json.dumps(
+        [dataset, model, str(seed), device, bool(smoke)], sort_keys=True
+    )
+
+
+def clear_pending_run(session_state) -> None:
+    """Release the reservation — **both** keys, always together.
+
+    The id and the subject are one value in two slots: the subject is the
+    cache key for the id. Clearing one without the other leaves the pair
+    inconsistent, and that is exactly what crashed the page — see
+    :func:`reserved_run_id`. Every release goes through here so the pair
+    cannot drift apart again.
+    """
+    for key in (PENDING_RUN_ID_KEY, PENDING_RUN_SUBJECT_KEY):
+        session_state.pop(key, None)
+
+
+def reserved_run_id(
+    session_state,
     *,
     dataset: str,
     model: str,
@@ -975,16 +1045,50 @@ def _reserved_run_id(
     renumber the run on every rerun, and re-minted when any part of the plan
     that identifies the experiment changes. Reserving is not creating: no
     directory and no manifest exist until Run is pressed.
+
+    **Re-mints when the id is missing, even if the subject still matches.**
+    That is the repaired case: pressing Run used to pop the id alone, so the
+    next rerun of the same plan matched the stale subject, skipped minting,
+    and then read a key that was no longer there —
+
+        KeyError: st.session_state has no key "agent_pending_run_id"
+
+    — taking the whole page down with Streamlit's native traceback. The
+    condition below is an ``or`` rather than a lone subject comparison so
+    that a half-cleared pair heals itself instead of raising.
+
+    Reads through ``.get`` and returns the local value, never a second
+    lookup, and never stringifies ``None``: a missing id is falsy and mints a
+    real one rather than becoming the literal ``"None"``.
     """
-    subject = json.dumps(
-        [dataset, model, str(seed), device, bool(smoke)], sort_keys=True
+    subject = pending_run_subject(
+        dataset=dataset, model=model, seed=seed, device=device, smoke=smoke
     )
-    if st.session_state.get("agent_pending_run_subject") != subject:
-        st.session_state["agent_pending_run_subject"] = subject
-        st.session_state[PENDING_RUN_ID_KEY] = new_run_id(
-            dataset=dataset, model=model, seed=seed
-        )
-    return str(st.session_state[PENDING_RUN_ID_KEY])
+    reserved = str(session_state.get(PENDING_RUN_ID_KEY) or "").strip()
+    if not reserved or session_state.get(PENDING_RUN_SUBJECT_KEY) != subject:
+        reserved = str(new_run_id(dataset=dataset, model=model, seed=seed))
+        session_state[PENDING_RUN_SUBJECT_KEY] = subject
+        session_state[PENDING_RUN_ID_KEY] = reserved
+    return reserved
+
+
+def _reserved_run_id(
+    *,
+    dataset: str,
+    model: str,
+    seed: Any,
+    device: str,
+    smoke: bool,
+) -> str:
+    """:func:`reserved_run_id` against the live Streamlit session."""
+    return reserved_run_id(
+        st.session_state,
+        dataset=dataset,
+        model=model,
+        seed=seed,
+        device=device,
+        smoke=smoke,
+    )
 
 
 def _launch_run(
@@ -1536,7 +1640,9 @@ def render_agent_workflow() -> None:
                 run_context=st.session_state.get("agent_run_context") or {},
             )
             # The reservation is spent: a repeat of this plan is a new run.
-            st.session_state.pop(PENDING_RUN_ID_KEY, None)
+            # Both keys, or the next rerun of this same plan would match the
+            # stale subject, skip minting and read an id that is gone.
+            clear_pending_run(st.session_state)
             st.session_state["agent_run_signature"] = current_signature
             st.rerun()
 

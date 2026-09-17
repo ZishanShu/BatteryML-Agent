@@ -37,14 +37,23 @@ import streamlit as st
 #: unstyled sidebar, that is 42% shorter with the text still clear.
 SIDEBAR_COMPACT_CSS = """
 <style>
-/* The band above the sidebar title — the largest single saving. It holds
-   the collapse control, so its padding shrinks and nothing is hidden. */
+/* The band above the sidebar title — the "forehead", and the largest single
+   saving. It holds the sidebar-collapse control, so only its padding
+   shrinks: the control keeps its own size and stays clickable. Measured in a
+   browser afterwards to confirm the button is neither clipped nor overlapped
+   by the title beneath it. */
 [data-testid="stSidebarHeader"] {
-    padding-top: 0.5rem;
+    /* Streamlit fixes this band at 60px while the collapse control inside it
+       is 28px, so the height is what to reduce — padding alone cannot. 2.25rem
+       (36px) still centres the 28px control with room around it, and matches
+       the main header's height set in app.py. */
+    height: 2.25rem;
+    min-height: 2.25rem;
+    padding-top: 0.25rem;
     padding-bottom: 0;
 }
 [data-testid="stSidebarUserContent"] {
-    padding-top: 0.5rem;
+    padding-top: 0.25rem;
     padding-bottom: 1rem;
 }
 
@@ -54,11 +63,12 @@ SIDEBAR_COMPACT_CSS = """
     gap: 0.4rem;
 }
 
-/* Dividers: keep the rule, drop the air around it. */
+/* Dividers: keep the rule, drop the air around it. Five dividers separate
+   the sidebar's sections, so this is worth several lines of height. */
 [data-testid="stSidebar"] hr,
 [data-testid="stSidebar"] [data-testid="stDivider"] {
-    margin-top: 0.45rem;
-    margin-bottom: 0.45rem;
+    margin-top: 0.3rem;
+    margin-bottom: 0.3rem;
 }
 
 /* "BatteryML", "Current project", "Protocol Workflow". Reduced, not zeroed. */

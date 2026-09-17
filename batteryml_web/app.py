@@ -53,6 +53,7 @@ from batteryml_web.ui.run_history import (
 from batteryml_web.ui.settings_panel import render_llm_settings_form
 from batteryml_web.ui.progress_utils import get_safe_runtime_env, run_command_with_progress
 from batteryml_web.ui.scroll import render_scroll_to_top
+from batteryml_web.ui.errors import error_boundary, render_copy_control
 from batteryml_web.ui.workflow_sidebar import NAV_STEPS, get_current_step_index, render_sidebar_workflow, set_current_step
 from batteryml_web.core.readiness import assess_dataset
 from batteryml_web.core.config_registry import get_config_registry
@@ -1934,16 +1935,33 @@ current_step = st.session_state.get("current_step", "home")
 # were. See ui/scroll.py.
 render_scroll_to_top(current_step)
 
-if current_step == "home":
-    render_home_page()
-elif current_step == "prepare_data":
-    render_prepare_data_page()
-elif current_step == "run_model":
-    render_run_model_page()
-elif current_step == "agent_workflow":
-    render_agent_workflow()
-elif current_step == "review_results":
-    render_review_results_page()
-else:
-    st.session_state["current_step"] = "home"
-    st.rerun()
+# The page body runs inside an error boundary. An application error renders
+# our own "Something went wrong" view with the details one click away and a
+# copy control of our own, instead of Streamlit's built-in traceback panel
+# with its Copy / Ask Google / Ask ChatGPT buttons — which shows a scientist a
+# developer's view and invites them to paste an internal traceback into a
+# search engine. Streamlit's panel is not touched: a genuinely uncaught
+# framework failure still reaches it, and st.rerun()/st.stop() pass straight
+# through. See ui/errors.py.
+with error_boundary(
+    key=f"page_{current_step}",
+    message=(
+        "This page could not be drawn. Your project, runs and data are "
+        "untouched — nothing was executed or written. Try the step again, or "
+        "move to another page from the sidebar."
+    ),
+    context={"page": current_step, "project": _current_project_name()},
+):
+    if current_step == "home":
+        render_home_page()
+    elif current_step == "prepare_data":
+        render_prepare_data_page()
+    elif current_step == "run_model":
+        render_run_model_page()
+    elif current_step == "agent_workflow":
+        render_agent_workflow()
+    elif current_step == "review_results":
+        render_review_results_page()
+    else:
+        st.session_state["current_step"] = "home"
+        st.rerun()

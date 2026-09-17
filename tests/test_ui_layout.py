@@ -236,10 +236,19 @@ class TestPageTopResetIsWiredIn(unittest.TestCase):
         reset = min(
             i for i, line in enumerate(lines) if "render_scroll_to_top(current_step)" in line
         )
+        # The dispatch now sits inside the error boundary, so it is indented.
         dispatch = min(
-            i for i, line in enumerate(lines) if line.startswith("if current_step ==")
+            i for i, line in enumerate(lines)
+            if line.strip().startswith("if current_step ==")
         )
         self.assertLess(reset, dispatch)
+        # ...and the boundary itself starts after the reset, so a page that
+        # raises is caught having already been scrolled to the top.
+        boundary = min(
+            i for i, line in enumerate(lines)
+            if line.strip().startswith("with error_boundary(")
+        )
+        self.assertLess(reset, boundary)
         for page_call in (
             "render_home_page()",
             "render_prepare_data_page()",
@@ -514,6 +523,65 @@ class TestSidebarIsCompact(unittest.TestCase):
             set(),
             "the sidebar stylesheet may only adjust spacing",
         )
+
+    def test_the_forehead_is_reduced_to_fit_its_control(self) -> None:
+        """The top band, measured in a browser at 60px before this change.
+
+        Streamlit fixes it with a `height`, not padding, so padding alone
+        could not shrink it. The collapse control inside is 28px, so the band
+        may not go below that plus its own padding, or the control would be
+        clipped.
+        """
+        match = re.search(
+            r'stSidebarHeader"\]\s*\{([^}]*)\}', self.css, re.DOTALL
+        )
+        self.assertIsNotNone(match, "the sidebar header rule is gone")
+        block = match.group(1)
+        height = re.search(r"\bheight:\s*([0-9.]+)rem", block)
+        self.assertIsNotNone(height, "the header height must be set, not just padding")
+        rem = float(height.group(1))
+        self.assertLessEqual(rem, 2.5, "the forehead is still as tall as Streamlit's default")
+        self.assertGreaterEqual(
+            rem, 2.0,
+            "below ~32px the 28px sidebar-collapse control would be clipped",
+        )
+
+    def test_the_sidebar_captions_are_short_enough_not_to_need_clipping(self) -> None:
+        """Shortened copy, not CSS that hides wrapped text."""
+        from batteryml_web.ui import workflow_sidebar
+
+        for step in workflow_sidebar.NAV_STEPS:
+            with self.subTest(step=step["key"]):
+                description = str(step["description"])
+                self.assertTrue(description)
+                self.assertLessEqual(
+                    len(description), 80,
+                    f"{step['key']}'s caption is long enough to wrap to three "
+                    "lines in a 300px sidebar; shorten it rather than clipping it",
+                )
+
+    def test_nothing_clips_overflowing_text(self) -> None:
+        """A hidden caption is worse than a tall one."""
+        for forbidden in ("overflow: hidden", "overflow:hidden",
+                          "text-overflow", "white-space: nowrap", "-webkit-line-clamp"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(
+                    forbidden, self.css,
+                    "the sidebar stylesheet must not clip text; shorten the "
+                    "copy instead",
+                )
+
+    def test_dividers_are_tighter_than_the_block_gap_allows_alone(self) -> None:
+        """Five dividers separate the sidebar's sections."""
+        match = re.search(
+            r"stDivider\"\]\s*\{([^}]*)\}", self.css, re.DOTALL
+        )
+        self.assertIsNotNone(match)
+        values = re.findall(r"margin-\w+:\s*([0-9.]+)rem", match.group(1))
+        self.assertTrue(values)
+        for value in values:
+            self.assertLessEqual(float(value), 0.35)
+            self.assertGreater(float(value), 0.0, "a divider still needs some air")
 
     def test_no_generated_class_names_are_relied_on(self) -> None:
         """Streamlit's ``css-1x2y3z`` classes change between releases."""
