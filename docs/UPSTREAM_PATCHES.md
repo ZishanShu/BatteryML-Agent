@@ -1,91 +1,58 @@
-# Upstream BatteryML patches
+# Upstream patches to `batteryml/`
 
-Per `CLAUDE.md` §4, `batteryml/` is upstream core and is not modified. Every
-unavoidable change to it is recorded here with rationale and a minimal diff.
-
-Upstream reference: <https://github.com/microsoft/BatteryML> (branch `main`).
+`CLAUDE.md` §4 says new code goes in `batteryml_web/` and that a change to
+upstream core must be recorded here with a rationale and a minimal diff.
+This file is that record.
 
 ---
 
-## UP-01 — `TransformerRULPredictor.forward` printed the feature shape on every forward pass
+## UP-01 — `NNModel.fit` gains resume support and a per-epoch hook
 
 | Field | Value |
 | --- | --- |
-| File | `batteryml/models/rul_predictors/transformer.py` |
-| Line (before patch) | 35 |
-| Upstream status | Present in `microsoft/BatteryML@main`. Confirmed by fetching `https://raw.githubusercontent.com/microsoft/BatteryML/main/batteryml/models/rul_predictors/transformer.py` on 2026-08-31; that file is byte-identical to this repository's pre-patch copy, `print(feature.shape)` included. `[VERIFIED]` — the fetch and comparison were performed and observed. |
-| Approved by | User instruction, this session. |
+| File | `batteryml/models/nn_model.py` |
+| Function | `NNModel.fit` |
+| Added | `resume_state=None`, `on_epoch_end=None` |
+| Milestone | Training resume (A) |
+| Basis | `[VERIFIED]` — `tests/test_training_resume.py` trains a model twice and compares parameters |
 
-### Symptom
+### Why it could not go in `batteryml_web/`
 
-`forward()` is called once per training batch and once per evaluation batch.
-Every call wrote a bare `torch.Size([...])` line to stdout. The transformer
-configs declare `epochs: 1000` with `batch_size: 128`
-(`configs/baselines/nn_models/transformer/matr_1.yaml`), so a single run emits
-on the order of 10^4 unlabelled shape lines into the same stream that the
-metrics parser reads.
+Resume needs two things that exist only inside the training loop:
 
-`bin/batteryml.py::run` prints the evaluation scores dict to the same stdout, so
-this noise is interleaved with the only machine-readable result the CLI emits.
+1. **the optimizer actually in use.** It is a local variable created at
+   `nn_model.py:56` and *rebuilt* at `:66` whenever a non-finite loss
+   triggers `reset_parameters`. It is never stored on `self`, so no external
+   caller can reach the object whose state must be saved.
+2. **the epoch counter.** `range(self.train_epochs)` starts at 0 with no way
+   to begin elsewhere, so a continuation would always restart — the exact
+   fiction this milestone removes.
 
-### Why not simply delete the line
+Subclassing would have meant copying the whole loop, which then drifts from
+upstream and quietly diverges in scientific behaviour. Extending it is the
+smaller and safer change.
 
-The shape is genuinely useful when debugging the 3-D/4-D feature branch
-immediately below it (`feature.ndim == 4` vs `== 3`), which is the code path
-that differs between feature extractors. The line is therefore demoted to
-`logging.DEBUG` rather than removed, so it can be turned back on without
-editing core.
+### The diff, in words
 
-### Minimal diff
+* `fit(...)` takes `resume_state` and `on_epoch_end`, both defaulting to
+  `None`, so **every existing call site behaves exactly as before**.
+* when `resume_state` is given: the optimizer's `state_dict` is loaded, and
+  the loop runs `range(start_epoch, self.train_epochs)` instead of
+  `range(self.train_epochs)`.
+* after each epoch, `on_epoch_end(epoch, {"optimizer", "model",
+  "total_epochs"})` is called when supplied. This is how a caller in
+  `batteryml_web/` can persist a full resumable checkpoint without upstream
+  having to know the checkpoint format.
 
-```diff
---- a/batteryml/models/rul_predictors/transformer.py
-+++ b/batteryml/models/rul_predictors/transformer.py
-@@ -1,11 +1,15 @@
- # Licensed under the MIT License.
- # Copyright (c) Microsoft Corporation.
+### What was deliberately not changed
 
-+import logging
-+
- import torch
- import torch.nn as nn
+* no scheduler and no AMP scaler were introduced — the loop has neither, and
+  adding them would change training;
+* the learning rate, batch size, optimizer choice, shuffling and the
+  `reset_parameters` behaviour on a non-finite loss are untouched;
+* `dump_checkpoint` / `load_checkpoint` keep their weights-only meaning, so
+  existing checkpoints stay readable for inference and warm start.
 
- from batteryml.builders import MODELS
- from batteryml.models.nn_model import NNModel
-
-+logger = logging.getLogger(__name__)
-+
-
- @MODELS.register()
- class TransformerRULPredictor(NNModel):
-@@ -31,7 +35,8 @@ class TransformerRULPredictor(NNModel):
-     def forward(self,
-                 feature: torch.Tensor,
-                 label: torch.Tensor,
-                 return_loss: bool = False):
--        print(feature.shape)
-+        logger.debug('TransformerRULPredictor input shape: %s',
-+                     tuple(feature.shape))
-         if feature.ndim == 4:
-```
-
-### Behaviour after the patch
-
-`batteryml/preprocess/__init__.py` calls `logging.basicConfig(level=logging.INFO)`
-at import time, so the root logger sits at `INFO` and this record is suppressed
-by default. `[STATIC]` — `batteryml/preprocess/__init__.py:14-16`.
-
-To re-enable it for a debugging run, raise the level for this logger only:
-
-```python
-import logging
-logging.getLogger('batteryml.models.rul_predictors.transformer').setLevel(logging.DEBUG)
-```
-
-No numeric behaviour changes: the statement has no effect on `feature`, on the
-loss, or on any prediction. `[STATIC]`
-
-### If this is ever upstreamed
-
-The change is self-contained and carries no repository-specific assumptions; it
-could be submitted to `microsoft/BatteryML` unmodified.
+**No scientific semantics changed.** With `resume_state=None` the loop is
+byte-for-byte the previous behaviour, and the resume path is proved to
+reproduce uninterrupted training on a deterministic model.

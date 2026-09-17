@@ -110,6 +110,7 @@ def build_manifest(
     command: Optional[Iterable[str]] = None,
     git_commit: Any = None,
     created_at: Optional[str] = None,
+    resumed_from: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """A fresh PLANNED manifest.
 
@@ -144,6 +145,33 @@ def build_manifest(
         "metrics": {},
         "git_commit": None if git_commit is None else str(git_commit),
         "failure": None,
+        # Lineage for a resumed run. None for an ordinary one. The original
+        # run is never modified: a resume is a new run that records where it
+        # continued from, so the interrupted run stays exactly as it ended.
+        "resumed_from": dict(resumed_from) if resumed_from else None,
+    }
+
+
+def build_resume_lineage(
+    *,
+    source_run_id: str,
+    checkpoint_path: str,
+    starting_epoch: int,
+    target_total_epochs: int,
+    completed_epochs: int,
+) -> Dict[str, Any]:
+    """The ``resumed_from`` block a resumed run carries.
+
+    Total-target semantics: ``target_total_epochs`` is where training stops,
+    not how many more epochs to run, so a run that completed 40 of 100
+    continues to 100 rather than to 140.
+    """
+    return {
+        "run_id": str(source_run_id),
+        "checkpoint": str(checkpoint_path),
+        "completed_epochs": int(completed_epochs),
+        "starting_epoch": int(starting_epoch),
+        "target_total_epochs": int(target_total_epochs),
     }
 
 
