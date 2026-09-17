@@ -202,8 +202,41 @@ def load_config(config_path: str,
         os.makedirs(workspace)
 
     configs['workspace'] = workspace
+
+    # The optionally declared task. import_config returns only CONFIG_FIELDS,
+    # so it is read separately rather than added to that list: making it a
+    # required field would print a "missing config field" warning for every
+    # existing config, none of which declares one. Absent simply means the
+    # config does not state its task, and nothing is inferred here.
+    declared_task = _declared_task(config_path)
+    if declared_task:
+        configs['task'] = declared_task
+
     print(workspace)
     return configs
+
+
+def _declared_task(config_path: Path) -> str | None:
+    """The ``task:`` a YAML config declares, or None.
+
+    Read straight from the file because it is deliberately outside
+    ``CONFIG_FIELDS``. A non-YAML config, an unreadable one or one without the
+    key all yield None; this is metadata for the result artifact, and a
+    failure to read it must not stop a run that is otherwise fine.
+    """
+    path = Path(config_path)
+    if path.suffix != '.yaml' or not path.is_file():
+        return None
+    import yaml
+
+    try:
+        raw = yaml.safe_load(path.read_text(encoding='utf-8'))
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    task = raw.get('task')
+    return str(task) if task else None
 
 
 def build_dataset(configs: dict,
@@ -288,6 +321,12 @@ def _task_metadata(config: dict) -> dict:
     if not isinstance(label, dict):
         return {}
     metadata = {'label_annotator': label.get('name')}
+    # The config's own declared task, when it declares one. Recorded verbatim
+    # so a result says which scientific question it answers without anyone
+    # having to infer it from the annotator's class name.
+    declared_task = config.get('task') if isinstance(config, dict) else None
+    if declared_task:
+        metadata['task'] = str(declared_task)
     for field in ('reference_capacity_mode', 'reference_n_cycles',
                   'min_cycle', 'max_cycle', 'cycle_stride'):
         if field in label:

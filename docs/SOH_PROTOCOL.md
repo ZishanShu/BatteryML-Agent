@@ -159,51 +159,117 @@ python -m scripts.audit_soh_readiness --min-cycle 10 --cycle-stride 5 \
     --json runs/verify/soh_readiness.json
 ```
 
-It prints one row per dataset:
-
-```
-Dataset | Cells | Eligible cells | SOH samples | Status
-```
-
 A dataset is `SOH_READY` only when enough cells each yield enough cycle-level
 samples through the same annotator and extractor a run would use. Being ready
 for RUL says nothing about being ready for SOH.
 
-## The config
+### What the server audit found
 
-Written **after** the audit names an eligible dataset, one config for one
-dataset and one model:
+Run on the real processed data. These are the user's observed numbers, not
+this repository's claim:
 
-```yaml
-# configs/soh/<model>/<dataset>.yaml
-task: 'SOH estimation'
-model:
-    name: 'RidgeRULPredictor'          # task-agnostic; displayed as "Ridge Regression"
-train_test_split:
-    name: '<DATASET>TrainTestSplitter'  # a cell-level splitter
-    cell_data_path: 'data/processed/<DATASET>'
-feature:
-    name: 'SOHVoltageCurveFeatureExtractor'
-    n_voltage_points: 32
-    n_history_cycles: 1
-label:
-    name: 'CycleSOHLabelAnnotator'
-    reference_capacity_mode: 'first_valid_discharge_capacity'
-    min_cycle: 10
-    max_cycle: null
-    cycle_stride: 1
-feature_transformation:
-    name: 'ZScoreDataTransformation'
-label_transformation:
-    name: 'ZScoreDataTransformation'
+| Dataset | Eligible cells | SOH samples (default) | SOH samples (min_cycle 10, stride 5) | Status |
+| --- | --- | --- | --- | --- |
+| MATR | 180 / 180 | 142,035 | 28,156 | `SOH_READY` |
+| HUST | 77 / 77 | 146,120 | 29,119 | `SOH_READY` |
+
+`reference_capacity_mode: first_valid_discharge_capacity`, no exclusions
+reported for either dataset.
+
+**MATR is the first route**, for cell-level generalisation: 180 independent
+cells against HUST's 77. HUST is the intended second dataset; no HUST config
+exists yet.
+
+## Before training: audit the labels
+
+Eligibility says a dataset *can* produce labels. This says what they are:
+
+```bash
+python -m scripts.audit_soh_labels --dataset MATR --min-cycle 10 --cycle-stride 5
+python -m scripts.audit_soh_labels --dataset MATR --min-cycle 10 --cycle-stride 5 \
+    --per-cell --json runs/verify/soh_labels_matr.json
 ```
 
-Note the label transformation is a plain Z-score, **not** the
-`LogScale + ZScore` sequence the RUL configs use: a log of a ratio near 1.0
-compresses exactly the range SOH lives in, and is undefined at 0.
+It reports the SOH distribution (min, p1, p5, median, p95, p99, max), counts of
+NaN / infinite / non-positive labels, how many exceed 1.0, 1.05 and 1.10, and
+the reference-capacity range. It exits non-zero when the distribution looks
+structurally wrong.
 
-`configs/soh/dummy/*` are marked `LEGACY EXAMPLE` in-file. They use
-`DummyRULPredictor` and one label per cell; they are not this task.
+**SOH is never clipped to [0, 1].** Under a first-cycle reference, a ratio
+above 1.0 early in life is a real measurement — capacity activation in the
+first cycles is a known effect. The audit surfaces a suspicious distribution;
+it never tidies one.
+
+Stop and report rather than training if the audit shows a large NaN or `<= 0`
+count, a median far from ~1.0, a max far above ~1.2, or a p1 near 0.
+
+## The first real config
+
+`configs/soh/ridge/matr.yaml` — MATR, SOH estimation, Ridge regression,
+`min_cycle: 10`, `cycle_stride: 5`,
+`reference_capacity_mode: first_valid_discharge_capacity`.
+
+### The split
+
+`MATRPrimaryTestTrainTestSplitter`: the canonical MATR-1 partition every MATR
+RUL baseline in `configs/baselines/` uses, so an SOH result here concerns the
+same cells those results concern.
+
+| | Cells |
+| --- | --- |
+| train | 41 |
+| test | 42 |
+| **covered** | **83 of the 180 processed MATR cells** (batches 1-2; upstream removes the b2c1 outlier) |
+
+There is **no validation split**: BatteryML's splitter contract is
+`(train, test)`, and inventing a third split would mean a splitter this
+repository would then have to justify. To use 178 of the 180 cells instead,
+change the splitter to `MATRCLOTestTrainTestSplitter` (108 train / 70 test) —
+one line, and it is also cell-disjoint.
+
+The cell partition is checked, not assumed: `Task.build` calls
+`assert_disjoint_cells` on the loaded cells *before* any expansion into
+cycles.
+
+### Why Ridge
+
+`sklearn.linear_model.Ridge` through `RidgeRULPredictor`, whose `RUL` is
+naming only. Fast, deterministic, and task-agnostic, which is what a first
+end-to-end proof needs. It is not a claim that Ridge is a good SOH estimator.
+
+## The server smoke
+
+```bash
+conda run -n batteryml python batteryml_web/core/run_batteryml_cli.py run \
+    configs/soh/ridge/matr.yaml \
+    --workspace runs/soh_smoke_matr_ridge \
+    --train --eval \
+    --device cpu --seed 0 \
+    --metric MAE,RMSE
+```
+
+`--metric` is a real CLI flag (`bin/batteryml.py`, default `RMSE,MAE,MAPE`).
+It is passed explicitly because MAPE is not a canonical SOH metric: it is
+informative for a cycle count of order 100 and close to meaningless for a
+ratio of order 1, where it merely restates MAE. The Agent's execution plan
+passes the same list for an SOH task.
+
+Ridge on roughly 28k x 37 is cheap; this is a smoke, not a benchmark run.
+
+## After the run: inspect the artifact
+
+```bash
+python -m scripts.inspect_soh_artifact runs/soh_smoke_matr_ridge \
+    --config configs/soh/ridge/matr.yaml --rows 10
+```
+
+Reports the task and reference convention the artifact records, the prediction
+and unique-test-cell counts, observed and predicted SOH ranges, the recorded
+MAE and RMSE, a cross-check that the inverse transform reproduces them, and
+the first rows as `cell_id, cycle, observed, predicted, residual`.
+
+**Workflow validation, not a quality judgement.** One Ridge run says the route
+works end to end. It says nothing about how well SOH can be estimated.
 
 ## The prediction artifact
 

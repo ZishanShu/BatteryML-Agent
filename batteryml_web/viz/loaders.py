@@ -799,13 +799,32 @@ def load_prediction_artifact(
     y_pred = y_pred_t.numpy().astype(np.float64)
 
     config = read_config(config_path) if config_path is not None else None
-    cells = resolve_test_cell_ids(
-        payload,
-        source=artifact_path,
-        config=config,
-        y_true=y_true,
-        verify_alignment=verify_cell_alignment,
-    )
+    sample_index = _sample_index_of(payload, artifact_path, len(y_true))
+    if sample_index is not None:
+        # The run recorded who each row belongs to, so there is nothing to
+        # infer. The whole-cell resolver must not run here at all: it compares
+        # the test split's *cell* count against the row count, which for a
+        # cycle-level task is 5 cells against 55 rows — correct, and rejected
+        # as an inconsistency. The recorded identity is authoritative.
+        cells = CellIdResolution(
+            cell_ids=[record["cell_id"] for record in sample_index],
+            source="artifact_sample_index",
+            n_cells_total=len({record["cell_id"] for record in sample_index}),
+            n_dropped_nan_label=None,
+            alignment_verified=True,
+            reason=(
+                "the artifact records a cell id and observed cycle for every "
+                "prediction, written by the evaluation step; nothing is inferred."
+            ),
+        )
+    else:
+        cells = resolve_test_cell_ids(
+            payload,
+            source=artifact_path,
+            config=config,
+            y_true=y_true,
+            verify_alignment=verify_cell_alignment,
+        )
 
     seed = payload.get("seed")
     return PredictionArtifact(
@@ -818,7 +837,7 @@ def load_prediction_artifact(
         score_check=score_check,
         label_transformations=chain,
         cells=cells,
-        sample_index=_sample_index_of(payload, artifact_path, len(y_true)),
+        sample_index=sample_index,
         task_metadata=dict(payload.get('task_metadata') or {})
         if isinstance(payload.get('task_metadata'), dict) else {},
     )

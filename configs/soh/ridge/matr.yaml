@@ -1,0 +1,65 @@
+# The first real BatteryML SOH end-to-end workflow.
+#
+# MATR, SOH estimation at an observed cycle, Ridge regression. This is a
+# workflow, not a benchmark: one feature path, one label convention, and a
+# model chosen for being fast, deterministic and task-agnostic rather than for
+# SOH accuracy. See docs/SOH_PROTOCOL.md.
+#
+# SPLIT COVERAGE, stated because it is easy to miss:
+# MATRPrimaryTestTrainTestSplitter is the canonical MATR-1 partition that every
+# MATR RUL baseline in configs/baselines/ uses, so an SOH result here is about
+# the same cells those results are about. It covers 83 of the 180 processed
+# MATR cells (41 train + 42 test, batches 1-2; upstream removes the b2c1
+# outlier). To use 178 of the 180 instead, change the splitter name to
+# MATRCLOTestTrainTestSplitter — one line, and it is also cell-disjoint.
+#
+# SAMPLE POLICY lives under `label:` only. The label annotator owns which
+# cycles are sampled and the feature extractor is asked for exactly those, so
+# min_cycle / cycle_stride under `feature:` would be keys the extractor does
+# not accept.
+
+task: 'SOH estimation'
+
+model:
+    # sklearn.linear_model.Ridge. The RUL in the class name is naming only:
+    # SklearnModel.fit is model.fit(feature.view(n, -1), label) with no
+    # lifetime, end-of-life or cycle semantics. Displayed as "Ridge Regression".
+    name: 'RidgeRULPredictor'
+    alpha: 1.0
+
+train_test_split:
+    # Cell-level. Cells are partitioned by explicit ID before any expansion
+    # into cycle-level samples; Task.build asserts the two sides share no cell.
+    name: 'MATRPrimaryTestTrainTestSplitter'
+    cell_data_path: 'data/processed/MATR'
+
+feature:
+    # The voltage curve observed at cycle t, resampled to a fixed width plus
+    # five summary scalars. Reads cycles <= t only, and never capacity: the
+    # label is capacity / Q_ref, so capacity as a feature would make the target
+    # an arithmetic function of the input.
+    name: 'SOHVoltageCurveFeatureExtractor'
+    n_voltage_points: 32
+    n_history_cycles: 1
+    include_cycle_number: false
+
+label:
+    # SOH(cell, t) = Q_discharge(cell, t) / Q_ref(cell), a ratio.
+    name: 'CycleSOHLabelAnnotator'
+    reference_capacity_mode: 'first_valid_discharge_capacity'
+    min_cycle: 10
+    max_cycle: null
+    cycle_stride: 5
+
+feature_transformation:
+    # Voltage values and durations are on very different scales; Ridge is
+    # scale-sensitive through its penalty, so the features are standardised.
+    name: 'ZScoreDataTransformation'
+
+label_transformation:
+    # Invertible, and DataBundle.evaluate inverse-transforms before scoring, so
+    # the recorded MAE and RMSE are on the canonical SOH ratio scale.
+    # LogScale is deliberately NOT stacked here as it is for RUL: a log of a
+    # ratio near 1.0 compresses exactly the range SOH lives in, and is
+    # undefined at 0.
+    name: 'ZScoreDataTransformation'
