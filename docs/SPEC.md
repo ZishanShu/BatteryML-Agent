@@ -268,6 +268,9 @@ that made the LLM route look broken rather than optional.
 | `UX-05` | A BatteryML prediction `.pkl` is described rather than refused: output kind, prediction count, whether ground truth is stored, the seed, and whether saved metrics are present — then the observed-vs-predicted, residual and table views. Reading goes through the one CPU-safe unpickler; no metric is computed or restated here. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/artifact_preview.py` |
 | `UX-06` | An unrecognised `.pkl` is neither parsed nor called "not implemented": it reports that its structure is not a supported prediction-view format and shows only what it can read — top-level type, keys, types and shapes. A dict that merely has a `prediction` key but no usable shape counts as unrecognised. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/artifact_preview.py` (`describe_structure`, `_is_prediction_payload`) |
 | `UX-07` | The Files view groups discovered artifacts by category with size and modified time, and states Project / Workspace / Run directory explicitly rather than leaving them to be inferred from a path. No group is created for files that do not exist, and every path shown comes from discovery inside that run's own directory. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/run_history.py` (`group_artifacts`, `render_run_location`, `render_file_browser`) |
+| `UX-08` | Opening a page from the sidebar shows it from the top. The previous page's scroll offset is never carried across a page switch, on any entry (Home, Agent Workflow, Prepare Data, Run Model, Review Results) and by any route into it (a sidebar button, Prev/Next, the bottom navigation, or a direct `current_step` assignment). A rerun *within* a page does not scroll, so a button press does not move the reader. The reset is injected before the page body, so a page that raises part-way through still opens at the top. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/scroll.py` (`page_changed`, `render_scroll_to_top`), `batteryml_web/app.py` |
+| `UX-09` | Prepare Data is one linear flow, not a Preprocessing / Feature Inspection split: dataset selector → readiness, raw and processed paths → preprocess action → latest preprocessing log → feature/artifact inspection. One dataset selector drives all of it, so the page cannot act on one dataset while reporting another. Nothing the two tabs offered was dropped, and an empty dataset list no longer abandons the rest of the page. | `IMPLEMENTED-STATIC` | `batteryml_web/app.py` (`render_prepare_data_page`, `_selected_dataset_index`) |
+| `UX-10` | The sidebar's vertical spacing is tightened with a layout-only stylesheet: padding, margin and gap, scoped to the sidebar by stable `data-testid` selectors, with nothing hidden and no generated class names relied on. Streamlit's sidebar heading overflows its own container by ~16px, so the block gap may not go below `0.4rem` and the heading padding may not be zeroed — both values were established by rendering the page, not by eye. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/styles.py` (`SIDEBAR_COMPACT_CSS`, `render_layout_css`), `batteryml_web/ui/workflow_sidebar.py` |
 
 The check that establishes this group is `RUN-01`
 (`scripts/verify/check_run_context.py`); the tests are
@@ -278,6 +281,16 @@ and, in `tests/test_agent_web_ui.py`, the classes
 `TestNothingRuntimeIsHardcoded`. The last is written to fail if anyone later
 writes a GPU count, a GPU name, a device string, a project path or a metric
 value into the UI source, and its scan is proved non-vacuous by mutation.
+
+`UX-08`–`UX-10` are covered by `tests/test_ui_layout.py`. Two of their
+claims are about what a browser does rather than what the source says, so
+they were checked by rendering the app with Playwright and measuring: that
+run is what caught the reset being skipped by a page that raises, and what
+established the two sidebar values `UX-10` now pins. The measurements
+(sidebar content height 1202px unstyled → 627px, every navigation landing
+at offset 0) are `[VERIFIED]` in this container only; the Streamlit version
+on the server is not pinned by this repository, so re-checking the sidebar
+there is worth one look.
 
 `RUN-04` deliberately does **not** claim multi-GPU execution. A multi-GPU
 selection is still preserved as `{"mode": "multi_gpu", "gpu_ids": [...]}`,

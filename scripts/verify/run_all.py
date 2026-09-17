@@ -61,6 +61,9 @@ CHECKS: tuple[tuple[str, str, str, bool], ...] = (
     # Where a run goes, what it may claim about itself, and what it must not
     # print: project -> workspace, provenance, earned ETA, no leaked key.
     ("RUN-01", "run_context", "check_run_context", True),
+    # Navigation and layout: page-top reset, one Prepare Data flow, compact
+    # sidebar. Pure source inspection plus the reset's own pure decision.
+    ("UI-01", "navigation_layout", "check_navigation_layout", True),
     # Last: the only check that actually renders anything, so it is the slowest
     # and the one most likely to be skipped for a missing package.
     ("FIG-01", "figure_contract", "check_figure_contract", True),

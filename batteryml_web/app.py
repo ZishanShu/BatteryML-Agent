@@ -52,6 +52,7 @@ from batteryml_web.ui.run_history import (
 )
 from batteryml_web.ui.settings_panel import render_llm_settings_form
 from batteryml_web.ui.progress_utils import get_safe_runtime_env, run_command_with_progress
+from batteryml_web.ui.scroll import render_scroll_to_top
 from batteryml_web.ui.workflow_sidebar import NAV_STEPS, get_current_step_index, render_sidebar_workflow, set_current_step
 from batteryml_web.core.readiness import assess_dataset
 from batteryml_web.core.config_registry import get_config_registry
@@ -811,6 +812,20 @@ def _ui_dataset_label(name: str) -> str:
     return f"{name} [{extras}]" if extras else name
 
 
+def _selected_dataset_index(datasets: list[str]) -> int:
+    """Where the session's selected dataset sits in ``datasets``.
+
+    Falls back to the first entry when the session names a dataset this list
+    does not contain, which is what happens after a manifest refresh drops
+    one. Returning 0 rather than raising keeps the page usable; the selector
+    then shows the dataset it is actually about to act on.
+    """
+    selected = st.session_state.get("selected_dataset")
+    if selected in datasets:
+        return datasets.index(selected)
+    return 0
+
+
 def _current_dataset_status(name: str) -> str:
     info = _dataset_card(name)
     status = str(info.get("status", "MISSING"))
@@ -858,10 +873,14 @@ def render_prepare_data_page():
     st.header("🔋 Prepare Data", anchor=False)
     st.caption("Raw data → Preprocessing → Processed records → Feature inspection → Ready for model")
 
+    # Preprocessing and feature inspection are one tab, not two. They were
+    # split while each carried its own dataset selector, and the two could
+    # disagree about which dataset was being prepared. The dataset is chosen
+    # once and the flow runs top to bottom: dataset → readiness → preprocess
+    # → log → inspection. No step was dropped in the merge.
     tabs = st.tabs([
         "Dataset Overview",
-        "Preprocessing",
-        "Feature Inspection",
+        "Preprocess & Inspect",
         "Custom Dataset / Schema Mapping",
     ])
 
@@ -928,144 +947,145 @@ def render_prepare_data_page():
         st.markdown('</div>', unsafe_allow_html=True)
 
     with tabs[1]:
-        ds = st.selectbox("Dataset", datasets, key="prep_ds_select") if datasets else None
-        if ds is None:
+        if not datasets:
+            # No early return: the Custom Dataset tab below does not depend
+            # on the registered-dataset list and must still render.
             st.info("No datasets available.")
-            render_bottom_step_navigation()
-            return
-        info = _dataset_card(ds)
-        raw_path = info["raw_path"]
-        processed_path = info["processed_path"]
-        st.write(f"**Selected dataset:** {ds}")
-        st.write(f"**Dataset readiness:** {_current_dataset_status(ds)}")
-        st.write(f"**Raw path:** `{raw_path}`")
-        st.write(f"**Processed path:** `{processed_path}`")
-
-        if not info["raw_exists"]:
-            st.error("Raw data missing")
-            st.button(
-                "Run preprocessing",
-                disabled=True,
-                use_container_width=True,
-                key="prep_run_disabled",
-            )
-
-        elif not info.get("preprocessing_supported", False):
-            st.warning(
-                info.get(
-                    "readiness_reason",
-                    "Raw data are present, but this source is not yet wired "
-                    "to the BatteryML preprocessing route.",
-                )
-            )
-            st.info(
-                "This raw source is available locally, but automatic "
-                "preprocessing is not enabled for this source yet."
-            )
-            st.button(
-                "Run preprocessing",
-                disabled=True,
-                use_container_width=True,
-                key="prep_run_unsupported",
-            )
-
         else:
-            command = [
-                sys.executable,
-                "batteryml_web/core/run_batteryml_cli.py",
-                "preprocess",
-                ds,
-                str(raw_path),
-                str(processed_path),
-            ]
-
-            st.code(
-                " ".join(command),
-                language="bash",
+            ds = st.selectbox(
+                "Dataset",
+                datasets,
+                index=_selected_dataset_index(datasets),
+                key="prep_ds_select",
             )
+            info = _dataset_card(ds)
+            raw_path = info["raw_path"]
+            processed_path = info["processed_path"]
+            st.write(f"**Selected dataset:** {ds}")
+            st.write(f"**Dataset readiness:** {_current_dataset_status(ds)}")
+            st.write(f"**Raw path:** `{raw_path}`")
+            st.write(f"**Processed path:** `{processed_path}`")
+            st.write(f"**Processed file count:** {info['processed_files']}")
 
-            btn_label = (
-                "Re-run preprocessing"
-                if info["processed_exists"]
-                else "Run preprocessing"
+            if not info["raw_exists"]:
+                st.error("Raw data missing")
+                st.button(
+                    "Run preprocessing",
+                    disabled=True,
+                    use_container_width=True,
+                    key="prep_run_disabled",
+                )
+
+            elif not info.get("preprocessing_supported", False):
+                st.warning(
+                    info.get(
+                        "readiness_reason",
+                        "Raw data are present, but this source is not yet wired "
+                        "to the BatteryML preprocessing route.",
+                    )
+                )
+                st.info(
+                    "This raw source is available locally, but automatic "
+                    "preprocessing is not enabled for this source yet."
+                )
+                st.button(
+                    "Run preprocessing",
+                    disabled=True,
+                    use_container_width=True,
+                    key="prep_run_unsupported",
+                )
+
+            else:
+                command = [
+                    sys.executable,
+                    "batteryml_web/core/run_batteryml_cli.py",
+                    "preprocess",
+                    ds,
+                    str(raw_path),
+                    str(processed_path),
+                ]
+
+                st.code(
+                    " ".join(command),
+                    language="bash",
+                )
+
+                btn_label = (
+                    "Re-run preprocessing"
+                    if info["processed_exists"]
+                    else "Run preprocessing"
+                )
+
+                if st.button(
+                    btn_label,
+                    use_container_width=True,
+                    key="prep_run",
+                ):
+                    log_path = (
+                        _project_root()
+                        or Path("runs/web_projects/default")
+                    ) / "logs" / f"preprocess_{ds}.log"
+
+                    result = run_command_with_progress(
+                        command=command,
+                        cwd=REPO_ROOT,
+                        log_path=log_path,
+                        steps=[
+                            (5, "Initialize"),
+                            (20, "Check raw data"),
+                            (40, "Start preprocessing"),
+                            (80, "Write outputs"),
+                            (100, "Done"),
+                        ],
+                    )
+
+                    st.session_state["last_run_status"] = (
+                        "success" if result["success"] else "failed"
+                    )
+                    st.session_state["last_run_time"] = result["elapsed"]
+                    st.session_state["last_run_code"] = result["return_code"]
+                    st.session_state["last_preprocess_log"] = (
+                        Path(result["log_path"]).read_text(encoding="utf-8")
+                        if Path(result["log_path"]).exists()
+                        else ""
+                    )
+
+            if st.session_state.get("last_preprocess_log"):
+                with st.expander("Latest preprocessing log", expanded=False):
+                    st.text_area("Log", value=st.session_state["last_preprocess_log"], height=260, key="prep_log_view")
+
+            st.markdown("---")
+            st.markdown("**Feature / artifact inspection**")
+            st.caption(
+                "What preprocessing left on disk for the dataset selected above."
             )
-
-            if st.button(
-                btn_label,
-                use_container_width=True,
-                key="prep_run",
-            ):
-                log_path = (
-                    _project_root()
-                    or Path("runs/web_projects/default")
-                ) / "logs" / f"preprocess_{ds}.log"
-
-                result = run_command_with_progress(
-                    command=command,
-                    cwd=REPO_ROOT,
-                    log_path=log_path,
-                    steps=[
-                        (5, "Initialize"),
-                        (20, "Check raw data"),
-                        (40, "Start preprocessing"),
-                        (80, "Write outputs"),
-                        (100, "Done"),
-                    ],
-                )
-
-                st.session_state["last_run_status"] = (
-                    "success" if result["success"] else "failed"
-                )
-                st.session_state["last_run_time"] = result["elapsed"]
-                st.session_state["last_run_code"] = result["return_code"]
-                st.session_state["last_preprocess_log"] = (
-                    Path(result["log_path"]).read_text(encoding="utf-8")
-                    if Path(result["log_path"]).exists()
-                    else ""
-                )
-        if st.session_state.get("last_preprocess_log"):
-            with st.expander("Latest preprocessing log", expanded=False):
-                st.text_area("Log", value=st.session_state["last_preprocess_log"], height=260, key="prep_log_view")
+            feature_files = [p for p in processed_path.rglob("*") if p.is_file() and any(k in p.name.lower() for k in ["feature", "cache", "artifact", ".npy", ".npz", ".pkl"])][:100] if processed_path.exists() else []
+            if feature_files:
+                cards = st.columns(2)
+                for idx, p in enumerate(feature_files[:10]):
+                    with cards[idx % 2]:
+                        stat = p.stat()
+                        st.markdown(
+                            f"""
+                            <div style="border:1px solid rgba(255,255,255,0.12); border-radius:14px; padding:12px; min-height:110px;">
+                                <div style="font-weight:700; word-break:break-all;">{p.name}</div>
+                                <div style="font-size:0.85rem; opacity:0.85; margin-top:6px;">Type: {p.suffix or 'unknown'}</div>
+                                <div style="font-size:0.85rem; opacity:0.85;">Size: {stat.st_size} bytes</div>
+                                <div style="font-size:0.75rem; opacity:0.75; word-break:break-all; margin-top:6px;">Path: {p}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                st.write("**Feature / cache / artifact files:**")
+                st.code("\n".join(str(p) for p in feature_files[:30]), language="text")
+                st.write("**Feature dimension:**")
+                st.info("Feature information is not available yet. Run model or inspect BatteryML cache outputs.")
+            else:
+                st.info("Feature information is not available yet. Run model or inspect BatteryML cache outputs.")
+            if st.button("Go to Run Model", use_container_width=True, key="prep_go_run_model"):
+                set_current_step("run_model")
 
     with tabs[2]:
-        ds = st.selectbox("Dataset for feature inspection", datasets, key="feature_ds_select", index=datasets.index(st.session_state.get("selected_dataset", datasets[0] if datasets else "")) if datasets and st.session_state.get("selected_dataset", datasets[0]) in datasets else 0) if datasets else None
-        if ds is None:
-            st.info("No datasets available.")
-            render_bottom_step_navigation()
-            return
-        info = _dataset_card(ds)
-        processed_path = info["processed_path"]
-        st.write(f"**Selected dataset:** {ds}")
-        st.write(f"**Dataset readiness:** {_current_dataset_status(ds)}")
-        st.write(f"**Processed path:** `{processed_path}`")
-        st.write(f"**Processed file count:** {info['processed_files']}")
-        feature_files = [p for p in processed_path.rglob("*") if p.is_file() and any(k in p.name.lower() for k in ["feature", "cache", "artifact", ".npy", ".npz", ".pkl"])][:100] if processed_path.exists() else []
-        if feature_files:
-            cards = st.columns(2)
-            for idx, p in enumerate(feature_files[:10]):
-                with cards[idx % 2]:
-                    stat = p.stat()
-                    st.markdown(
-                        f"""
-                        <div style="border:1px solid rgba(255,255,255,0.12); border-radius:14px; padding:12px; min-height:110px;">
-                            <div style="font-weight:700; word-break:break-all;">{p.name}</div>
-                            <div style="font-size:0.85rem; opacity:0.85; margin-top:6px;">Type: {p.suffix or 'unknown'}</div>
-                            <div style="font-size:0.85rem; opacity:0.85;">Size: {stat.st_size} bytes</div>
-                            <div style="font-size:0.75rem; opacity:0.75; word-break:break-all; margin-top:6px;">Path: {p}</div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-            st.write("**Feature / cache / artifact files:**")
-            st.code("\n".join(str(p) for p in feature_files[:30]), language="text")
-            st.write("**Feature dimension:**")
-            st.info("Feature information is not available yet. Run model or inspect BatteryML cache outputs.")
-        else:
-            st.info("Feature information is not available yet. Run model or inspect BatteryML cache outputs.")
-        if st.button("Go to Run Model", use_container_width=True, key="prep_go_run_model"):
-            set_current_step("run_model")
-
-    with tabs[3]:
         st.caption("Upload raw cycling files exported from supported battery cyclers. Training and validation/test files must be uploaded separately. The platform will call BatteryML preprocessing before any training workflow is enabled.")
         project_dir = _selected_project_dir()
         uploads_dir = project_dir / "uploads"
@@ -1367,6 +1387,53 @@ def render_llm_output_panel(output_key: str, title: str) -> None:
         st.markdown(output)
 
 
+def _render_run_model_without_datasets() -> None:
+    """Run Model with no dataset registered: say so, and point somewhere useful.
+
+    The page used to build its four tabs regardless. With nothing to offer,
+    the dataset selectbox returns ``None``, and the configuration summary
+    then did ``readiness[None]`` and killed the page with ``KeyError: None``
+    — an ordinary empty state presented as a crash.
+
+    The execution controls are omitted rather than shown disabled. There is
+    no dataset to configure a run against, and a Run button that can never
+    be pressed says less than a sentence naming what is missing. Nothing is
+    selected on the user's behalf: no dataset is invented to fill the gap,
+    and the session's dataset is left exactly as it was.
+
+    What stays is the way out: the two pages that create the missing
+    dataset, and the step navigation.
+    """
+    st.info("No datasets are currently available. Prepare or upload a dataset first.")
+    st.caption(
+        "Run Model executes a BatteryML run against a registered dataset, so "
+        "there is nothing to select, configure or run until one exists."
+    )
+    st.markdown("**Where to go next**")
+    st.write(
+        "- **Prepare Data** — preprocess a dataset already under `data/raw/`, "
+        "or upload your own raw cycling files under Custom Dataset / Schema "
+        "Mapping."
+    )
+    st.write("- **Home** — create or load a project first, if you have not yet.")
+    prepare_col, home_col = st.columns(2)
+    with prepare_col:
+        if st.button(
+            "Go to Prepare Data",
+            use_container_width=True,
+            key="run_empty_go_prepare_data",
+        ):
+            set_current_step("prepare_data")
+    with home_col:
+        if st.button(
+            "Go to Home",
+            use_container_width=True,
+            key="run_empty_go_home",
+        ):
+            set_current_step("home")
+    render_bottom_step_navigation()
+
+
 def render_run_model_page():
     st.header("🚀 Run Model", anchor=False)
     st.caption("Configure dataset, prediction task, model, device, and execute the deterministic BatteryML workflow.")
@@ -1374,6 +1441,13 @@ def render_run_model_page():
     datasets = _ui_dataset_options()
     tasks = ["RUL prediction", "SOH estimation"]
     readiness = {ds: _dataset_card(ds) for ds in datasets}
+
+    # Checked once, here, rather than inside each tab: every tab below reads a
+    # selected dataset, and `readiness` is keyed by the datasets that exist, so
+    # with none of them there is no key to look up and nothing to run.
+    if not datasets:
+        _render_run_model_without_datasets()
+        return
 
     tabs = st.tabs(["Configuration", "Dataset Readiness", "Command & Run", "Logs / Debug"])
 
@@ -1851,6 +1925,15 @@ Metrics:
 render_sidebar_workflow()
 
 current_step = st.session_state.get("current_step", "home")
+
+# Before the page body, not after: Streamlit streams elements as the script
+# produces them, so this still runs while the page arrives, and a page that
+# raises part-way through still opens at the top rather than silently keeping
+# the previous page's scroll offset. Injected only when the step changed, so a
+# rerun within a page (a button, a progress tick) leaves the reader where they
+# were. See ui/scroll.py.
+render_scroll_to_top(current_step)
+
 if current_step == "home":
     render_home_page()
 elif current_step == "prepare_data":

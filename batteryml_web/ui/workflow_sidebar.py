@@ -19,6 +19,7 @@ import streamlit as st
 
 from ..core.project_context import resolve_project
 from .settings_panel import render_sidebar_settings
+from .styles import render_layout_css
 
 #: Ordered for Prev/Next. ``group`` decides where a step is drawn:
 #: ``home`` at the top, ``agent`` in its own block, ``workflow`` in the
@@ -152,6 +153,9 @@ def _nav_button(step: dict, current_step: str) -> None:
 
 
 def render_sidebar_workflow():
+    # Spacing only, and injected before the sidebar is drawn so the first
+    # paint is already compact. See ui/styles.py for what it may not do.
+    render_layout_css()
     with st.sidebar:
         st.markdown("### 🔋 BatteryML")
         st.caption("Protocol Navigator")
