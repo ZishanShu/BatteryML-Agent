@@ -31,9 +31,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .result_views import (
+    RUL_CYCLEWISE_SCHEMA,
     RUL_SCHEMA,
+    SCALAR_SCHEMAS,
+    SOH_SCALAR_SCHEMA,
     SOH_SCHEMA,
     TRAJECTORY_SCHEMA,
+    build_rul_cycle_view,
     build_rul_view,
     build_soh_view,
     build_trajectory_view,
@@ -55,7 +59,11 @@ SUPPORTED_PREVIEW_FORMATS: tuple[str, ...] = (
 #: says so instead of being described as the last branch of an if/else.
 _OUTPUT_KIND: Dict[str, str] = {
     RUL_SCHEMA: "Scalar prediction per cell (lifetime / RUL)",
+    RUL_CYCLEWISE_SCHEMA: (
+        "Remaining-useful-life prediction per observed cycle of each cell"
+    ),
     SOH_SCHEMA: "Scalar prediction per cycle of each cell (SOH ratio)",
+    SOH_SCALAR_SCHEMA: "Scalar prediction per cell (SOH ratio)",
     TRAJECTORY_SCHEMA: "Sequence per cell (degradation trajectory)",
 }
 
@@ -144,7 +152,9 @@ def _is_prediction_payload(payload: Any) -> bool:
     """
     if not isinstance(payload, dict) or "prediction" not in payload:
         return False
-    return detect_schema(payload) in (RUL_SCHEMA, SOH_SCHEMA, TRAJECTORY_SCHEMA)
+    return detect_schema(payload) in (
+        *SCALAR_SCHEMAS, SOH_SCHEMA, TRAJECTORY_SCHEMA,
+    )
 
 
 def preview_prediction_file(path: str | Path) -> Dict[str, Any]:
@@ -166,6 +176,7 @@ def preview_prediction_file(path: str | Path) -> Dict[str, Any]:
         "summary": {},
         "structure": {},
         "rul": None,
+        "rul_cycles": None,
         "soh": None,
         "trajectory": None,
     }
@@ -197,10 +208,17 @@ def preview_prediction_file(path: str | Path) -> Dict[str, Any]:
     result["kind"] = KIND_BATTERYML_PREDICTION
     result["schema"] = schema
 
-    rul = build_rul_view(payload) if schema == RUL_SCHEMA else None
+    rul = build_rul_view(payload) if schema in SCALAR_SCHEMAS else None
     soh = build_soh_view(payload) if schema == SOH_SCHEMA else None
     trajectory = build_trajectory_view(payload) if schema == TRAJECTORY_SCHEMA else None
+    # Built only for the schema that genuinely carries per-cell, per-cycle
+    # remaining-life estimates; None everywhere else, so a caller cannot draw
+    # a curve for an artifact that has none.
+    rul_cycles = (
+        build_rul_cycle_view(payload) if schema == RUL_CYCLEWISE_SCHEMA else None
+    )
     result["rul"] = rul
+    result["rul_cycles"] = rul_cycles
     result["soh"] = soh
     result["trajectory"] = trajectory
 

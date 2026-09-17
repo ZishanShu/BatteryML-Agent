@@ -105,8 +105,9 @@ instead of cells) that produces a good-looking score and no visible symptom.
 | `SOH-08` | The SOH result views are the existing parity and residual figures plus `soh_vs_cycle`, which groups measured and estimated SOH by real `cell_id` from the saved artifact and states how many of how many cells it shows. Every point is an at-cycle estimate; it is never presented as a trajectory forecast. | `IMPLEMENTED-STATIC` | `batteryml_web/viz/figures.py` (`soh_vs_cycle_figure`), `batteryml_web/viz/contract.py`, `batteryml_web/viz/cli.py` |
 | `SOH-09` | No dataset is claimed SOH-ready and no dataset SOH config exists until `scripts/audit_soh_readiness.py` is run on real processed data. The legacy `configs/soh/dummy/*` examples are marked `legacy_example: true` and withheld from the runnable catalog rather than advertised as SOH support. | `IMPLEMENTED-STATIC` | `configs/soh/dummy/*.yaml`, `batteryml_web/core/config_registry.py` (`_parse_entry`) |
 | `SOH-10` | Agent intent maps SOH language (English and Chinese) to SOH estimation and lifetime, RUL and trajectory language away from it. "End of life at 80% SOH" is the `eol_soh` decoy in natural language and resolves to RUL. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/intent.py`, `tests/test_soh_agent_results.py` |
-| `SOH-11` | The first real SOH route is MATR + Ridge Regression at `configs/soh/ridge/matr.yaml`, with `min_cycle: 10`, `cycle_stride: 5` and `reference_capacity_mode: first_valid_discharge_capacity`, on the canonical cell-level `MATRPrimaryTestTrainTestSplitter` (41 train / 42 test cells, 83 of MATR's 180). It is the only entry the SOH catalog offers; the MATR RUL menu of 24 models is unchanged. Labels are audited before training and the artifact after it, by `scripts/audit_soh_labels.py` and `scripts/inspect_soh_artifact.py`. | `IMPLEMENTED-STATIC` | `configs/soh/ridge/matr.yaml`, `scripts/audit_soh_labels.py`, `scripts/inspect_soh_artifact.py`, `tests/test_soh_matr_config.py` |
-| `SOH-12` | A cycle-level SOH result is presented as one, in every place a result is drawn. The schema is decided from the recorded `sample_index`, never from the numbers — an SOH scalar per cycle is structurally identical to an RUL scalar per cell — so each row names its cell and its cycle, the axes say SOH (ratio), and per-cell curves are drawn beside the parity scatter. Beside them is a display-only range check: how many estimates fall below 0, above 1.0 and above 1.1, the extremes, and the ten largest absolute residuals. It counts and reports; it never clips, rescales, drops or reorders a prediction, and the values plotted are the values the canonical metrics were computed from. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/result_views.py` (`SOH_SCHEMA`, `build_soh_view`, `soh_range_diagnostics`, `largest_residuals`), `batteryml_web/ui/run_history.py` (`render_soh_figures`), `tests/test_soh_result_views.py` |
+| `SOH-11` | The first real SOH route is MATR + Ridge Regression at `configs/soh/ridge/matr.yaml`, with `min_cycle: 10`, `cycle_stride: 5` and `reference_capacity_mode: first_valid_discharge_capacity`, on the canonical cell-level `MATRPrimaryTestTrainTestSplitter` (41 train / 42 test cells, 83 of MATR's 180). The MATR RUL menu is unchanged. (Amended by `SOH-13`: Ridge is no longer the only entry the SOH catalog offers.) Labels are audited before training and the artifact after it, by `scripts/audit_soh_labels.py` and `scripts/inspect_soh_artifact.py`. | `IMPLEMENTED-STATIC` | `configs/soh/ridge/matr.yaml`, `scripts/audit_soh_labels.py`, `scripts/inspect_soh_artifact.py`, `tests/test_soh_matr_config.py` |
+| `SOH-12` | A cycle-level SOH result is presented as one, in every place a result is drawn. The schema is decided from what the artifact records about itself, never from the numbers — an SOH scalar per cycle is structurally identical to an RUL scalar per cell — and from `RES-01` onward that means the recorded task *and* the recorded per-row identity, not the identity alone — so each row names its cell and its cycle, the axes say SOH (ratio), and per-cell curves are drawn beside the parity scatter. Beside them is a display-only range check: how many estimates fall below 0, above 1.0 and above 1.1, the extremes, and the ten largest absolute residuals. It counts and reports; it never clips, rescales, drops or reorders a prediction, and the values plotted are the values the canonical metrics were computed from. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/result_views.py` (`SOH_SCHEMA`, `build_soh_view`, `soh_range_diagnostics`, `largest_residuals`), `batteryml_web/ui/run_history.py` (`render_soh_figures`), `tests/test_soh_result_views.py` |
+| `SOH-13` | Beside Ridge, the SOH catalog offers every estimator that passed a compatibility audit against the real `SklearnModel.fit`/`predict`/`evaluate` path on a cycle-level bundle of the route's own 37-wide shape: Lasso, Elastic Net, Random Forest and XGBoost. Each has a config under `configs/soh/` that is byte-identical to the Ridge config outside its `model:` block — same split, reference convention, sample policy, feature extractor, transformations and metrics — so two SOH numbers differ only by the estimator. No config declares a hyperparameter and none pins `random_state`, so `--seed` keeps its meaning. MLP was audited and rejected: it is an `NNModel` requiring a two-dimensional per-sample feature geometry a flat SOH row does not have, and the feature is not reshaped to suit it. These are compatible baselines, not a ranking. | `IMPLEMENTED-STATIC` | `configs/soh/{lasso,elastic_net,rf,xgb}/matr.yaml`, `tests/test_soh_baseline_pack.py`, `docs/SOH_PROTOCOL.md` |
 
 ### Notes on the SOH group
 
@@ -320,7 +321,8 @@ that made the LLM route look broken rather than optional.
 | `UX-08` | Opening a page from the sidebar shows it from the top. The previous page's scroll offset is never carried across a page switch, on any entry (Home, Agent Workflow, Prepare Data, Run Model, Review Results) and by any route into it (a sidebar button, Prev/Next, the bottom navigation, or a direct `current_step` assignment). A rerun *within* a page does not scroll, so a button press does not move the reader. The reset is injected before the page body, so a page that raises part-way through still opens at the top. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/scroll.py` (`page_changed`, `render_scroll_to_top`), `batteryml_web/app.py` |
 | `UX-09` | Prepare Data is one linear flow, not a Preprocessing / Feature Inspection split: dataset selector → readiness, raw and processed paths → preprocess action → latest preprocessing log → feature/artifact inspection. One dataset selector drives all of it, so the page cannot act on one dataset while reporting another. Nothing the two tabs offered was dropped, and an empty dataset list no longer abandons the rest of the page. | `IMPLEMENTED-STATIC` | `batteryml_web/app.py` (`render_prepare_data_page`, `_selected_dataset_index`) |
 | `UX-10` | The sidebar's vertical spacing is tightened with a layout-only stylesheet: padding, margin and gap, scoped to the sidebar by stable `data-testid` selectors, with nothing hidden and no generated class names relied on. Streamlit's sidebar heading overflows its own container by ~16px, so the block gap may not go below `0.4rem` and the heading padding may not be zeroed — both values were established by rendering the page, not by eye. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/styles.py` (`SIDEBAR_COMPACT_CSS`, `render_layout_css`), `batteryml_web/ui/workflow_sidebar.py` |
-| `UX-11` | The sidebar's horizontal rules mark real boundaries only. The title, the project, **Home** and **Agent Workflow** are one block with no rule between them; the rules that remain separate the numbered protocol list, the Prev/Next pair, the settings block and the status line. The grey secondary lines are set at `0.82rem`, scoped to the sidebar so `st.caption` elsewhere in the application is untouched, with type size and line-height only — no margin, height or overflow, which is what previously clipped a wrapped caption behind the button beneath it. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/workflow_sidebar.py` (`render_sidebar_workflow`), `batteryml_web/ui/styles.py` (`SIDEBAR_COMPACT_CSS`) |
+| `UX-11` | The sidebar draws **exactly one** horizontal rule, immediately above the **Protocol Workflow** heading — the one place a boundary exists, between the two ways in (Home, Agent Workflow) and the numbered route. The rules that used to sit above Prev/Next, above the settings block and above the status line separated a list from its own controls, and a single-line control from a single-line readout; vertical rhythm does that work now. A navigation entry carries a caption only where the caption says something its label cannot: **Home** carries none, the Protocol Workflow heading carries none, and **Agent Workflow** keeps the one that states the execution contract (nothing runs until Run is pressed). The grey secondary lines are set at `0.82rem`, scoped to the sidebar so `st.caption` elsewhere in the application is untouched, with type size and line-height only — no margin, height or overflow, which is what previously clipped a wrapped caption behind the button beneath it. | `IMPLEMENTED-STATIC` | `batteryml_web/ui/workflow_sidebar.py` (`render_sidebar_workflow`), `batteryml_web/ui/styles.py` (`SIDEBAR_COMPACT_CSS`) |
+| `UX-12` | A running run shows **one structured state**, not a log. Stage names are the tqdm descriptions BatteryML actually prints (`Reading train data`, `Reading test data`, `Extracting {train,test} cycle samples`, `Training`/the upstream `Traning` typo), so the four data phases are reported separately instead of collapsing into one "Loading data". A progress bar and a percentage are drawn **only** from a parsed `current/total`, recomputed as the exact ratio rather than tqdm's rounded percent, and a counter is attributed to the stage that printed it. A stage with no denominator gets a spinner and an elapsed time and never a fabricated percentage. An ETA appears only once the run has produced enough completed units to time one, is a moving average of the most recent ten, and is discarded when the stage changes because two stages do not share a unit of work. Two boundaries BatteryML announces with no output — training→evaluating and dataset-built→training — are inferred from the CLI's own call order and from nothing else, which is what keeps a one-shot sklearn fit from waiting for an epoch counter that never comes. The periodic heartbeat is flagged in the event rather than recognised by its text, and is kept out of the live tail and `run.log`; the raw stdout/stderr stays complete and one click away under a disclosure. Terminal state is read from the RunManager's status, never from the event stream, so a run that emits no progress at all still releases the page. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/streaming.py`, `batteryml_web/agent/progress_estimate.py` (`EpochTimer`), `batteryml_web/core/run_manager.py`, `batteryml_web/ui/agent_workflow.py` (`progress_view`), `docs/RUN_PROGRESS.md` |
 
 The check that establishes this group is `RUN-01`
 (`scripts/verify/check_run_context.py`); the tests are
@@ -341,6 +343,41 @@ established the two sidebar values `UX-10` now pins. The measurements
 at offset 0) are `[VERIFIED]` in this container only; the Streamlit version
 on the server is not pinned by this repository, so re-checking the sidebar
 there is worth one look.
+
+## Result schemas (`RES-nn`)
+
+Which figures a saved artifact earns. A figure is a claim about work that
+happened, and the artifact — not the model's name, not the row count — is what
+says which claim is true. Full rationale in `docs/RESULT_SCHEMAS.md`.
+
+| ID | Requirement | Status | Implementation |
+| --- | --- | --- | --- |
+| `RES-01` | A result artifact is classified from two independent things, never one standing in for the other: the **task** it recorded (`task_metadata`'s declared task, else its label annotator — never a model class name, because `RidgeRULPredictor` trains the SOH route) and the **granularity** of its rows. The categories stay semantically separate: `rul_scalar`, `rul_cyclewise`, `soh_cycle`, `soh_scalar`, `trajectory`, `unknown`. A sequence per row is a trajectory whatever the recorded task says. An unidentified task can never produce `rul_cyclewise`. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/result_views.py` (`task_family`, `schema_evidence`, `detect_schema`) |
+| `RES-02` | A result is cycle-level only on positive evidence: a well-formed `sample_index` of matching length, **no** row carrying the `WHOLE_CELL_CYCLE` sentinel, a repeated cell id, and at least two distinct cycles for some cell. Shape alone is never sufficient — "more rows than cells" and "a `sample_index` exists" are both satisfied by whole-cell RUL artifacts, which write one index record per cell with `cycle_index = -1`. Each rejected rule has a fixture that would pass it. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/result_views.py` (`schema_evidence`), `tests/fixtures/synthetic_result_artifacts.py`, `tests/test_rul_cycle_views.py` |
+| `RES-03` | **Cycle-wise RUL curves are shown only for artifacts that contain genuine per-cell, per-cycle RUL estimates.** The view returns per-cell entries rather than a flat series, so two cells cannot be joined into one line by default; cycles are sorted ascending within a cell, carrying observed and predicted with them; and every value is one the artifact stores — `true_rul = final_lifetime - cycle` is never reconstructed, and an artifact with no observed labels draws nothing and says why. A `rul_scalar` run gets no warning, only a collapsed caption stating that one estimate per cell means no cycle-wise curve. | `IMPLEMENTED-STATIC` | `batteryml_web/agent/result_views.py` (`build_rul_cycle_view`, `RUL_SCALAR_CURVE_NOTE`), `batteryml_web/ui/run_history.py` (`render_rul_cycle_figure`) |
+| `RES-04` | Every schema dispatch site handles every category, so a working result cannot silently lose its figures by falling through to "cannot be visualized". | `IMPLEMENTED-STATIC` | `batteryml_web/ui/run_history.py`, `batteryml_web/ui/agent_workflow.py`, `batteryml_web/agent/artifact_preview.py` |
+
+### Notes on the RES group
+
+* Audited, not assumed: all 170 RUL configs across 23 models use
+  `RULLabelAnnotator`, which subclasses `BaseLabelAnnotator` rather than
+  `BaseCycleLabelAnnotator`, so `Task.is_cycle_level` is False and every RUL
+  run takes the `SampleIndex.for_whole_cells` branch. The only registered
+  cycle-level annotator is `CycleSOHLabelAnnotator`.
+* Therefore: **cycle-wise RUL visualization is implemented, but no current
+  production RUL artifact emits the required per-cell, per-cycle RUL schema.**
+  The capability is dormant against real artifacts and exercised only by the
+  synthetic fixtures. No RUL model training was changed to make a curve
+  appear.
+* That conclusion is asserted by
+  `tests/test_rul_cycle_views.py::TestTheProductionRulArtifactAudit`, so it
+  fails a test rather than going quietly stale. The day a cycle-level RUL
+  annotator is added, that failure is the signal the feature can come out of
+  dormancy.
+* `RES-01` amends the `sample_index`-only rule `SOH-12` described. Under that
+  rule a whole-cell RUL artifact — which now carries an index of `-1`
+  sentinels — classified as a cycle-level SOH result.
+
 
 `RUN-04` deliberately does **not** claim multi-GPU execution. A multi-GPU
 selection is still preserved as `{"mode": "multi_gpu", "gpu_ids": [...]}`,
@@ -372,7 +409,11 @@ were made in the authoring container, not on the server, so the rows stay
 run, says which module owns which decision, and carries the command block the
 user runs on the server to turn any of these rows into `VERIFIED`.
 `docs/GPU_MULTI_GPU_AUDIT.md` carries the device and parallelism audit behind
-the `GPU` group.
+the `GPU` group. `docs/RUN_PROGRESS.md` carries the progress contract behind
+`UX-12` — which line of BatteryML each stage name comes from, and which two
+boundaries are inferred and why. `docs/RESULT_SCHEMAS.md` carries the schema
+rule behind the `RES` group, including the four tempting classifiers it
+refuses and the fixture that would fool each one.
 
 ---
 
@@ -381,4 +422,26 @@ the `GPU` group.
 Record here any requirement found to be wrong or impossible, with the proposed
 change, rather than implementing something different.
 
-*(none yet)*
+### `SOH-12` — "the schema is decided from the recorded `sample_index`"
+
+**Found wrong.** `SOH-12` said a result's schema is decided from the presence
+of a `sample_index`. That was true when only a cycle-level task wrote one.
+`Task.build` now writes `SampleIndex.for_whole_cells` for a whole-cell run
+too (`batteryml/task.py:102`), stamping every row with
+`cycle_index = -1` — so under the old rule **every RUL artifact classified as
+a cycle-level SOH result**, and would have been drawn with SOH axes and
+per-cell curves.
+
+**Amended, not replaced.** `RES-01` and `RES-02` keep the part of `SOH-12`
+that was right — the schema comes from what the artifact records about itself,
+never from the numbers — and fix the part that was not: the decision now reads
+the recorded *task* and the *granularity* separately, and treats the
+whole-cell sentinel as what it is. `SOH-12`'s text has been updated to point
+at `RES-01`. Its other claims (per-cell curves, the range check, nothing
+clipped) are unchanged.
+
+### `SOH-11` — "it is the only entry the SOH catalog offers"
+
+**Superseded, not wrong.** True when written; `SOH-13` adds the four audited
+baselines beside Ridge. `SOH-11`'s text now says so rather than standing as a
+claim the catalog no longer satisfies.

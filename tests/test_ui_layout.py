@@ -589,18 +589,34 @@ class TestSidebarIsCompact(unittest.TestCase):
         )
 
     def test_the_sidebar_captions_are_short_enough_not_to_need_clipping(self) -> None:
-        """Shortened copy, not CSS that hides wrapped text."""
+        """Shortened copy, not CSS that hides wrapped text.
+
+        ``description`` is optional — an entry may carry none at all — but an
+        entry that does carry one may not carry an empty string, which would
+        draw a caption container with nothing in it.
+        """
         from batteryml_web.ui import workflow_sidebar
 
+        described = 0
         for step in workflow_sidebar.NAV_STEPS:
             with self.subTest(step=step["key"]):
+                if "description" not in step:
+                    continue
                 description = str(step["description"])
-                self.assertTrue(description)
+                self.assertTrue(
+                    description,
+                    f"{step['key']} declares an empty description; drop the key "
+                    "instead, so no caption is drawn at all",
+                )
+                described += 1
                 self.assertLessEqual(
                     len(description), 80,
                     f"{step['key']}'s caption is long enough to wrap to three "
                     "lines in a 300px sidebar; shorten it rather than clipping it",
                 )
+        # Non-vacuity: if every description were dropped the loop above would
+        # pass without checking a single string.
+        self.assertGreater(described, 0, "no navigation entry carries a description")
 
     def test_nothing_clips_overflowing_text(self) -> None:
         """A hidden caption is worse than a tall one."""
@@ -671,23 +687,30 @@ class _SidebarRecorder:
 
 
 class TestSidebarStructure(unittest.TestCase):
-    """The rules that remain mark real boundaries; the others are gone.
+    """One rule, in the one place a boundary exists.
 
-    Three dividers around the header, Home and Agent Workflow said "a
-    different kind of thing follows" three times for boundaries that do not
-    exist — those four entries are one block. The rules that stay separate
-    the numbered protocol list, the Prev/Next pair, settings, and status.
+    Every divider that used to sit around the header, Home, Agent Workflow,
+    Prev/Next, settings and the status line said "a different kind of thing
+    follows" about boundaries that are not there: a list and its own
+    Prev/Next controls are one thing, and so are a single-line settings
+    control and a single-line status readout. The rule that remains marks
+    the real boundary — the two ways in, then the numbered protocol route.
     """
 
-    def _render(self) -> list[tuple[str, str]]:
+    def _render(self, current_step: str = "home") -> list[tuple[str, str]]:
         from batteryml_web.ui import workflow_sidebar as sidebar
 
-        recorder = _SidebarRecorder({"current_step": "home"})
+        recorder = _SidebarRecorder({"current_step": current_step})
         saved = (sidebar.st, sidebar.render_layout_css,
                  sidebar.render_sidebar_settings)
         sidebar.st = recorder
         sidebar.render_layout_css = lambda: None
-        sidebar.render_sidebar_settings = lambda: None
+        # Recorded rather than dropped: "no rule immediately above Settings"
+        # is a statement about where Settings sits in the sequence, so the
+        # sequence has to contain it.
+        sidebar.render_sidebar_settings = lambda: recorder.sequence.append(
+            ("settings", "")
+        )
         try:
             sidebar.render_sidebar_workflow()
         finally:
@@ -704,16 +727,112 @@ class TestSidebarStructure(unittest.TestCase):
         # uninterrupted block.
         self.assertNotIn("divider", kinds[:agent + 1])
 
-    def test_the_protocol_list_and_the_blocks_after_it_keep_their_rules(self) -> None:
+    def test_the_only_rule_is_the_one_above_the_protocol_list(self) -> None:
         sequence = self._render()
         kinds = [kind for kind, _ in sequence]
         labels = [text for _, text in sequence]
         heading = labels.index("**Protocol Workflow**")
         # A rule immediately precedes the numbered list: that boundary is
         # real, and losing it would be the opposite regression.
-        self.assertEqual(kinds[heading - 1], "divider")
-        # Prev/Next, settings and status each still get one.
-        self.assertEqual(kinds.count("divider"), 4)
+        self.assertEqual(
+            kinds[heading - 1], "divider",
+            "the rule above the Protocol Workflow heading is the one that "
+            "marks a real boundary; it may not be removed with the others",
+        )
+        self.assertEqual(
+            kinds.count("divider"), 1,
+            "the sidebar draws exactly one rule; found "
+            f"{kinds.count('divider')} at indices "
+            f"{[i for i, k in enumerate(kinds) if k == 'divider']}",
+        )
+
+    def test_no_rule_sits_immediately_above_settings(self) -> None:
+        """The rule the user asked for by name.
+
+        Asserted positionally rather than by counting, so it keeps holding if
+        a rule is ever added back somewhere else in the sidebar.
+        """
+        sequence = self._render()
+        kinds = [kind for kind, _ in sequence]
+        self.assertIn("settings", kinds, "the settings block is no longer drawn")
+        settings = kinds.index("settings")
+        self.assertNotEqual(
+            kinds[settings - 1], "divider",
+            "a rule is drawn immediately above Settings",
+        )
+
+    def test_no_rule_sits_immediately_above_prev_next_or_the_llm_status(self) -> None:
+        sequence = self._render()
+        kinds = [kind for kind, _ in sequence]
+        labels = [text for _, text in sequence]
+        prev = labels.index("← Prev")
+        self.assertNotEqual(
+            kinds[prev - 1], "divider",
+            "a rule is drawn immediately above the Prev/Next pair",
+        )
+        status = next(
+            index for index, text in enumerate(labels) if text.startswith("<div") and "LLM:" in text
+        )
+        self.assertNotEqual(
+            kinds[status - 1], "divider",
+            "a rule is drawn immediately above the LLM status line",
+        )
+
+    def test_the_helper_copy_the_brief_named_is_gone(self) -> None:
+        """Both strings, checked against what is actually drawn.
+
+        Home's caption only appears while Home is the current step, so the
+        sidebar is rendered on both pages rather than once.
+        """
+        removed = (
+            "Create/load a project or start a workflow.",
+            "The manual route; works offline, with no API key.",
+        )
+        for step in ("home", "agent_workflow"):
+            drawn = [text for _, text in self._render(current_step=step)]
+            for copy in removed:
+                with self.subTest(step=step, copy=copy):
+                    self.assertNotIn(
+                        copy, drawn,
+                        f"{copy!r} is still drawn in the sidebar on {step}",
+                    )
+
+    def test_the_helper_copy_is_not_replaced_by_another_paragraph(self) -> None:
+        """Removed, not reworded.
+
+        Home carries no caption of its own at all now, and the Protocol
+        Workflow heading is followed straight by its first numbered step.
+        """
+        from batteryml_web.ui import workflow_sidebar as sidebar
+
+        home = next(step for step in sidebar.NAV_STEPS if step["key"] == "home")
+        self.assertNotIn(
+            "description", home,
+            "Home carries a caption again; the brief removed it rather than "
+            "asking for shorter copy",
+        )
+
+        sequence = self._render()
+        labels = [text for _, text in sequence]
+        kinds = [kind for kind, _ in sequence]
+        heading = labels.index("**Protocol Workflow**")
+        self.assertNotEqual(
+            kinds[heading + 1], "caption",
+            f"a caption follows the Protocol Workflow heading: {labels[heading + 1]!r}",
+        )
+
+    def test_the_agent_entry_keeps_the_one_description_that_carries_a_promise(self) -> None:
+        """Requirement 6: one short description may stay where it adds value.
+
+        Agent Workflow's says nothing runs until Run is pressed — the
+        execution contract from CLAUDE.md §3, which the label cannot carry.
+        """
+        from batteryml_web.ui import workflow_sidebar as sidebar
+
+        agent = sidebar.AGENT_STEPS[0]
+        description = agent.get("description", "")
+        self.assertIn("Run", description)
+        self.assertLessEqual(len(description), 80)
 
     def test_every_navigation_entry_is_still_reachable(self) -> None:
         """Non-vacuity: removing rules must not remove destinations."""

@@ -214,6 +214,9 @@ ERROR_TAIL_CHARS = 20000
 PROGRESS_REDRAW_INTERVAL_S = 0.25
 #: How many trailing output lines the live log shows while a run is going.
 LIVE_LOG_LINES = 12
+#: Label of the disclosure the raw stdout/stderr lives behind. The primary
+#: view is one structured state; the untouched output stays one click away.
+TECHNICAL_LOG_LABEL = "Technical log (raw output)"
 #: The two compute modes, as the user picks them.
 COMPUTE_MODES: tuple[str, str] = ("CPU", "GPU")
 COMPUTE_LABEL = "Compute device"
@@ -652,6 +655,87 @@ def progress_caption(
     )
 
 
+def is_heartbeat(event: dict[str, Any]) -> bool:
+    """Whether one progress event is the periodic "still alive" tick.
+
+    The ``heartbeat`` flag is authoritative. The message is checked as a
+    fallback because a snapshot can outlive the code that produced it: the
+    RunManager stores whatever event it was handed, so an event written
+    before the flag existed — by a run still in flight across a restart —
+    would otherwise be redrawn as a real stage change and logged as output.
+    """
+    if event.get("heartbeat"):
+        return True
+    return str(event.get("message") or "") == HEARTBEAT_MESSAGE
+
+
+def progress_view(
+    event: dict[str, Any],
+    elapsed_s: float,
+    timer: EpochTimer,
+) -> dict[str, Any]:
+    """What the progress UI should draw for one event. Pure; no Streamlit.
+
+    Separated from the drawing so the decision — bar or spinner, which
+    percentage, which ETA — can be tested without a browser, and so the two
+    places that draw progress (the in-page live run and the polled fragment)
+    cannot drift apart.
+
+    Returns:
+        ``caption`` — the one-line status;
+        ``fraction`` — ``current / total`` when the run printed a counter,
+        else ``None``. A bar is drawn only for a float, and the value is
+        always the parsed counter, never a stand-in for "something is
+        happening";
+        ``determinate`` — whether a bar should be drawn at all;
+        ``counter`` — ``(current, total)`` or ``None``.
+
+    The counter is read from the event and nothing else. A stage with no
+    denominator produces ``fraction=None`` and the caller shows a spinner and
+    an elapsed time, which is the honest rendering of "no idea how much is
+    left".
+    """
+    stage = str(event.get("stage") or "")
+    current = event.get("current")
+    total = event.get("total")
+    has_counter = (
+        isinstance(current, int)
+        and not isinstance(current, bool)
+        and isinstance(total, int)
+        and not isinstance(total, bool)
+        and total > 0
+    )
+    timer.observe(current, total, elapsed_s, stage=stage)
+    eta = timer.eta_seconds() if has_counter else None
+
+    fraction = event.get("fraction")
+    # bool is an int subclass; True must never be read as 100%.
+    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+        fraction = None
+    elif not has_counter:
+        # A fraction with no counter behind it would be a percentage the run
+        # did not report. Refused rather than displayed.
+        fraction = None
+    else:
+        fraction = min(max(float(fraction), 0.0), 1.0)
+
+    return {
+        "caption": progress_caption(
+            stage,
+            current if has_counter else None,
+            total if has_counter else None,
+            elapsed_s,
+            eta_s=eta,
+            # A counter exists but has not produced enough completed units to
+            # time yet: say so instead of guessing.
+            estimating=has_counter and eta is None,
+        ),
+        "fraction": fraction,
+        "determinate": fraction is not None,
+        "counter": (current, total) if has_counter else None,
+    }
+
+
 class _LiveProgress:
     """Renders backend progress events into three Streamlit placeholders.
 
@@ -676,7 +760,14 @@ class _LiveProgress:
 
     def on_event(self, event: dict[str, Any]) -> None:
         message = str(event.get("message") or "")
-        if event.get("type") in ("output", "training_progress") and message:
+        # A heartbeat repeats the last state and adds nothing to a log; only
+        # its timing matters, and that is read from the clock below.
+        heartbeat = is_heartbeat(event)
+        if (
+            not heartbeat
+            and event.get("type") in ("output", "training_progress")
+            and message
+        ):
             self._lines.append(message)
             del self._lines[:-LIVE_LOG_LINES]
 
@@ -684,7 +775,7 @@ class _LiveProgress:
         now = time.monotonic()
         forced = (
             event.get("type") == "completed"
-            or (stage and stage != self._stage and message != HEARTBEAT_MESSAGE)
+            or (stage and stage != self._stage and not heartbeat)
         )
         if not forced and (now - self._last_draw) < PROGRESS_REDRAW_INTERVAL_S:
             return
@@ -694,31 +785,19 @@ class _LiveProgress:
 
     def _draw(self, event: dict[str, Any]) -> None:
         elapsed = time.monotonic() - self._started
-        self._timer.observe(event.get("current"), event.get("total"), elapsed)
-        eta = self._timer.eta_seconds()
-        has_counter = isinstance(event.get("current"), int) and isinstance(
-            event.get("total"), int
-        )
-        caption = progress_caption(
-            str(event.get("stage") or ""),
-            event.get("current"),
-            event.get("total"),
-            elapsed,
-            eta_s=eta,
-            # A counter exists but has not produced enough completed units to
-            # time yet: say so instead of guessing.
-            estimating=has_counter and eta is None,
-        )
+        view = progress_view(event, elapsed, self._timer)
         if event.get("stage") == STAGE_FAILED:
-            self._status.error(caption)
+            self._status.error(view["caption"])
         else:
-            self._status.info(caption)
-        fraction = event.get("fraction")
-        # bool is an int subclass; True must never be read as 100%.
-        if isinstance(fraction, (int, float)) and not isinstance(fraction, bool):
-            self._bar.progress(min(max(float(fraction), 0.0), 1.0))
+            self._status.info(view["caption"])
+        if view["determinate"]:
+            self._bar.progress(view["fraction"])
         if self._lines:
-            self._log.code("\n".join(self._lines), language="text")
+            # Behind a disclosure: the structured line above is the primary
+            # view, and the raw output stays available without being it.
+            with self._log.container():
+                with st.expander(TECHNICAL_LOG_LABEL, expanded=False):
+                    st.code("\n".join(self._lines), language="text")
 
 
 def _render_execution_status(
@@ -1418,29 +1497,28 @@ def _render_active_run(
             return
         event = current.get("event") or {}
         elapsed = float(current.get("elapsed_s") or 0.0)
-        timer = _progress_timer(run_id)
-        timer.observe(event.get("current"), event.get("total"), elapsed)
-        eta = timer.eta_seconds()
-        has_counter = isinstance(event.get("current"), int) and isinstance(
-            event.get("total"), int
-        )
-        st.caption(
-            progress_caption(
-                str(event.get("stage") or ""),
-                event.get("current"),
-                event.get("total"),
-                elapsed,
-                eta_s=eta,
-                estimating=has_counter and eta is None,
-            )
-        )
-        fraction = event.get("fraction")
-        if isinstance(fraction, (int, float)):
-            # Drawn only when the run itself reported a counter.
-            st.progress(min(max(float(fraction), 0.0), 1.0))
+        view = progress_view(event, elapsed, _progress_timer(run_id))
+        if view["determinate"]:
+            # A real bar, drawn only from the counter the run printed. The
+            # caption carries the same counter as "current / total", so the
+            # bar's position is always checkable against a number.
+            st.progress(view["fraction"], text=view["caption"])
+        else:
+            # No denominator exists for this stage, so there is nothing to
+            # fill. A status with a spinner says "working" without implying
+            # an amount; st.progress would have to be given a number, and any
+            # number here would be invented.
+            st.status(view["caption"], state="running", expanded=False)
         tail = current.get("tail") or []
         if tail:
-            st.code("\n".join(str(line) for line in tail[-LIVE_LOG_LINES:]), language="text")
+            # One click away, never the primary display. The manager already
+            # keeps heartbeats out of the tail, so this is the run's own
+            # output rather than hundreds of repetitions of "Running.".
+            with st.expander(TECHNICAL_LOG_LABEL, expanded=False):
+                st.code(
+                    "\n".join(str(line) for line in tail[-LIVE_LOG_LINES:]),
+                    language="text",
+                )
         if current.get("finished"):
             # A full-app rerun (the default scope), not a fragment-scoped
             # one: the outer branch has to see the terminal snapshot to
@@ -1490,13 +1568,16 @@ def _render_result_figures(result_context: dict[str, Any] | None) -> None:
     if not predictions_file:
         return
     from ..agent.result_views import (
+        RUL_CYCLEWISE_SCHEMA,
         RUL_SCHEMA,
+        SCALAR_SCHEMAS,
         SOH_SCHEMA,
         TRAJECTORY_SCHEMA,
         load_view,
     )
     from .run_history import (
         render_prediction_table,
+        render_rul_cycle_figure,
         render_rul_figures,
         render_soh_figures,
         render_trajectory_figure,
@@ -1511,8 +1592,12 @@ def _render_result_figures(result_context: dict[str, Any] | None) -> None:
             "metrics above are unaffected."
         )
         return
-    if views["schema"] == RUL_SCHEMA:
+    if views["schema"] in SCALAR_SCHEMAS:
         render_rul_figures(views["rul"])
+        # Only for a RUL-family artifact, and drawn only when that artifact
+        # genuinely holds per-cell, per-cycle remaining-life estimates.
+        if views["schema"] in (RUL_SCHEMA, RUL_CYCLEWISE_SCHEMA):
+            render_rul_cycle_figure(views["rul_cycles"])
         render_prediction_table(views["rul"])
     elif views["schema"] == SOH_SCHEMA:
         # A cycle-level result: per-cell curves and the range diagnostic, and

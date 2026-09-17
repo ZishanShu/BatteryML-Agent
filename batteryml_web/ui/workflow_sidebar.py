@@ -24,12 +24,18 @@ from .styles import render_layout_css
 #: Ordered for Prev/Next. ``group`` decides where a step is drawn:
 #: ``home`` at the top, ``agent`` in its own block, ``workflow`` in the
 #: numbered protocol list. ``step_no`` exists only for ``workflow`` steps.
+#:
+#: ``description`` is optional. An entry whose label already says what it is
+#: does not get a caption repeating it: "Home" needs no gloss, and the copy
+#: that used to sit under it described the Home *page*, not the navigation
+#: entry. A description earns its place only by carrying something the label
+#: cannot — Agent Workflow's keeps the execution contract ("nothing runs
+#: until you press Run"), which is a promise, not a restatement.
 NAV_STEPS = [
     {
         "key": "home",
         "label": "Home",
         "emoji": "🏠",
-        "description": "Create/load a project or start a workflow.",
         "group": "home",
     },
     {
@@ -142,11 +148,16 @@ def _nav_button(step: dict, current_step: str) -> None:
 
     The current entry is marked by weight alone. A caret prefix decorated
     the label without saying anything the bold text did not.
+
+    A step with no ``description`` gets no caption at all — not an empty one,
+    which would still cost a line box.
     """
     label = nav_label(step)
     if current_step == step["key"]:
         st.markdown(f"**{label}**")
-        st.caption(step["description"])
+        description = step.get("description")
+        if description:
+            st.caption(description)
     else:
         if st.button(label, key=f"sidebar_go_{step['key']}", use_container_width=True):
             set_current_step(step["key"])
@@ -163,12 +174,14 @@ def render_sidebar_workflow():
         st.markdown("**Current project**")
         st.caption(current_project_label())
 
-        # No rule between the header, Home and Agent Workflow. A divider
-        # says "a different kind of thing follows", and three of them around
-        # two single-line entries said it three times for no boundary that
-        # exists: the header, the project, Home and Agent Workflow are one
-        # block. The rules that remain mark real boundaries — the numbered
-        # protocol list, the Prev/Next pair, settings and status.
+        # Exactly one rule in the whole sidebar, immediately above the
+        # numbered protocol list. A divider says "a different kind of thing
+        # follows"; the only place that is true here is the boundary between
+        # the two ways in (Home, Agent Workflow) and the numbered route. The
+        # rules that used to sit above Prev/Next, above settings and above
+        # the status line separated a list from its own controls, and a
+        # single-line control from a single-line readout — boundaries that
+        # do not exist. Vertical rhythm does that work now.
         current_step = st.session_state.get("current_step", "home")
         _nav_button(NAV_STEPS[0], current_step)
         for step in AGENT_STEPS:
@@ -176,11 +189,9 @@ def render_sidebar_workflow():
 
         st.divider()
         st.markdown("**Protocol Workflow**")
-        st.caption("The manual route; works offline, with no API key.")
         for step in WORKFLOW_STEPS:
             _nav_button(step, current_step)
 
-        st.divider()
         idx = get_current_step_index()
         prev_col, next_col = st.columns(2)
         with prev_col:
@@ -190,10 +201,8 @@ def render_sidebar_workflow():
             if st.button("Next →", disabled=(idx == len(NAV_STEPS) - 1), use_container_width=True, key="sidebar_next_step"):
                 set_current_step(NAV_STEPS[idx + 1]["key"])
 
-        st.divider()
         render_sidebar_settings()
 
-        st.divider()
         label, color = llm_status_badge()
         st.markdown(
             f"<div style='font-size:0.9rem; color:{color}; font-weight:600;'>LLM: {label}</div>",

@@ -403,7 +403,9 @@ def _render_scientific_views(manifest: Dict[str, Any]) -> None:
     not carry the needed values gets the reason rather than a chart.
     """
     from ..agent.result_views import (
+        RUL_CYCLEWISE_SCHEMA,
         RUL_SCHEMA,
+        SCALAR_SCHEMAS,
         SOH_SCHEMA,
         TRAJECTORY_SCHEMA,
         load_view,
@@ -425,8 +427,13 @@ def _render_scientific_views(manifest: Dict[str, Any]) -> None:
         )
         return
 
-    if views["schema"] == RUL_SCHEMA:
+    if views["schema"] in SCALAR_SCHEMAS:
         render_rul_figures(views["rul"])
+        # The cycle curve is drawn only for the schema that genuinely carries
+        # per-cell, per-cycle estimates; for a per-cell lifetime result the
+        # view refuses itself and the renderer says so quietly.
+        if views["schema"] in (RUL_SCHEMA, RUL_CYCLEWISE_SCHEMA):
+            render_rul_cycle_figure(views["rul_cycles"])
         render_prediction_table(views["rul"])
     elif views["schema"] == SOH_SCHEMA:
         render_soh_figures(views["soh"])
@@ -500,6 +507,55 @@ def render_rul_figures(view: Dict[str, Any]) -> None:
             axes.set_ylabel("Residual")
 
         st.pyplot(_figure(_residuals), clear_figure=True)
+
+
+def render_rul_cycle_figure(view: Dict[str, Any], *, max_cells: int = 6) -> None:
+    """Remaining useful life against the cycle each estimate was made at.
+
+    Drawn only for an artifact that genuinely holds repeated RUL estimates
+    for the same cell at several observed cycles. For a per-cell lifetime
+    result the view refuses itself, and this draws the refusal as a quiet
+    caption inside a closed disclosure rather than a warning: nothing is
+    wrong with such a run, and there is nothing for the reader to fix.
+
+    One line pair per cell, never a single series across cells: the view
+    hands over per-cell entries precisely so two cells cannot be joined.
+    """
+    if not view.get("available"):
+        reason = str(view.get("reason") or "")
+        if reason:
+            with st.expander("Cycle-wise RUL curve", expanded=False):
+                st.caption(reason)
+        return
+    if view.get("note"):
+        st.caption(str(view["note"]))
+
+    cells = view.get("cells") or []
+    st.caption(
+        f"{view['count']:,} remaining-life estimate(s) across "
+        f"{view.get('n_cells', 0)} test cell(s); "
+        f"first {min(len(cells), max_cells)} shown."
+    )
+
+    def _curves(axes) -> None:
+        for position, cell in enumerate(cells[:max_cells]):
+            # Each cell is plotted from its own arrays, so no line can span
+            # two cells. The view already sorted the cycles ascending.
+            axes.plot(
+                cell["cycles"], cell["observed"],
+                linewidth=1,
+                label="observed / true RUL" if position == 0 else None,
+            )
+            axes.plot(
+                cell["cycles"], cell["predicted"],
+                linewidth=1, linestyle="--",
+                label="estimated RUL" if position == 0 else None,
+            )
+        axes.set_xlabel("Observed cycle")
+        axes.set_ylabel("Remaining useful life (cycles)")
+        axes.legend(loc="best", fontsize="small")
+
+    st.pyplot(_figure(_curves), clear_figure=True)
 
 
 def render_soh_figures(view: Dict[str, Any], *, max_cells: int = 6) -> None:
@@ -901,7 +957,13 @@ def render_predictions_panel(manifest: Dict[str, Any]) -> None:
         SUPPORTED_PREVIEW_FORMATS,
         preview_prediction_file,
     )
-    from ..agent.result_views import RUL_SCHEMA, SOH_SCHEMA, TRAJECTORY_SCHEMA
+    from ..agent.result_views import (
+        RUL_CYCLEWISE_SCHEMA,
+        RUL_SCHEMA,
+        SCALAR_SCHEMAS,
+        SOH_SCHEMA,
+        TRAJECTORY_SCHEMA,
+    )
 
     files = [
         str(path)
@@ -927,8 +989,10 @@ def render_predictions_panel(manifest: Dict[str, Any]) -> None:
             hide_index=True,
             use_container_width=True,
         )
-        if preview["schema"] == RUL_SCHEMA and preview["rul"]:
+        if preview["schema"] in SCALAR_SCHEMAS and preview["rul"]:
             render_rul_figures(preview["rul"])
+            if preview["schema"] in (RUL_SCHEMA, RUL_CYCLEWISE_SCHEMA):
+                render_rul_cycle_figure(preview.get("rul_cycles") or {})
             render_prediction_table(preview["rul"])
         elif preview["schema"] == SOH_SCHEMA and preview.get("soh"):
             render_soh_figures(preview["soh"])

@@ -180,6 +180,16 @@ class RunManager:
 
         def on_event(event: Dict[str, Any]) -> None:
             message = str(event.get("message") or "")
+            # A heartbeat repeats the last observed state and says nothing
+            # new. Appending it would fill both the live tail and run.log
+            # with hundreds of identical "Running." lines and push the run's
+            # real output out of view — which is exactly what a log is for.
+            # The event itself is still stored, so elapsed time and the last
+            # counter keep updating while the run is quiet.
+            if event.get("heartbeat"):
+                with handle._lock:
+                    handle.event = dict(event)
+                return
             with handle._lock:
                 handle.event = dict(event)
                 if message:

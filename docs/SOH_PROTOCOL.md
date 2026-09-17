@@ -405,11 +405,13 @@ rows.
 
 An SOH artifact holds one scalar per *cycle sample*. Structurally that is
 indistinguishable from an RUL artifact's one scalar per cell, so the view
-layer decides which it is from the recorded `sample_index` and never from the
-numbers (`batteryml_web/agent/result_views.py`, `detect_schema`). A result
-with no index is read as RUL, as it was before; one with an index becomes the
-SOH view, whose rows name their cell and cycle and whose axes say
-*SOH (ratio)*.
+layer decides which it is from what the artifact records about itself and
+never from the numbers (`batteryml_web/agent/result_views.py`,
+`detect_schema`). It reads two independent things — the **task**, from the
+`task_metadata` the evaluation step writes, and the **granularity**, from the
+`sample_index` — and never lets one stand in for the other. An SOH result
+becomes the SOH view, whose rows name their cell and cycle and whose axes say
+*SOH (ratio)*. See `docs/RESULT_SCHEMAS.md` for the full table.
 
 Three things are drawn:
 
