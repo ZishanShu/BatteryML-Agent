@@ -37,7 +37,10 @@ def _streamlit_available() -> bool:
 
 STREAMLIT_AVAILABLE = _streamlit_available()
 
-PLACEHOLDER = "Use CPTransformer on MATR to predict battery lifetime."
+#: The generic shape Home now shows. A hardcoded example sentence used to
+#: be asserted here; both pages share one backend-derived template instead,
+#: so the only constant left is the pattern itself.
+PLACEHOLDER = "REQUEST_TEMPLATE_STRUCTURE"
 
 
 def _function(tree: ast.Module, name: str) -> ast.FunctionDef | None:
@@ -75,6 +78,23 @@ class TestHomeAgentEntry(unittest.TestCase):
         self.assertIn("Describe what you want to do", body)
         self.assertIn(PLACEHOLDER, body)
         self.assertIn("Analyze with Agent", body)
+        # Home names no model and no dataset of its own: the template comes
+        # from the same backend helper the Agent Workflow page uses.
+        self.assertIn("agent_request_template()", body)
+        for hardcoded in ("CPTransformer", "MATR", "BatLiNet", "XGBoost"):
+            self.assertNotIn(hardcoded, body)
+
+    def test_home_and_agent_workflow_share_one_request_ux(self) -> None:
+        """One template helper, not two different request affordances."""
+        entry = _function(self.tree, "render_home_agent_entry")
+        body = ast.get_source_segment(self.source, entry)
+        self.assertIn("USE_TEMPLATE_LABEL", body)
+        self.assertIn("accept_request_template", body)
+        # ...and the page imports them from the Agent Workflow module rather
+        # than carrying its own copy of the rule.
+        self.assertIn(
+            "from batteryml_web.ui.agent_workflow import", self.source
+        )
 
     def test_quick_start_and_agent_share_the_same_heading_level(self) -> None:
         home = _function(self.tree, "render_home_page")

@@ -38,7 +38,11 @@ from typing import Any
 
 import streamlit as st
 
-from ..agent.catalog import build_intent_catalog, build_request_suggestion
+from ..agent.catalog import (
+    REQUEST_TEMPLATE_STRUCTURE,
+    build_intent_catalog,
+    build_request_template,
+)
 from ..agent.execution import build_execution_plan
 from ..agent.llm_intent import (
     filter_suggestions,
@@ -151,10 +155,11 @@ PROGRESS_POLL_SECONDS = 2.0
 #: was a second way to do the same thing, and the page now offers one.
 REQUEST_LABEL = "Workflow request"
 
-#: The quiet affordance that accepts the grey suggestion. Section 4 of the
-#: milestone allows a visible control only where a key-driven one cannot be
-#: built; docs/STREAMLIT_KEYBOARD_AUDIT.md records why that is the case here.
-USE_SUGGESTION_LABEL = "Use suggestion"
+#: Fills the request box with a template drawn from this installation.
+#: Replaces the earlier Tab-to-accept idea, which no stable Streamlit API
+#: supports (docs/STREAMLIT_KEYBOARD_AUDIT.md), and the example gallery
+#: before it. One helper, not a list of curated cases.
+USE_TEMPLATE_LABEL = "Use template"
 #: Session key holding the canonical request text. One key, written by
 #: typing and by accepting the suggestion alike (milestone section 6).
 REQUEST_STATE_KEY = "agent_original_request"
@@ -163,9 +168,10 @@ REQUEST_STATE_KEY = "agent_original_request"
 #: suggestion has to write it before the widget is instantiated.
 REQUEST_WIDGET_KEY = "agent_request_input"
 
-#: Set by the accept button, consumed on the next run. A one-shot flag, not
-#: a second request state: the text it produces goes into REQUEST_STATE_KEY.
-ACCEPT_SUGGESTION_KEY = "agent_accept_suggestion"
+#: Set by the template button, consumed on the next run. A one-shot flag,
+#: not a second request state: the text it produces goes into
+#: REQUEST_STATE_KEY, the same key typing writes.
+USE_TEMPLATE_KEY = "agent_use_template"
 #: Exact wording milestone A requires wherever a smoke run is offered or shown.
 SMOKE_CHECKBOX_LABEL = SMOKE_NOTICE
 #: Raw stdout/stderr are display tails only; metrics never come from them.
@@ -922,37 +928,35 @@ def _analyze_request(trimmed: str) -> None:
         st.session_state["agent_explanation"] = f"LLM guidance failed: {exc}"
 
 
-def request_suggestion() -> str:
-    """The one suggestion the empty request box shows.
+def request_template() -> str:
+    """The one request template this installation offers.
 
     Derived from the live catalog and, where readiness is known, from the
-    models that are actually runnable — so the box never proposes a missing
-    dataset or a model with no config. This is request-completion UX, not a
-    second recommendation engine: the choice is "first READY dataset, first
-    model with a config for it", and the real model/task recommendation
+    models actually runnable — so the filled sentence names nothing this
+    platform cannot run. It is a sentence pattern, not a curated example and
+    not a second recommendation engine: the real model/task recommendation
     stays with the agent backend.
 
-    Cached per session because it is a hint, not a live readout, and
-    rebuilding the catalog on every rerun would cost more than it is worth.
+    Cached per session because it is an input aid, not a live readout.
     """
-    cached = st.session_state.get("agent_request_suggestion")
+    cached = st.session_state.get("agent_request_template")
     if isinstance(cached, str) and cached:
         return cached
     context = st.session_state.get("agent_workflow_context")
     runnable = runnable_model_keys(context) if isinstance(context, dict) else None
-    suggestion = build_request_suggestion(build_intent_catalog(), runnable_keys=runnable)
-    st.session_state["agent_request_suggestion"] = str(suggestion)
-    return str(suggestion)
+    template = build_request_template(build_intent_catalog(), runnable_keys=runnable)
+    st.session_state["agent_request_template"] = str(template)
+    return str(template)
 
 
-def accept_suggestion(suggestion: str, current_request: str) -> bool:
-    """Whether accepting ``suggestion`` should overwrite the request field.
+def accept_template(template: str, current_request: str) -> bool:
+    """Whether filling with ``template`` may overwrite the request field.
 
-    Pure, so the rule is testable without Streamlit. Accepting is allowed
-    only into an empty field: text the user typed is never overwritten by a
-    suggestion, however they trigger the acceptance.
+    Pure, so the rule is testable without Streamlit. Filling is allowed only
+    into an empty field: text the user typed is never overwritten, however
+    the fill was triggered.
     """
-    return bool(str(suggestion or "").strip()) and not str(current_request or "").strip()
+    return bool(str(template or "").strip()) and not str(current_request or "").strip()
 
 
 def _reserved_run_id(
@@ -1257,40 +1261,42 @@ def render_agent_workflow() -> None:
     # One request control. The suggestion is grey placeholder text while the
     # field is empty: it is a hint, not the user's request, and nothing is
     # analysed or executed until Analyze is pressed.
-    suggestion = request_suggestion()
+    template = request_template()
 
-    # Accepting is applied *here*, before the text area is instantiated.
+    # The fill is applied *here*, before the text area is instantiated.
     # A keyed widget takes its content from its own session key, and that key
     # may only be written before the widget exists; writing it afterwards (or
     # popping it and relying on ``value=``) leaves the box empty, which is
     # exactly what a browser check of the first attempt showed.
-    if st.session_state.pop(ACCEPT_SUGGESTION_KEY, False):
-        # Re-checked here, against the value the widget actually committed.
+    if st.session_state.pop(USE_TEMPLATE_KEY, False):
+        # Re-checked against the value the widget actually committed.
         # Streamlit commits a text area on blur, so a user can be typing
-        # while the accept control is still on screen; clicking it then
-        # blurs the box and commits their text. Without this second check
-        # that text would be overwritten — which a browser check caught.
+        # while the helper is still on screen; clicking it then blurs the box
+        # and commits their text. Without this second check that text would
+        # be overwritten — which a browser check caught.
         committed = str(st.session_state.get(REQUEST_WIDGET_KEY, "") or "")
-        if accept_suggestion(suggestion, committed):
-            st.session_state[REQUEST_STATE_KEY] = suggestion
-            st.session_state[REQUEST_WIDGET_KEY] = suggestion
+        if accept_template(template, committed):
+            st.session_state[REQUEST_STATE_KEY] = template
+            st.session_state[REQUEST_WIDGET_KEY] = template
 
     request = st.text_area(
         REQUEST_LABEL,
         value=st.session_state.get(REQUEST_STATE_KEY, ""),
-        placeholder=suggestion,
+        # The generic shape, so the box teaches the pattern without
+        # pretending a curated example is waiting there.
+        placeholder=REQUEST_TEMPLATE_STRUCTURE,
         key=REQUEST_WIDGET_KEY,
         height=90,
     )
-    if accept_suggestion(suggestion, request):
+    if accept_template(template, request):
         # Only reachable while the field is empty, so typed text can never be
-        # overwritten. See docs/STREAMLIT_KEYBOARD_AUDIT.md for why this is a
-        # button rather than the Tab key.
-        if st.button(USE_SUGGESTION_LABEL, key="agent_use_suggestion"):
+        # overwritten. A button rather than the Tab key: see
+        # docs/STREAMLIT_KEYBOARD_AUDIT.md.
+        if st.button(USE_TEMPLATE_LABEL, key="agent_use_template"):
             # Only records the intent and reruns; the write happens above, on
             # the next run, before the widget is built. Filling the box is all
             # it does: no analysis, no LLM call, no plan, no execution.
-            st.session_state[ACCEPT_SUGGESTION_KEY] = True
+            st.session_state[USE_TEMPLATE_KEY] = True
             st.rerun()
     if st.button("Analyze", key="agent_analyze", use_container_width=True):
         if not str(request or "").strip():

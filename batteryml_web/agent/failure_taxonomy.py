@@ -65,8 +65,15 @@ _AUTH_MARKERS = (
 _TIMEOUT_MARKERS = (
     re.compile(r"timed? ?out", re.IGNORECASE),
     re.compile(r"\bconnection (refused|reset|error|aborted)\b", re.IGNORECASE),
+    # The errno the server actually reports when it has no route out — the
+    # observed symptom that motivated this classification, and the one a
+    # "connection failed" message told the user nothing about.
+    re.compile(r"network is unreachable", re.IGNORECASE),
+    re.compile(r"no route to host", re.IGNORECASE),
+    re.compile(r"\bunreachable\b", re.IGNORECASE),
     re.compile(r"name or service not known", re.IGNORECASE),
     re.compile(r"temporary failure in name resolution", re.IGNORECASE),
+    re.compile(r"failed to establish a new connection", re.IGNORECASE),
     re.compile(r"\b(502|503|504)\b"),
 )
 
@@ -273,9 +280,12 @@ def classify_llm_failure(
         return _finding(
             CATEGORY_LLM_TIMEOUT,
             "The assistant could not be reached.",
-            "The request timed out or the endpoint could not be contacted.",
-            "Check the endpoint and the network, then try again. The "
-            "deterministic workflow continues to work offline.",
+            "The request timed out or the endpoint could not be contacted "
+            "from this machine.",
+            "Check the Base URL, and whether this server is allowed to reach "
+            "it — a training server often has no outbound internet access, "
+            "which looks exactly like this. The deterministic workflow "
+            "continues to work offline either way.",
             evidence_line=text[:400],
         )
     return _finding(

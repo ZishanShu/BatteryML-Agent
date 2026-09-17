@@ -39,6 +39,9 @@ from tests.test_readiness import (  # noqa: E402
 from batteryml_web.agent.results import SMOKE_RUN_WARNING  # noqa: E402
 from batteryml_web.agent.run_policy import SMOKE_NOTICE  # noqa: E402
 from batteryml_web.core import device_inventory as di  # noqa: E402
+from batteryml_web.agent.catalog import (  # noqa: E402
+    REQUEST_TEMPLATE_STRUCTURE,
+)
 from batteryml_web.core.run_identity import is_run_id  # noqa: E402
 from batteryml_web.core.project_context import (  # noqa: E402
     agent_workspace,
@@ -1584,14 +1587,14 @@ class TestLlmAssistedIntentInTheUi(unittest.TestCase):
 
 
 class TestRequestAreaIsOneControl(unittest.TestCase):
-    """The tabs and the example gallery are gone; one suggestion remains."""
+    """One box, one template helper: no tabs, no gallery, no key hooks."""
 
-    SUGGESTION = "Use CPTransformer on MATR to predict battery lifetime."
+    TEMPLATE = "Use CPTransformer on MATR to predict battery lifetime."
 
     def setUp(self) -> None:
         self._real_resolve = ui.resolve_workflow_intent_with_llm
         self._real_catalog = ui.build_intent_catalog
-        self._real_suggestion = ui.build_request_suggestion
+        self._real_template = ui.build_request_template
         self._real_stream = ui.execute_plan_streaming
         self._real_llm = ui.is_llm_configured
         self.analysed: list[str] = []
@@ -1599,22 +1602,22 @@ class TestRequestAreaIsOneControl(unittest.TestCase):
 
         def stub_resolve(request, **kwargs):
             self.analysed.append(request)
-            raise AssertionError("accepting a suggestion must not analyse")
+            raise AssertionError("using the template must not analyse")
 
         def stub_stream(plan, **kwargs):
             self.executed.append(plan)
-            raise AssertionError("accepting a suggestion must not execute")
+            raise AssertionError("using the template must not execute")
 
         ui.resolve_workflow_intent_with_llm = stub_resolve
         ui.execute_plan_streaming = stub_stream
         ui.build_intent_catalog = lambda **kw: _FAKE_CATALOG
-        ui.build_request_suggestion = lambda catalog, **kw: self.SUGGESTION
+        ui.build_request_template = lambda catalog, **kw: self.TEMPLATE
         ui.is_llm_configured = lambda: False
 
     def tearDown(self) -> None:
         ui.resolve_workflow_intent_with_llm = self._real_resolve
         ui.build_intent_catalog = self._real_catalog
-        ui.build_request_suggestion = self._real_suggestion
+        ui.build_request_template = self._real_template
         ui.execute_plan_streaming = self._real_stream
         ui.is_llm_configured = self._real_llm
 
@@ -1633,6 +1636,7 @@ class TestRequestAreaIsOneControl(unittest.TestCase):
             "_render_examples",
             "build_example_requests",
             "agent_example_requests",
+            "build_request_suggestion",
         ):
             self.assertNotIn(gone, source, f"{gone} still present in the page")
 
@@ -1640,17 +1644,21 @@ class TestRequestAreaIsOneControl(unittest.TestCase):
         fake = _render({"gpu_inventory": _FAKE_GPU_INVENTORY})
         labels = [b["label"] for b in fake.rec["buttons"]]
         # Exactly one suggestion affordance, not a list of requests.
-        self.assertEqual(labels.count(ui.USE_SUGGESTION_LABEL), 1)
+        self.assertEqual(labels.count(ui.USE_TEMPLATE_LABEL), 1)
         for label in labels:
             self.assertNotIn("帮我用", label)
 
     # --- one suggestion ------------------------------------------------
-    def test_the_empty_box_shows_one_grey_suggestion(self) -> None:
+    def test_the_empty_box_shows_the_generic_template_shape(self) -> None:
+        """The placeholder teaches the pattern, not a curated example."""
         fake = _render({"gpu_inventory": _FAKE_GPU_INVENTORY})
         areas = [a for a in fake.rec["text_areas"] if a["label"] == ui.REQUEST_LABEL]
         self.assertEqual(len(areas), 1)
-        # Grey, because it is the placeholder: a hint, not the request.
-        self.assertEqual(areas[0]["placeholder"], self.SUGGESTION)
+        self.assertEqual(areas[0]["placeholder"], REQUEST_TEMPLATE_STRUCTURE)
+        # The slots are visible in the hint; the filled values arrive only
+        # when the user asks for them.
+        for slot in ("[method]", "[dataset]", "[task]"):
+            self.assertIn(slot, areas[0]["placeholder"])
         self.assertEqual(areas[0]["value"], "")
 
     def test_the_suggestion_is_computed_once_and_cached(self) -> None:
@@ -1658,18 +1666,18 @@ class TestRequestAreaIsOneControl(unittest.TestCase):
 
         def counting(catalog, **kwargs):
             calls.append(kwargs)
-            return self.SUGGESTION
+            return self.TEMPLATE
 
-        ui.build_request_suggestion = counting
+        ui.build_request_template = counting
         session = {"gpu_inventory": _FAKE_GPU_INVENTORY}
         _render(session)
         _render(session)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(session["agent_request_suggestion"], self.SUGGESTION)
+        self.assertEqual(session["agent_request_template"], self.TEMPLATE)
 
     def test_the_page_names_no_model_or_dataset_of_its_own(self) -> None:
         source = Path(ui.__file__).read_text(encoding="utf-8")
-        block = source.split("def request_suggestion")[1].split("\ndef ")[0]
+        block = source.split("def request_template")[1].split("\ndef ")[0]
         for name in ("CPTransformer", "BatLiNet", "XGBoost", "PBT", "MATR"):
             self.assertNotIn(name, block)
 
@@ -1684,24 +1692,24 @@ class TestRequestAreaIsOneControl(unittest.TestCase):
         the widget, not only in the canonical state.
         """
         session = {"gpu_inventory": _FAKE_GPU_INVENTORY}
-        _render(session, clicked={ui.USE_SUGGESTION_LABEL})
-        self.assertTrue(session[ui.ACCEPT_SUGGESTION_KEY])
+        _render(session, clicked={ui.USE_TEMPLATE_LABEL})
+        self.assertTrue(session[ui.USE_TEMPLATE_KEY])
 
         fake = _render(session)
         # The same key manual typing writes — one state, not three.
-        self.assertEqual(session[ui.REQUEST_STATE_KEY], self.SUGGESTION)
+        self.assertEqual(session[ui.REQUEST_STATE_KEY], self.TEMPLATE)
         self.assertEqual(ui.REQUEST_STATE_KEY, "agent_original_request")
         # ...and the box itself now holds it.
-        self.assertEqual(session[ui.REQUEST_WIDGET_KEY], self.SUGGESTION)
+        self.assertEqual(session[ui.REQUEST_WIDGET_KEY], self.TEMPLATE)
         areas = [a for a in fake.rec["text_areas"] if a["label"] == ui.REQUEST_LABEL]
-        self.assertEqual(areas[0]["value"], self.SUGGESTION)
+        self.assertEqual(areas[0]["value"], self.TEMPLATE)
         # The one-shot flag is consumed, so a later rerun cannot re-accept
         # over text the user has since typed.
-        self.assertNotIn(ui.ACCEPT_SUGGESTION_KEY, session)
+        self.assertNotIn(ui.USE_TEMPLATE_KEY, session)
 
     def test_accepting_does_not_analyse_call_the_llm_or_execute(self) -> None:
         session = {"gpu_inventory": _FAKE_GPU_INVENTORY}
-        _render(session, clicked={ui.USE_SUGGESTION_LABEL})
+        _render(session, clicked={ui.USE_TEMPLATE_LABEL})
         _render(session)
         self.assertEqual(self.analysed, [])
         self.assertEqual(self.executed, [])
@@ -1715,10 +1723,10 @@ class TestRequestAreaIsOneControl(unittest.TestCase):
             ui.REQUEST_STATE_KEY: typed,
             "agent_request_input": typed,
         }
-        fake = _render(session, clicked={ui.USE_SUGGESTION_LABEL})
+        fake = _render(session, clicked={ui.USE_TEMPLATE_LABEL})
         # The accept control is not even offered once the field has content.
         labels = [b["label"] for b in fake.rec["buttons"]]
-        self.assertNotIn(ui.USE_SUGGESTION_LABEL, labels)
+        self.assertNotIn(ui.USE_TEMPLATE_LABEL, labels)
         self.assertEqual(session[ui.REQUEST_STATE_KEY], typed)
 
     def test_text_typed_before_the_click_lands_is_not_overwritten(self) -> None:
@@ -1731,19 +1739,19 @@ class TestRequestAreaIsOneControl(unittest.TestCase):
         """
         typed = "Run BatLiNet on MATR"
         session = {"gpu_inventory": _FAKE_GPU_INVENTORY}
-        _render(session, clicked={ui.USE_SUGGESTION_LABEL})
-        self.assertTrue(session[ui.ACCEPT_SUGGESTION_KEY])
+        _render(session, clicked={ui.USE_TEMPLATE_LABEL})
+        self.assertTrue(session[ui.USE_TEMPLATE_KEY])
         # The blur commits what they typed, then the accepting run happens.
         session[ui.REQUEST_WIDGET_KEY] = typed
         _render(session)
         self.assertEqual(session[ui.REQUEST_WIDGET_KEY], typed)
-        self.assertNotEqual(session.get(ui.REQUEST_STATE_KEY), self.SUGGESTION)
+        self.assertNotEqual(session.get(ui.REQUEST_STATE_KEY), self.TEMPLATE)
 
     def test_the_accept_rule_is_pure_and_refuses_a_non_empty_field(self) -> None:
-        self.assertTrue(ui.accept_suggestion(self.SUGGESTION, ""))
-        self.assertTrue(ui.accept_suggestion(self.SUGGESTION, "   "))
-        self.assertFalse(ui.accept_suggestion(self.SUGGESTION, "typed"))
-        self.assertFalse(ui.accept_suggestion("", ""))
+        self.assertTrue(ui.accept_template(self.TEMPLATE, ""))
+        self.assertTrue(ui.accept_template(self.TEMPLATE, "   "))
+        self.assertFalse(ui.accept_template(self.TEMPLATE, "typed"))
+        self.assertFalse(ui.accept_template("", ""))
 
     def test_analyze_remains_the_explicit_action(self) -> None:
         fake = _render({"gpu_inventory": _FAKE_GPU_INVENTORY})

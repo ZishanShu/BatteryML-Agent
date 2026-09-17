@@ -30,10 +30,12 @@ from typing import Any, Callable, Dict, Optional
 
 import streamlit as st
 
+from ..agent.failure_taxonomy import classify_llm_failure
 from ..agent.llm_client import test_llm_connection
 from .feedback import notify_success
 from .llm_state import (
     LLM_STATUS_CONFIGURED,
+    describe_llm_status,
     LLM_STATUS_CONNECTED,
     LLM_STATUS_FAILED,
     LLM_STATUS_NOT_CONFIGURED,
@@ -70,6 +72,42 @@ EVENT_LLM_CONNECTED = "llm_connected"
 INCOMPLETE_MESSAGE = (
     "Base URL, API key and model are all required before the connection can "
     "be tested."
+)
+
+#: Provider presets: a name and the Base URL that provider documents for its
+#: OpenAI-compatible endpoint. This is a *convenience for filling one field*,
+#: not a claim of integration — the client speaks one protocol, and any
+#: endpoint that speaks it works, including one not listed here.
+#:
+#: Model names are deliberately absent. They change faster than this file
+#: can, and a stale dropdown of model names that no longer exist is worse
+#: than a text box. The user types the model.
+PROVIDER_PRESETS: Dict[str, str] = {
+    "OpenAI": "https://api.openai.com/v1",
+    "Gemini (OpenAI-compatible)": "https://generativelanguage.googleapis.com/v1beta/openai",
+    "Claude (OpenAI-compatible)": "https://api.anthropic.com/v1",
+    "Kimi / Moonshot": "https://api.moonshot.cn/v1",
+    "GLM / Zhipu": "https://open.bigmodel.cn/api/paas/v4",
+    "Custom OpenAI-compatible": "",
+}
+
+CUSTOM_PROVIDER = "Custom OpenAI-compatible"
+
+PROVIDER_LABEL = "Provider"
+
+#: Session key for the chosen preset. Part of the same single settings
+#: state as the credentials themselves.
+PROVIDER_KEY = "llm_provider_preset"
+
+#: What this client actually supports, stated precisely. It speaks the
+#: OpenAI chat-completions protocol; that is an endpoint-compatibility claim
+#: and not a promise of any provider's own extensions.
+SUPPORTED_API_NOTE = (
+    "This client speaks the OpenAI-compatible chat-completions API. Any "
+    "endpoint offering that protocol works — OpenAI, Gemini, Claude, Kimi "
+    "and GLM all publish one, as do most self-hosted gateways. Presets only "
+    "fill the Base URL; provider-specific features beyond chat completions "
+    "are not implemented."
 )
 
 #: Field labels. The names come from the existing contract, not a new one.
@@ -120,6 +158,7 @@ def connect_llm(base_url: str, api_key: str, model: str) -> tuple[bool, str]:
     """
     ensure_llm_state_defaults()
     set_llm_settings(base_url, api_key, model)
+    _invalidate_all_form_syncs()
     if not is_llm_configured():
         st.session_state["llm_status"] = LLM_STATUS_NOT_CONFIGURED
         st.session_state["llm_status_message"] = INCOMPLETE_MESSAGE
@@ -133,6 +172,61 @@ def connect_llm(base_url: str, api_key: str, model: str) -> tuple[bool, str]:
     st.session_state["llm_status"] = LLM_STATUS_CONNECTED if ok else LLM_STATUS_FAILED
     st.session_state["llm_status_message"] = str(message)
     return bool(ok), str(message)
+
+
+#: Per-form marker recording which stored values that form's widgets were
+#: last seeded from.
+_SYNCED_SUFFIX = "_synced_from"
+
+
+#: Marker value meaning "the store was written elsewhere; re-read it". Not a
+#: deletion: a missing marker means "this form has never synced", which is a
+#: different situation and must not clobber a half-typed field.
+_STALE = ["__stale__"]
+
+
+def _invalidate_all_form_syncs() -> None:
+    """Force every settings form to re-read the store on the next run.
+
+    Called after a write, so a value saved on one surface is what every other
+    surface shows — which is the whole point of having one store.
+    """
+    for key in [k for k in st.session_state if str(k).endswith(_SYNCED_SUFFIX)]:
+        st.session_state[key] = list(_STALE)
+
+
+def _sync_widgets_from_store(key_prefix: str) -> None:
+    """Make this form's widgets a view of the one credential store.
+
+    Each surface needs its own widget keys — the sidebar form and an inline
+    form render in the same script run, and Streamlit rejects duplicate keys.
+    But a keyed widget's session value *wins over* its ``value=`` argument,
+    so per-surface keys quietly become per-surface copies: settings saved in
+    the sidebar never appeared in the Home form, which is the "enter it
+    again" problem this milestone exists to fix. A browser check caught it
+    after the obvious duplicate form had already been removed.
+
+    So the widget keys are re-seeded from the store whenever the store has
+    changed since this form last looked. Typing is never clobbered: while the
+    user edits, the store is unchanged, so no re-seed happens.
+    """
+    canonical = [
+        str(st.session_state.get(field, "") or "") for field in FIELD_LABELS
+    ]
+    marker = f"{key_prefix}{_SYNCED_SUFFIX}"
+    previous = st.session_state.get(marker)
+    if previous == canonical:
+        return
+    # Overwrite an existing widget value only when the store really changed
+    # under this form (previous marker present and different). A form that
+    # has never synced fills in what is missing and leaves anything already
+    # in the box alone — half-typed text is not something to discard.
+    external_change = previous is not None and previous != canonical
+    for field, value in zip(FIELD_LABELS, canonical):
+        widget_key = f"{key_prefix}_{field[len('llm_'):]}"
+        if widget_key not in st.session_state or external_change:
+            st.session_state[widget_key] = value
+    st.session_state[marker] = canonical
 
 
 def render_llm_settings_form(
@@ -159,10 +253,30 @@ def render_llm_settings_form(
     acted on — while a success is transient.
     """
     ensure_llm_state_defaults()
+    _sync_widgets_from_store(key_prefix)
+    st.caption(SUPPORTED_API_NOTE)
+
+    names = list(PROVIDER_PRESETS)
+    stored = str(st.session_state.get(PROVIDER_KEY) or CUSTOM_PROVIDER)
+    provider = st.selectbox(
+        PROVIDER_LABEL,
+        names,
+        index=names.index(stored) if stored in names else names.index(CUSTOM_PROVIDER),
+        key=f"{key_prefix}_provider",
+    )
+    if provider != stored:
+        # A preset fills the Base URL; it never locks it. The field below
+        # stays editable, and a gateway with its own URL is normal.
+        st.session_state[PROVIDER_KEY] = provider
+        default_url = PROVIDER_PRESETS.get(provider, "")
+        if default_url:
+            st.session_state[f"{key_prefix}_base_url"] = default_url
+
     base_url = st.text_input(
         FIELD_LABELS["llm_base_url"],
         value=str(st.session_state.get("llm_base_url", "")),
         key=f"{key_prefix}_base_url",
+        help="Editable. A preset fills this in; any OpenAI-compatible URL works.",
     )
     api_key = st.text_input(
         FIELD_LABELS["llm_api_key"],
@@ -187,6 +301,7 @@ def render_llm_settings_form(
         # Stores only. Whether these credentials work is a separate question,
         # asked by Connect, so saving can never block on a network call.
         set_llm_settings(base_url, api_key, model)
+        _invalidate_all_form_syncs()
         notify_success(
             SAVED_MESSAGE,
             event_key=EVENT_LLM_SAVED,
@@ -199,6 +314,12 @@ def render_llm_settings_form(
         CONNECT_LABEL, key=f"{key_prefix}_connect", use_container_width=True
     ):
         ok, message = connect_llm(base_url, api_key, model)
+        if not ok and message == INCOMPLETE_MESSAGE:
+            # Not a connection failure: nothing was sent, because a field is
+            # empty. Classifying this as an LLM error would report "the cause
+            # was not recognised" for a form the user simply has not finished.
+            st.error(message)
+            return "connect_failed"
         if ok:
             notify_success(
                 CONNECTED_MESSAGE,
@@ -209,10 +330,19 @@ def render_llm_settings_form(
             if on_connected is not None:
                 on_connected()
         else:
-            # Persistent, and actionable: the client's own reason, which
-            # never contains the key.
-            st.error(message)
+            # Persistent, and actionable. The reason is classified rather
+            # than shown raw, so "Network is unreachable" reads as a
+            # connectivity problem and not as a generic failure — and the
+            # classifier redacts anything key-shaped.
+            finding = classify_llm_failure(message, configured=True)
+            st.error(f"{finding['short_title']} {finding['user_message']}")
+            if finding["recommended_action"]:
+                st.caption(finding["recommended_action"])
+            if finding["evidence_line"]:
+                with st.expander("Show technical details", expanded=False):
+                    st.code(str(finding["evidence_line"]), language="text")
             action = "connect_failed"
+    st.caption(f"Status: {describe_llm_status()}")
     return action
 
 

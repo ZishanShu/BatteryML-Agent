@@ -13,7 +13,13 @@ import streamlit as st
 import torch
 
 from batteryml_web.agent.llm_client import run_llm_prompt, save_llm_output
-from batteryml_web.ui.agent_workflow import render_agent_workflow
+from batteryml_web.agent.catalog import REQUEST_TEMPLATE_STRUCTURE
+from batteryml_web.ui.agent_workflow import (
+    USE_TEMPLATE_LABEL,
+    accept_template as accept_request_template,
+    render_agent_workflow,
+    request_template as agent_request_template,
+)
 from batteryml_web.core.custom_uploads import (
     ALLOWED_CUSTOM_SOURCE_FORMATS,
     build_uploaded_dataset_manifest,
@@ -33,11 +39,17 @@ from batteryml_web.ui.feedback import (
     notify_success,
     toast,
 )
-from batteryml_web.ui.llm_state import ensure_llm_state_defaults, get_llm_status, is_llm_configured, refresh_llm_status_from_config, set_llm_settings
+from batteryml_web.ui.llm_state import describe_llm_status, ensure_llm_state_defaults, get_llm_status, is_llm_configured, refresh_llm_status_from_config, set_llm_settings
 from batteryml_web.core.project_context import resolve_project
 from batteryml_web.core.run_manager import get_run_manager
 from batteryml_web.core.run_manifest import find_run
-from batteryml_web.ui.run_history import render_run_detail, render_run_history
+from batteryml_web.ui.run_history import (
+    render_file_browser,
+    render_predictions_panel,
+    render_run_detail,
+    render_run_history,
+    render_run_location,
+)
 from batteryml_web.ui.settings_panel import render_llm_settings_form
 from batteryml_web.ui.progress_utils import get_safe_runtime_env, run_command_with_progress
 from batteryml_web.ui.workflow_sidebar import NAV_STEPS, get_current_step_index, render_sidebar_workflow, set_current_step
@@ -426,18 +438,33 @@ def render_home_agent_entry() -> None:
         "the dataset, task and model, checks readiness and builds a plan; nothing "
         "runs until you press Run on the next page."
     )
+    # The same request UX as the Agent Workflow page: one box, one template
+    # helper, the same canonical request key. Two pages with two different
+    # request affordances was the inconsistency this removes.
+    template = agent_request_template()
+    if st.session_state.pop("home_use_template", False):
+        committed = str(st.session_state.get("home_agent_request", "") or "")
+        if accept_request_template(template, committed):
+            st.session_state["agent_original_request"] = template
+            st.session_state["home_agent_request"] = template
     request = st.text_area(
         "Describe what you want to do...",
         value=st.session_state.get("agent_original_request", ""),
-        placeholder="Use CPTransformer on MATR to predict battery lifetime.",
+        placeholder=REQUEST_TEMPLATE_STRUCTURE,
         key="home_agent_request",
         height=90,
     )
+    if accept_request_template(template, request):
+        if st.button(USE_TEMPLATE_LABEL, key="home_use_template_button"):
+            st.session_state["home_use_template"] = True
+            st.rerun()
     if st.button("Analyze with Agent", use_container_width=True, key="home_agent_analyze"):
         trimmed = str(request or "").strip()
         if not trimmed:
-            st.warning("Enter a request first, for example: "
-                       "Use CPTransformer on MATR to predict battery lifetime.")
+            st.warning(
+                f"Enter a request first. The pattern is: {REQUEST_TEMPLATE_STRUCTURE} "
+                f"— or press {USE_TEMPLATE_LABEL!r} to fill it in."
+            )
         else:
             st.session_state["agent_original_request"] = trimmed
             # Consumed by render_agent_workflow(), which runs the backend
@@ -471,7 +498,10 @@ def render_home_page():
     project_root = _project_root()
     current_dataset = st.session_state.get("selected_dataset", "MATR")
     last_run = st.session_state.get("last_run_status", "N/A")
-    llm_status = "Connected" if st.session_state.get("llm_base_url") and st.session_state.get("llm_api_key") else "Not connected"
+    # From the one status the credential store maintains — not re-derived
+    # from whether two fields happen to be non-empty, which reported
+    # "Connected" for settings that had never been tested.
+    llm_status = describe_llm_status()
 
     summary_items = [
         ("Project", _current_project_name()),
@@ -551,25 +581,12 @@ def render_home_page():
             st.button("Load Project", disabled=True, use_container_width=True, key="home_load_disabled")
 
     st.markdown("---")
-    with st.expander("Optional LLM Assistant", expanded=False):
-        st.caption("LLM assistant is optional. Without an LLM endpoint, the platform still runs the deterministic BatteryML workflow.")
-        st.text_input("Base URL", key="llm_base_url")
-        st.text_input("API key", key="llm_api_key", type="password")
-        st.text_input("Model", key="llm_model")
-        connected = is_llm_configured()
-        st.caption(f"Status: {'Connected' if connected else 'Not connected'}")
-        if st.button("Check settings", key="home_llm_test", use_container_width=True):
-            # This checks that the three fields are filled; it does not call the
-            # endpoint. Reporting "not connected" in a green success box said the
-            # opposite of what it meant.
-            if connected:
-                toast("LLM settings are complete", icon="✅")
-            else:
-                st.warning(
-                    "LLM assistant is not configured: Base URL, API key and model "
-                    "are all required. The platform runs the full deterministic "
-                    "workflow without them."
-                )
+    # One settings surface, shared with the sidebar and the Explain prompt.
+    # This block used to carry its own three text inputs bound straight to
+    # the session keys, which bypassed set_llm_settings entirely: the status
+    # was never updated, and settings entered here did not register as
+    # configured elsewhere. That is what made the app ask twice.
+    render_inline_llm_settings("home", expanded=False)
 
     st.markdown("---")
     st.subheader("Quick Start", anchor=False)
@@ -1197,8 +1214,8 @@ def render_inline_llm_settings(location_key: str, expanded: bool = False):
             "LLM assistant is optional. Without an LLM endpoint, the platform "
             "still runs the deterministic BatteryML workflow."
         )
+        # The form prints the status itself, from the one status vocabulary.
         render_llm_settings_form(key_prefix=location_key)
-        st.caption(f"Status: {get_llm_status().replace('_', ' ').title()}")
 
 
 def set_llm_not_configured_message(output_key: str):
@@ -1571,6 +1588,27 @@ def render_run_model_page():
     render_bottom_step_navigation()
 
 
+def _selected_run_manifest():
+    """The run the user opened in Run History, or None.
+
+    Returned to the Predictions and Files tabs so they describe *that run's*
+    artifacts rather than whatever the workspace glob happened to find. None
+    means nothing is selected — the tabs then fall back to the workspace and
+    say so, instead of silently showing a different run's files.
+    """
+    selected = st.session_state.get("run_history_selection")
+    if not selected:
+        return None
+    project = resolve_project(
+        project_root=st.session_state.get("project_root"),
+        project_name=st.session_state.get("project_name")
+        or st.session_state.get("current_project"),
+    )
+    return find_run(
+        project["root"], str(selected), live_run_ids=get_run_manager().live_run_ids()
+    )
+
+
 def _render_project_run_history() -> None:
     """The current project's runs, and the one the user opened."""
     project = resolve_project(
@@ -1724,7 +1762,14 @@ Metrics:
             st.write("**Next action:** Run training or inspect logs for RMSE / MAE / MAPE output.")
 
     with tabs[2]:
-        if preds_df is not None and not preds_df.empty:
+        # A selected run's predictions, described through the shared reader.
+        # The old branch below only understood a CSV with guessable column
+        # names and called every .pkl "parser not implemented" — which is
+        # almost every artifact this platform writes.
+        selected_manifest = _selected_run_manifest()
+        if selected_manifest is not None:
+            render_predictions_panel(selected_manifest)
+        elif preds_df is not None and not preds_df.empty:
             st.dataframe(preds_df, use_container_width=True, hide_index=True)
             cols = {c.lower(): c for c in preds_df.columns}
             y_true_col = next((cols[c] for c in cols if c in {"y_true", "true", "gt", "label", "ground_truth"}), None)
@@ -1737,17 +1782,20 @@ Metrics:
                 st.info("Prediction file found but parser not implemented for this format.")
                 for p in files["prediction_files"]:
                     st.code(str(p), language="text")
+        elif files["prediction_files"]:
+            # No run selected in history, but artifacts exist on disk: preview
+            # the first one through the same reader rather than declaring it
+            # unparseable.
+            render_predictions_panel(
+                {"artifacts": {"prediction_files": [str(p) for p in files["prediction_files"]]},
+                 "run_id": "workspace"}
+            )
         else:
-            if files["prediction_files"]:
-                st.warning("Prediction file found but parser not implemented for this format.")
-                for p in files["prediction_files"]:
-                    st.code(str(p), language="text")
-            else:
-                st.info("Not available")
-                st.write("**Searched paths:**")
-                for p in searched_paths:
-                    st.code(str(p), language="text")
-                st.write("**Next action:** Run training and re-open Review Results.")
+            st.info("No predictions artifact was found.")
+            st.write("**Searched paths:**")
+            for p in searched_paths:
+                st.code(str(p), language="text")
+            st.write("**Next action:** Run training and re-open Review Results.")
 
     with tabs[3]:
         if files["log_files"]:
@@ -1764,13 +1812,34 @@ Metrics:
         render_llm_output_panel("review_llm_output", "Result interpretation")
 
     with tabs[4]:
-        st.write(f"**Workspace path:** {session_workspace or (project_dir / 'workspace')}")
-        st.code(f"open {session_workspace or (project_dir / 'workspace')}", language="text")
-        if files["all_files"]:
-            for p in files["all_files"]:
-                st.code(str(p), language="text")
+        selected_manifest = _selected_run_manifest()
+        if selected_manifest is not None:
+            # Where it wrote, then the files grouped by what they are.
+            render_run_location(selected_manifest)
+            run_dir = str(
+                selected_manifest.get("run_dir")
+                or selected_manifest.get("workspace")
+                or ""
+            )
+            if run_dir:
+                render_file_browser(run_dir)
         else:
-            st.info("Not available")
+            workspace = str(session_workspace or (project_dir / "workspace"))
+            st.markdown("**Where results are being read from**")
+            st.dataframe(
+                [
+                    {"": "Project", "Path": _current_project_name()},
+                    {"": "Project directory", "Path": str(project_dir)},
+                    {"": "Workspace", "Path": workspace},
+                ],
+                hide_index=True,
+                use_container_width=True,
+            )
+            st.caption(
+                "Select a run in Run History above to browse that run's own "
+                "files, grouped by artifact type."
+            )
+            render_file_browser(workspace)
         render_llm_output_panel("review_llm_output", "Result interpretation")
 
     render_bottom_step_navigation()

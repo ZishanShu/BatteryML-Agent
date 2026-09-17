@@ -411,3 +411,228 @@ def render_bundle_download(run_dir: str, manifest: Dict[str, Any]) -> None:
             f"{len(summary['omitted'])} file(s) were left out of the bundle and "
             "are named in its README with the path where they remain."
         )
+
+
+# --- structured file browsing ---------------------------------------------
+
+#: Order the artifact groups are shown in: what a user looks for first.
+GROUP_ORDER: tuple[str, ...] = (
+    "predictions",
+    "metrics",
+    "figures",
+    "config",
+    "manifest",
+    "logs",
+    "checkpoints",
+    "other",
+)
+
+GROUP_TITLES: Dict[str, str] = {
+    "predictions": "Predictions",
+    "metrics": "Metrics and summaries",
+    "figures": "Figures",
+    "config": "Config",
+    "manifest": "Manifest",
+    "logs": "Logs",
+    "checkpoints": "Checkpoints",
+    "other": "Other files",
+}
+
+
+def _human_size(size: Any) -> str:
+    try:
+        value = float(size)
+    except (TypeError, ValueError):
+        return "—"
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:,.0f} {unit}" if unit == "B" else f"{value:,.1f} {unit}"
+        value /= 1024
+    return f"{value:,.1f} GB"
+
+
+def _modified(path: str) -> str:
+    from datetime import datetime, timezone
+
+    try:
+        stamp = Path(path).stat().st_mtime
+    except OSError:
+        return "—"
+    return datetime.fromtimestamp(stamp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+def group_artifacts(entries: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """Group discovered artifacts by category, newest-looking order kept.
+
+    Purely a rearrangement of what ``list_artifacts`` found: no group is
+    created for files that do not exist, and nothing is added to make a
+    group look complete.
+    """
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for entry in entries:
+        grouped.setdefault(str(entry.get("category") or "other"), []).append(entry)
+    return {
+        name: grouped[name]
+        for name in GROUP_ORDER
+        if name in grouped
+    } | {
+        name: rows for name, rows in grouped.items() if name not in GROUP_ORDER
+    }
+
+
+def render_run_location(manifest: Dict[str, Any]) -> None:
+    """Say plainly where this run's output went.
+
+    Project, workspace and run directory, each on its own line. Inferring
+    the run directory from a truncated path in a table was the thing this
+    replaces.
+    """
+    run_dir = str(manifest.get("run_dir") or manifest.get("workspace") or "")
+    workspace = str(Path(run_dir).parent) if run_dir else ""
+    st.markdown("**Where this run wrote**")
+    st.dataframe(
+        [
+            {"": "Project", "Path": str(manifest.get("project") or NOT_AVAILABLE)},
+            {"": "Workspace", "Path": workspace or NOT_AVAILABLE},
+            {"": "Run directory", "Path": run_dir or NOT_AVAILABLE},
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
+    if run_dir:
+        st.code(run_dir, language="text")
+
+
+def render_file_browser(run_dir: str) -> None:
+    """The Files view: grouped, with metadata, not a flat list of paths."""
+    from ..core.artifact_browser import list_artifacts, read_artifact
+
+    entries = list_artifacts(run_dir)
+    if not entries:
+        st.caption(
+            f"No files were found under {run_dir}. Nothing is listed that "
+            "does not exist."
+        )
+        return
+
+    grouped = group_artifacts(entries)
+    st.caption(
+        f"{len(entries)} file(s) in {len(grouped)} group(s), discovered under "
+        "this run's own directory."
+    )
+    for name, rows in grouped.items():
+        with st.expander(
+            f"{GROUP_TITLES.get(name, name.title())} ({len(rows)})",
+            expanded=(name == "predictions"),
+        ):
+            st.dataframe(
+                [
+                    {
+                        "File": row["relative_path"],
+                        "Size": _human_size(row["size_bytes"]),
+                        "Modified (UTC)": _modified(
+                            str(Path(run_dir) / row["relative_path"])
+                        ),
+                    }
+                    for row in rows
+                ],
+                hide_index=True,
+                use_container_width=True,
+            )
+            downloadable = [row for row in rows if row["downloadable"]]
+            if not downloadable:
+                st.caption(
+                    "These files are larger than the download limit and stay "
+                    "in the run directory."
+                )
+                continue
+            choice = st.selectbox(
+                "File",
+                [row["relative_path"] for row in downloadable],
+                key=f"files_{run_dir}_{name}",
+                label_visibility="collapsed",
+            )
+            if choice:
+                st.code(str(Path(run_dir) / str(choice)), language="text")
+                payload = read_artifact(run_dir, str(choice))
+                if payload is not None:
+                    st.download_button(
+                        "Download",
+                        data=payload,
+                        file_name=Path(str(choice)).name,
+                        key=f"files_dl_{run_dir}_{name}",
+                    )
+
+
+def render_predictions_panel(manifest: Dict[str, Any]) -> None:
+    """The Predictions view: one artifact selected, described and previewed."""
+    from ..agent.artifact_preview import (
+        KIND_BATTERYML_PREDICTION,
+        KIND_UNREADABLE,
+        KIND_UNSUPPORTED_PICKLE,
+        SUPPORTED_PREVIEW_FORMATS,
+        preview_prediction_file,
+    )
+    from ..agent.result_views import RUL_SCHEMA, TRAJECTORY_SCHEMA
+
+    files = [
+        str(path)
+        for path in (manifest.get("artifacts") or {}).get("prediction_files") or []
+    ]
+    if not files:
+        st.info("This run recorded no predictions artifact.")
+        return
+
+    chosen = files[0]
+    if len(files) > 1:
+        chosen = st.selectbox(
+            "Prediction artifact",
+            files,
+            key=f"prediction_choice_{manifest.get('run_id')}",
+        )
+    preview = preview_prediction_file(str(chosen))
+
+    if preview["kind"] == KIND_BATTERYML_PREDICTION:
+        st.markdown("**Artifact summary**")
+        st.dataframe(
+            [{"Field": key, "Value": value} for key, value in preview["summary"].items()],
+            hide_index=True,
+            use_container_width=True,
+        )
+        if preview["schema"] == RUL_SCHEMA and preview["rul"]:
+            render_rul_figures(preview["rul"])
+            render_prediction_table(preview["rul"])
+        elif preview["schema"] == TRAJECTORY_SCHEMA and preview["trajectory"]:
+            render_trajectory_figure(preview["trajectory"])
+    elif preview["kind"] in (KIND_UNSUPPORTED_PICKLE, KIND_UNREADABLE):
+        # Graceful, and useful: say what it is not, then show what can be
+        # determined about it without interpreting anything.
+        st.info(preview["message"])
+        structure = preview.get("structure") or {}
+        if structure:
+            st.caption(
+                f"Top-level type: {structure.get('type')}"
+                + (f" · {structure.get('length')} entries" if structure.get("length") is not None else "")
+            )
+            if structure.get("fields"):
+                st.dataframe(
+                    [
+                        {"Field": f["name"], "Type": f["type"], "Shape": f["shape"]}
+                        for f in structure["fields"]
+                    ],
+                    hide_index=True,
+                    use_container_width=True,
+                )
+    else:
+        st.caption(
+            "This artifact is not a pickle payload; use the Files view to "
+            "download it."
+        )
+
+    st.code(str(chosen), language="text")
+    with st.expander("Which formats can be previewed?", expanded=False):
+        for line in SUPPORTED_PREVIEW_FORMATS:
+            st.caption(f"- {line}")
+        st.caption(
+            "Anything else is listed and downloadable, but not interpreted."
+        )

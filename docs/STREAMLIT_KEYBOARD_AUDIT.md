@@ -104,6 +104,14 @@ Any one of these, in preference order:
    anything in `scripts/verify/`. Adding one is a prerequisite for shipping
    frontend code that the Python tests cannot see.
 
+## Update: what ships now
+
+The `Use suggestion` button described below was replaced by a **Use template**
+helper. The conclusion above is unchanged — Tab is still not intercepted, and
+nothing claims it is — but the aid is now a template the user asks for rather
+than a ghost value waiting to be accepted, which is a clearer interaction
+than the one this audit was written to justify.
+
 ## What ships instead
 
 * the suggestion is the `placeholder` of the native `st.text_area`, so it is

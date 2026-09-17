@@ -320,15 +320,6 @@ def closest_model_keys(
 #: dataset and a model this installation actually has: a hardcoded example
 #: naming a model that was never registered teaches the user a request the
 #: platform will refuse.
-EXAMPLE_REQUEST_TEMPLATES: tuple[str, ...] = (
-    "Use {model} on {dataset} to predict battery lifetime.",
-    "Recommend a model to predict battery lifetime on {dataset}.",
-    "Forecast degradation trajectory for {dataset}.",
-    "帮我用 {dataset} 做电池寿命预测",
-    "{dataset} 上用 {model} 做寿命预测",
-)
-
-
 def _short_display(model_display: str, model_key: str) -> str:
     """The name a user would type: "CPTransformer", not the full subtitle.
 
@@ -401,60 +392,43 @@ def example_model(
     return _short_display(candidates[0].get("model_display"), candidates[0].get("model_key"))
 
 
-#: The suggestion shown in the empty request box when the catalog cannot
-#: supply one. It is the platform's documented default demo request
-#: (CLAUDE.md §11: MATR / RUL / XGBoost is the default configuration, and
-#: CPTransformer is the model the quick-start prose names), kept here as the
-#: single literal rather than written into the page.
-FALLBACK_REQUEST_SUGGESTION = "Use CPTransformer on MATR to predict battery lifetime."
+#: The shape shown to the user, with the slots left visible. Deliberately
+#: generic: it teaches the sentence pattern without pretending to be a
+#: curated example, and it is the same whatever this installation holds.
+REQUEST_TEMPLATE_STRUCTURE = "Use [method] on [dataset] to [task]."
+
+#: Task phrase used when filling the template. The canonical RUL task label
+#: reads awkwardly inside the sentence, so this is the plain-English form of
+#: the same task, not a second task.
+DEFAULT_TASK_PHRASE = "predict battery lifetime"
 
 
-def build_request_suggestion(
+def build_request_template(
     catalog: Dict[str, Any],
     *,
     runnable_keys: Optional[Sequence[str]] = None,
+    task_phrase: str = DEFAULT_TASK_PHRASE,
 ) -> str:
-    """The **one** request suggestion the empty request box shows.
+    """Fill :data:`REQUEST_TEMPLATE_STRUCTURE` from this installation.
 
-    Deliberately not a gallery and not a second recommendation engine: it
-    reuses :func:`example_dataset` and :func:`example_model`, which pick the
-    first READY dataset and a model that has a validated config for it, and
-    fills the single "Use {model} on {dataset}" template. Model/task
-    recommendation stays with the agent backend.
+    The slots come from the live catalog — a READY dataset and a model with a
+    validated config for it, preferring one readiness currently reports as
+    runnable. Nothing here is a curated example: on an installation with
+    different data it produces a different sentence, which is what the
+    dynamic-UI tests check.
 
-    A suggestion is only offered when the catalog supplies both halves, so
-    the box never proposes a missing dataset or a model with no config for
-    it. Otherwise the documented fallback is returned, so the field is never
-    left with no hint at all.
+    Where the catalog cannot supply a slot, the generic placeholder is kept
+    rather than substituting an invented name — a template that says
+    ``[dataset]`` is honest; one that names a dataset this platform does not
+    have is not. This is why the earlier hardcoded fallback sentence, and the
+    gallery of five example requests it belonged to, are gone.
     """
     dataset = example_dataset(catalog)
-    if not dataset:
-        return FALLBACK_REQUEST_SUGGESTION
-    model = example_model(catalog, dataset, runnable_keys=runnable_keys)
-    if not model:
-        return FALLBACK_REQUEST_SUGGESTION
-    return f"Use {model} on {dataset} to predict battery lifetime."
+    model = example_model(catalog, dataset, runnable_keys=runnable_keys) if dataset else None
+    return (
+        REQUEST_TEMPLATE_STRUCTURE
+        .replace("[method]", model or "[method]")
+        .replace("[dataset]", dataset or "[dataset]")
+        .replace("[task]", task_phrase)
+    )
 
-
-def build_example_requests(
-    catalog: Dict[str, Any],
-    *,
-    runnable_keys: Optional[Sequence[str]] = None,
-) -> List[str]:
-    """Clickable example requests, filled from this installation's catalog.
-
-    Templates that need a model are dropped when the catalog offers none, so
-    an example never names something that does not exist. The returned
-    strings are plain requests: they are written into the request box and
-    resolved by the ordinary backend path, never executed.
-    """
-    dataset = example_dataset(catalog)
-    if not dataset:
-        return []
-    model = example_model(catalog, dataset, runnable_keys=runnable_keys)
-    examples: List[str] = []
-    for template in EXAMPLE_REQUEST_TEMPLATES:
-        if "{model}" in template and not model:
-            continue
-        examples.append(template.format(dataset=dataset, model=model or ""))
-    return examples
