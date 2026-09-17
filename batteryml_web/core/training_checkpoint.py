@@ -361,6 +361,17 @@ def validate_resume(
     for field in BLOCKING_IDENTITY_FIELDS:
         if field not in requested_identity:
             continue
+        if field not in stored:
+            # The checkpoint does not record this field, so it cannot be
+            # compared. Reported rather than silently passed *or* silently
+            # failed: a checkpoint written by a producer that stores less
+            # than this one checks is usable, but the reader should know
+            # which guarantee it did not get.
+            warnings.append(
+                f"The checkpoint records no {field}, so it could not be "
+                f"checked against {requested_identity.get(field)!r}."
+            )
+            continue
         have, want = stored.get(field), requested_identity.get(field)
         if str(have) != str(want):
             errors.append(

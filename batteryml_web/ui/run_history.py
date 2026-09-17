@@ -209,29 +209,37 @@ def render_run_detail(manifest: Dict[str, Any]) -> None:
         render_artifacts(run_dir)
 
 
-def _render_resume_offer(manifest: Dict[str, Any]) -> None:
-    """Offer Resume only where it genuinely works, and keep it small.
+def resume_offer(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    """Whether this run may be resumed, and from what.
 
-    Two backend-derived conditions, both required: the model's training loop
-    must persist enough state (``resume_capability``), and a *resumable*
-    checkpoint must exist (``classify_checkpoint``). A weights-only ``.ckpt``
-    — which every older neural run has — is not enough.
+    Pure, so the gate is testable without Streamlit. Every condition is
+    backend-derived and all must hold:
 
-    When either is missing the control is simply absent. Explaining optimizer
-    and RNG state to someone who only wanted to look at a result is noise;
-    the reasons live in docs/TRAINING_STATE_AUDIT.md and in the technical
-    details, not on the normal page. No model is named here: the capability
-    comes from the backend.
+    * the model's training loop can resume (``resume_capability``);
+    * at least one checkpoint passes the resumable-checkpoint schema — a
+      filename is never evidence, and an older weights-only ``.ckpt`` is not
+      enough;
+    * the run belongs to a project, so the resumed run has somewhere to go.
+
+    Returns ``{"available", "checkpoint", "completed_epochs",
+    "suggested_target"}``. ``available`` False means the control is simply
+    not rendered — an unsupported run stays uncluttered.
     """
     from ..agent.run_policy import resume_capability
     from ..core.training_checkpoint import KIND_RESUMABLE, classify_checkpoint
 
-    model_key = str(manifest.get("model_key") or "")
+    empty = {
+        "available": False,
+        "checkpoint": None,
+        "completed_epochs": 0,
+        "suggested_target": 1,
+    }
     capability = resume_capability(
-        model_key, family=str(manifest.get("model_family") or "")
+        str(manifest.get("model_key") or ""),
+        family=str(manifest.get("model_family") or ""),
     )
     if not capability["supports_resume"]:
-        return
+        return empty
 
     resumable = [
         verdict
@@ -242,34 +250,149 @@ def _render_resume_offer(manifest: Dict[str, Any]) -> None:
         if verdict["kind"] == KIND_RESUMABLE
     ]
     if not resumable:
-        return
+        return empty
 
     latest = max(resumable, key=lambda v: v.get("epoch") or 0)
     completed = int(latest.get("epoch") or 0)
-    stored_target = int(latest.get("target_total_epochs") or 0)
+    stored = int(latest.get("target_total_epochs") or 0)
+    return {
+        "available": True,
+        "checkpoint": latest,
+        "completed_epochs": completed,
+        "suggested_target": max(completed + 1, stored),
+    }
+
+
+def _render_resume_offer(manifest: Dict[str, Any]) -> None:
+    """The Resume panel: three lines, and a button that really starts a run.
+
+    Deliberately small. Optimizer, RNG and schema internals are what make
+    resume correct, not what a user needs to see before pressing it; they
+    stay in docs/TRAINING_STATE_AUDIT.md and in the checkpoint itself.
+    """
+    offer = resume_offer(manifest)
+    if not offer["available"]:
+        return
+
+    completed = offer["completed_epochs"]
+    run_id = str(manifest.get("run_id"))
     with st.expander(RESUME_LABEL, expanded=False):
-        st.caption(f"Last resumable checkpoint: epoch {completed}")
-        target = st.number_input(
-            "Target total epochs",
-            min_value=completed + 1,
-            value=max(completed + 1, stored_target),
-            step=1,
-            key=f"resume_target_{manifest.get('run_id')}",
+        st.caption(f"Last checkpoint: epoch {completed}")
+        target = int(
+            st.number_input(
+                "Target total epochs",
+                min_value=completed + 1,
+                value=offer["suggested_target"],
+                step=1,
+                key=f"resume_target_{run_id}",
+            )
         )
         st.caption(
-            f"Continues from epoch {completed + 1} in a new run. This run is "
-            "not modified."
+            f"{target - completed} epoch(s) remaining — continues from epoch "
+            f"{completed + 1} in a new run. This run is not modified."
         )
-        st.button(
+        if st.button(
             "Resume",
-            key=f"resume_confirm_{manifest.get('run_id')}",
+            key=f"resume_confirm_{run_id}",
             use_container_width=True,
-            disabled=True,
-            help=(
-                "Launching a resumed run from this page is not wired up yet. "
-                "The checkpoint above is a valid resume point."
-            ),
-        )
+        ):
+            _start_resumed_run(manifest, offer, target)
+
+
+def _start_resumed_run(
+    manifest: Dict[str, Any],
+    offer: Dict[str, Any],
+    target_total_epochs: int,
+) -> None:
+    """Validate once more, then start a new run through the normal path.
+
+    The same planner, the same RunManager, the same manifest lifecycle as any
+    other run — a resumed run is an ordinary run that happens to start from a
+    checkpoint, so it gets live progress, Stop run, artifacts and a result
+    without a second execution system.
+    """
+    from ..agent.execution import build_execution_plan
+    from ..core.project_context import resolve_project, run_workspace
+    from ..core.run_identity import new_run_id
+    from ..core.run_manifest import build_resume_lineage
+    from ..core.training_checkpoint import validate_resume
+    from .agent_workflow import _launch_run
+
+    checkpoint = offer["checkpoint"]
+    completed = offer["completed_epochs"]
+    dataset = str(manifest.get("dataset") or "")
+    model_key = str(manifest.get("model_key") or "")
+
+    # The identity the checkpoint must agree with. Re-checked here rather
+    # than trusted from the panel: the number box is user input.
+    validation = validate_resume(
+        checkpoint,
+        {
+            "model_key": model_key,
+            "dataset": dataset,
+            "task": str(manifest.get("task") or ""),
+            "seed": str(manifest.get("seed") or ""),
+        },
+        target_total_epochs=target_total_epochs,
+    )
+    if not validation["ok"]:
+        for message in validation["errors"]:
+            st.error(message)
+        return
+    for message in validation["warnings"]:
+        # What could not be compared, said rather than hidden. The checkpoint
+        # lives inside this run's own directory and the plan is built from
+        # this run's manifest, so identity is anchored either way.
+        st.caption(message)
+
+    project = resolve_project(
+        project_root=st.session_state.get("project_root"),
+        project_name=st.session_state.get("project_name")
+        or st.session_state.get("current_project"),
+    )
+    run_id = new_run_id(dataset=dataset, model=model_key, seed=manifest.get("seed"))
+    workspace = run_workspace(project, dataset, model_key, run_id)
+
+    plan = build_execution_plan(
+        dataset,
+        str(manifest.get("task") or ""),
+        model_key,
+        device=str(manifest.get("device") or "cpu"),
+        seed=manifest.get("seed") or 0,
+        workspace=workspace,
+        # Total target, not additional: the loop runs start_epoch..target.
+        epochs=target_total_epochs,
+        resume_from=str(checkpoint["path"]),
+    )
+    if not plan.get("can_execute"):
+        st.error(str(plan.get("reason") or "The resumed run could not be planned."))
+        for message in plan.get("validation_errors") or []:
+            st.caption(str(message))
+        return
+
+    _launch_run(
+        run_id=run_id,
+        plan=plan,
+        project=project,
+        run_context={
+            "workspace": workspace,
+            "seed": manifest.get("seed"),
+            "device": manifest.get("device"),
+            "smoke": False,
+        },
+        resumed_from=build_resume_lineage(
+            source_run_id=str(manifest.get("run_id")),
+            checkpoint_path=str(checkpoint["path"]),
+            starting_epoch=int(validation["start_epoch"]),
+            target_total_epochs=target_total_epochs,
+            completed_epochs=completed,
+        ),
+    )
+    st.success(
+        f"Resumed run started from epoch {validation['start_epoch']}. It "
+        "appears in Run History as a new run."
+    )
+    st.rerun()
 
 
 def _render_scientific_views(manifest: Dict[str, Any]) -> None:

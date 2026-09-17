@@ -993,6 +993,7 @@ def _launch_run(
     plan: dict[str, Any],
     project: dict[str, Any],
     run_context: dict[str, Any],
+    resumed_from: dict[str, Any] | None = None,
 ) -> None:
     """Create the run on disk, then start it in the background.
 
@@ -1028,6 +1029,9 @@ def _launch_run(
         smoke=bool(run_context.get("smoke")),
         command=plan.get("command") or [],
         git_commit=_git_commit(),
+        # Present only for a resumed run. The source run is never touched:
+        # this is a new run that records where it continued from.
+        resumed_from=resumed_from,
     )
     write_manifest(run_dir, manifest)
 

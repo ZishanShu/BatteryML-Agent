@@ -178,6 +178,7 @@ def build_execution_plan(
     workspace: str | None = None,
     workflow_context: Optional[Dict[str, Any]] = None,
     epochs: int | None = None,
+    resume_from: str | None = None,
 ) -> Dict[str, Any]:
     """Build a validated, non-executing run plan for one model.
 
@@ -195,6 +196,12 @@ def build_execution_plan(
             mocked READY state). When omitted it is built from
             ``(dataset, task)``; only its ``validated_config`` values may
             ever appear in the plan.
+        resume_from: optional path to a *resumable* checkpoint. Adds
+            ``--ckpt-to-resume``; combined with ``epochs`` as the total
+            target, training continues from the checkpoint's epoch rather
+            than restarting. Validated by the caller against
+            ``core.training_checkpoint``; this function does not decide
+            whether a file is resumable.
         epochs: optional positive-int ``--epochs`` override owned by the
             planner (``bin/batteryml.py run`` accepts ``--epochs`` as a
             number-of-epochs override). ``None`` preserves the config's own
@@ -312,6 +319,11 @@ def build_execution_plan(
         ]
         if epochs_value is not None:
             command.extend(["--epochs", str(epochs_value)])
+        if resume_from:
+            # The CLI already accepts this flag and forwards it to
+            # Pipeline.train. Combined with --epochs as the *total* target,
+            # training continues from the checkpoint's epoch to that total.
+            command.extend(["--ckpt-to-resume", str(resume_from)])
         reason = f"Model {model_key!r} is READY with a validated config; plan only, nothing executed."
     else:
         command = None

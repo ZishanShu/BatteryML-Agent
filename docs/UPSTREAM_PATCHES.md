@@ -56,3 +56,66 @@ smaller and safer change.
 **No scientific semantics changed.** With `resume_state=None` the loop is
 byte-for-byte the previous behaviour, and the resume path is proved to
 reproduce uninterrupted training on a deterministic model.
+
+---
+
+## UP-02 — `Pipeline.train` distinguishes a resumable checkpoint from a warm start
+
+| Field | Value |
+| --- | --- |
+| File | `batteryml/pipeline.py` |
+| Function | `Pipeline.train`, plus module-level helpers |
+| Milestone | Resume from the web |
+| Basis | `[STATIC]` — read from the source; the resume *mechanics* are `[VERIFIED]` by `tests/test_training_resume.py`, but this wiring has not been executed on real data |
+
+### Why it could not go in `batteryml_web/`
+
+`--ckpt-to-resume` already existed and already reached `Pipeline.train`, but
+it led to `_prepare_model` → `model.load_checkpoint(path)` — the weights-only
+path — and `fit` was called with no resume state. The decision of *which*
+kind of checkpoint a path is, and the wiring of the state into `fit`, happen
+inside `train()`. Nothing outside it can intervene without replacing the
+execution entry point, which would mean a second execution system for
+resumed runs.
+
+### The diff, in words
+
+* `train()` classifies `ckpt_to_resume`. A **resumable** payload is loaded,
+  its model state applied to the unwrapped module, its RNG restored, and it
+  is passed to `fit(resume_state=…)`. A **weights-only** file takes the
+  pre-existing `_prepare_model` warm-start path, unchanged.
+* an `on_epoch_end` callback writes a resumable checkpoint at the model's
+  own `checkpoint_freq` — no extra writes, the existing ones simply carry
+  optimizer, epoch and RNG state too.
+* `_supported_fit_kwargs` passes the new kwargs only to a `fit` that accepts
+  them, so **BatLiNet, which defines its own training loop, is called
+  exactly as before**.
+* `_unwrap` peels `torch.compile`'s `_orig_mod.` and DDP's `module.` before
+  saving or loading, so a checkpoint is not tied to how the model was
+  wrapped.
+
+### The optional dependency, stated plainly
+
+These helpers import `batteryml_web.core.training_checkpoint` lazily, inside
+a `try`. When the web layer is absent — upstream BatteryML used standalone —
+every helper returns `None` and training behaves exactly as it did before.
+
+This is a dependency from core toward the web layer, which `CLAUDE.md` §3
+otherwise avoids. The alternatives were worse: duplicating the schema
+upstream creates two sources of truth for a format whose whole purpose is to
+be read back correctly, and running resumed runs through a different entry
+point creates the second execution system this milestone was told not to
+build. Recorded here so the choice is visible rather than discovered.
+
+### What was deliberately not changed
+
+* no change to the optimizer, learning rate, batch size, shuffling, epoch
+  count semantics, or the `reset_parameters` behaviour on a non-finite loss;
+* `dump_checkpoint` / `load_checkpoint` keep their weights-only meaning;
+* the two training vocabularies are kept apart: the checkpoint records
+  `model_class` (`CNNRULPredictor`) and never `model_key` (`cnn`), so a
+  legitimate resume is not rejected for a naming difference.
+
+**No scientific semantics changed.** With no `ckpt_to_resume`, `train()` is
+the previous behaviour.
+

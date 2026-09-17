@@ -314,6 +314,18 @@ than a check of a shipped feature.
 | BH | While BF runs, confirm with `nvidia-smi` that two worker processes occupy the two selected GPUs and nothing else on the box was touched |
 | BI | Read `third_party/BatteryLife/models/CPTransformer.py` and confirm nothing in its forward/loss assumes a global batch, a fixed rank count, or cross-sample state — the audit `docs/DDP_CONTRACT.md` §6 needs before CPTransformer may be enabled |
 
+Resume from the web. One cheap NN model; do not start a long benchmark.
+
+| # | Check |
+| --- | --- |
+| BJ | Run a supported NN model (CNN/LSTM/MLP/Transformer) on a small config with `target epochs = 3` and a `checkpoint_freq` that writes at least once before the end |
+| BK | Confirm a `*.resume.ckpt` appeared in the run directory, and that `classify_checkpoint` reports it `resumable` with the expected epoch |
+| BL | Open Run History, select that run, expand **Resume training**: it shows the last checkpoint epoch and a target field. A BatLiNet or XGBoost run must show no Resume at all |
+| BM | Set target total epochs to 5 and press **Resume** |
+| BN | In the new run's log, confirm training begins at `checkpoint_epoch + 1` — not at 0, and not running 5 more on top |
+| BO | Confirm the source run is unchanged (same status, same metrics, same files) and the new run shows "Resumed from &lt;run_id&gt; at epoch N" |
+| BP | While the resumed run is going, press **Stop run** and confirm it becomes CANCELLED with no metrics; then repeat and let one finish to confirm a normal result |
+
 **True multi-GPU execution is still not implemented.** T checks that the
 platform says so rather than attempting one.
 
