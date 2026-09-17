@@ -212,7 +212,17 @@ class TestMultiGpuCapabilityGate(unittest.TestCase):
                 self.assertFalse(capability["supports_multi_gpu"])
                 self.assertIsNone(capability["multi_gpu_strategy"])
                 self.assertIn(MULTI_GPU_UNSUPPORTED_MESSAGE, capability["reason"])
-                self.assertIn("GPU_MULTI_GPU_AUDIT", capability["reason"])
+                # The reason must point at a document that explains it. The
+                # DDP work moved that explanation from the original audit to
+                # docs/DDP_CONTRACT.md; what matters is that one is cited, not
+                # which filename is current.
+                self.assertTrue(
+                    any(
+                        doc in capability["reason"]
+                        for doc in ("DDP_CONTRACT", "GPU_MULTI_GPU_AUDIT")
+                    ),
+                    capability["reason"],
+                )
 
     def test_cpu_and_single_gpu_are_not_blocked(self) -> None:
         for ids in ([], [0], [7]):
@@ -258,14 +268,43 @@ class TestMultiGpuCapabilityGate(unittest.TestCase):
 class TestLiveProgressIsNotRegressed(unittest.TestCase):
     """H: the streaming execution path must survive this milestone."""
 
-    def test_the_ui_still_executes_through_the_streaming_entry_point(self) -> None:
-        source = (
+    def test_the_streaming_entry_point_is_still_the_only_execution_path(self) -> None:
+        """The chain grew a link; it did not grow a second path.
+
+        Execution used to be UI -> execute_plan_streaming. It is now
+        UI -> RunManager -> execute_plan_streaming, so that the script is not
+        blocked and Cancel can work. What must stay true is that the
+        streaming executor remains the *only* thing that starts a run, and
+        that the page still spawns nothing itself.
+        """
+        ui_source = (
             REPO_ROOT / "batteryml_web" / "ui" / "agent_workflow.py"
         ).read_text(encoding="utf-8")
-        self.assertIn("execute_plan_streaming(", source)
-        self.assertIn("on_event=progress.on_event", source)
-        self.assertNotIn("import subprocess", source)
-        self.assertNotIn("popen", source.lower())
+        manager_source = (
+            REPO_ROOT / "batteryml_web" / "core" / "run_manager.py"
+        ).read_text(encoding="utf-8")
+
+        # The page starts runs only by handing them to the manager.
+        self.assertIn("get_run_manager()", ui_source)
+        self.assertNotIn("import subprocess", ui_source)
+        self.assertNotIn("popen", ui_source.lower())
+
+        # The manager starts them only through the streaming executor.
+        self.assertIn("execute_plan_streaming(", manager_source)
+        self.assertIn(
+            "from ..agent.streaming import execute_plan_streaming", manager_source
+        )
+
+    def test_the_page_still_renders_real_progress_events(self) -> None:
+        """The progress the page draws is the run's own reported state."""
+        ui_source = (
+            REPO_ROOT / "batteryml_web" / "ui" / "agent_workflow.py"
+        ).read_text(encoding="utf-8")
+        # Drawn from the manager's snapshot of the run's latest event...
+        self.assertIn("manager.snapshot(run_id)", ui_source)
+        self.assertIn("progress_caption(", ui_source)
+        # ...and the bar only where the run reported a fraction.
+        self.assertIn('event.get("fraction")', ui_source)
 
     def test_progress_parsing_still_refuses_to_fabricate(self) -> None:
         from batteryml_web.agent.streaming import classify_stage, parse_progress_line

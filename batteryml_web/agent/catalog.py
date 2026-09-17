@@ -320,15 +320,6 @@ def closest_model_keys(
 #: dataset and a model this installation actually has: a hardcoded example
 #: naming a model that was never registered teaches the user a request the
 #: platform will refuse.
-EXAMPLE_REQUEST_TEMPLATES: tuple[str, ...] = (
-    "Use {model} on {dataset} to predict battery lifetime.",
-    "Recommend a model to predict battery lifetime on {dataset}.",
-    "Forecast degradation trajectory for {dataset}.",
-    "帮我用 {dataset} 做电池寿命预测",
-    "{dataset} 上用 {model} 做寿命预测",
-)
-
-
 def _short_display(model_display: str, model_key: str) -> str:
     """The name a user would type: "CPTransformer", not the full subtitle.
 
@@ -401,25 +392,60 @@ def example_model(
     return _short_display(candidates[0].get("model_display"), candidates[0].get("model_key"))
 
 
-def build_example_requests(
+#: The shape shown to the user, with the slots left visible. Deliberately
+#: generic: it teaches the sentence pattern without pretending to be a
+#: curated example, and it is the same whatever this installation holds.
+REQUEST_TEMPLATE_STRUCTURE = "Use [Model] on [dataset] to predict [task]."
+
+#: How each canonical task reads inside that sentence. The canonical labels
+#: are the backend's ("RUL prediction"), which do not fit after "predict";
+#: these are the same tasks in the sentence's grammar, not extra tasks. A
+#: task with no entry falls back to its canonical label rather than being
+#: rewritten into something this platform does not run.
+TASK_PHRASES: Dict[str, str] = {
+    TASK_RUL: "battery lifetime",
+    TASK_SOH: "state of health",
+    TASK_TRAJECTORY: "the degradation trajectory",
+}
+
+
+def task_phrase_for(task: Optional[str]) -> str:
+    """How ``task`` reads inside the request sentence.
+
+    Falls back to the canonical label, so a task this table does not know is
+    named as the backend names it rather than silently becoming another one.
+    """
+    if not task:
+        return TASK_PHRASES[TASK_RUL]
+    return TASK_PHRASES.get(str(task), str(task))
+
+
+def build_request_template(
     catalog: Dict[str, Any],
     *,
     runnable_keys: Optional[Sequence[str]] = None,
-) -> List[str]:
-    """Clickable example requests, filled from this installation's catalog.
+    task: Optional[str] = None,
+) -> str:
+    """Fill :data:`REQUEST_TEMPLATE_STRUCTURE` from this installation.
 
-    Templates that need a model are dropped when the catalog offers none, so
-    an example never names something that does not exist. The returned
-    strings are plain requests: they are written into the request box and
-    resolved by the ordinary backend path, never executed.
+    The slots come from the live catalog — a READY dataset and a model with a
+    validated config for it, preferring one readiness currently reports as
+    runnable. Nothing here is a curated example: on an installation with
+    different data it produces a different sentence, which is what the
+    dynamic-UI tests check.
+
+    Where the catalog cannot supply a slot, the generic placeholder is kept
+    rather than substituting an invented name — a template that says
+    ``[dataset]`` is honest; one that names a dataset this platform does not
+    have is not. This is why the earlier hardcoded fallback sentence, and the
+    gallery of five example requests it belonged to, are gone.
     """
     dataset = example_dataset(catalog)
-    if not dataset:
-        return []
-    model = example_model(catalog, dataset, runnable_keys=runnable_keys)
-    examples: List[str] = []
-    for template in EXAMPLE_REQUEST_TEMPLATES:
-        if "{model}" in template and not model:
-            continue
-        examples.append(template.format(dataset=dataset, model=model or ""))
-    return examples
+    model = example_model(catalog, dataset, runnable_keys=runnable_keys) if dataset else None
+    return (
+        REQUEST_TEMPLATE_STRUCTURE
+        .replace("[Model]", model or "[Model]")
+        .replace("[dataset]", dataset or "[dataset]")
+        .replace("[task]", task_phrase_for(task))
+    )
+

@@ -97,6 +97,17 @@ def _load_prediction_payload(path: Path) -> Optional[Dict[str, Any]]:
     return payload if isinstance(payload, dict) else None
 
 
+def load_prediction_payload(path: Path) -> Optional[Dict[str, Any]]:
+    """Public entry point for :func:`_load_prediction_payload`.
+
+    Exists so other modules (the result views) read the saved artifact
+    through the same CPU-safe unpickler rather than writing a second one.
+    The CUDA-remapping logic above is subtle and must have exactly one
+    implementation.
+    """
+    return _load_prediction_payload(path)
+
+
 def _canonical_metrics(payload: Dict[str, Any]) -> tuple[Dict[str, float], List[str]]:
     """Extract the canonical ``scores`` stored by ``Pipeline.evaluate``.
 

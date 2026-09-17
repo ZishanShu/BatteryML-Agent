@@ -49,6 +49,24 @@ def refresh_llm_status_from_config() -> None:
         st.session_state["llm_status_message"] = "LLM settings saved. Connection not tested yet."
 
 
+#: How each status reads to a user. One mapping, so every surface says the
+#: same word for the same state. "Configured" is deliberately not
+#: "Connected": filling three fields is not evidence that the endpoint
+#: answers, and reporting it as connected was a claim the app had not
+#: checked.
+LLM_STATUS_LABELS = {
+    LLM_STATUS_NOT_CONFIGURED: "Not configured",
+    LLM_STATUS_CONFIGURED: "Configured (not tested)",
+    LLM_STATUS_CONNECTED: "Connected",
+    LLM_STATUS_FAILED: "Connection failed",
+}
+
+
+def describe_llm_status() -> str:
+    """The current status in the user's words, from the one stored status."""
+    return LLM_STATUS_LABELS.get(get_llm_status(), "Unknown")
+
+
 def get_llm_status() -> str:
     refresh_llm_status_from_config()
     return st.session_state.get("llm_status", LLM_STATUS_NOT_CONFIGURED)

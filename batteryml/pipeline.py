@@ -7,6 +7,7 @@ import os
 import torch
 import pickle
 import random
+import inspect
 import shutil
 import hashlib
 import numpy as np
@@ -19,6 +20,7 @@ from batteryml.data import DataBundle
 from batteryml.builders import MODELS
 from batteryml.utils import import_config
 from batteryml.models.base import BaseModel
+from batteryml import training_checkpoint as _resume_schema_module
 
 
 class Pipeline:
@@ -55,8 +57,16 @@ class Pipeline:
             original_epochs = self.config['model'].get('epochs')
             self.config['model']['epochs'] = epochs
 
+        # A *resumable* checkpoint continues training; a weights-only one is
+        # the pre-existing warm start and keeps its old path untouched.
+        resume_state = _load_resume_state(ckpt_to_resume)
+
         # Prepare model
-        model = self._prepare_model(ckpt_to_resume, device)
+        model = self._prepare_model(
+            None if resume_state is not None else ckpt_to_resume, device)
+        if resume_state is not None:
+            _load_model_state(model, resume_state.get('model_state'))
+            _restore_rng_state(resume_state.get('rng_state'))
         ts = timestamp()
 
         # Make a copy of the config in the workspace
@@ -65,7 +75,14 @@ class Pipeline:
                 self.config_path,
                 model.workspace / f'config_{ts}.yaml')
 
-        model.fit(dataset, timestamp=ts)
+        # Passed only to a fit() that accepts them, so a model with its own
+        # training loop (BatLiNet) is called exactly as before.
+        extra = _supported_fit_kwargs(
+            model,
+            resume_state=resume_state,
+            on_epoch_end=_resume_checkpoint_writer(self, model, seed, ts),
+        )
+        model.fit(dataset, timestamp=ts, **extra)
 
         # Restore the origianl epochs in config
         if epochs is not None:
@@ -254,3 +271,114 @@ def timestamp(marker: bool = False):
     return datetime.now().strftime(template)
 
 
+# --- resumable checkpoints -------------------------------------------------
+#
+# The schema lives in batteryml.training_checkpoint — the training layer,
+# beside the code that writes and reads these files. It used to live in the web
+# layer, which meant core BatteryML had to import the web application to resume
+# its own training; that dependency is gone. The web layer re-exports the same
+# module, so there is still one schema, one serializer and one validator.
+# Recorded in docs/UPSTREAM_PATCHES.md (UP-02).
+
+
+def _unwrap(model):
+    """The real module beneath torch.compile / DDP wrappers.
+
+    ``torch.compile`` is applied in ``_prepare_model``, and its state_dict
+    keys carry an ``_orig_mod.`` prefix. Saving that would make a checkpoint
+    fail to load into an uncompiled model — the same interoperability trap a
+    ``module.`` prefix is for DDP — so both are peeled off before saving and
+    before loading.
+    """
+    for attribute in ('_orig_mod', 'module'):
+        inner = getattr(model, attribute, None)
+        if inner is not None:
+            return _unwrap(inner)
+    return model
+
+
+def _load_resume_state(path):
+    """The resume payload at ``path``, or None if it is not a resumable one."""
+    if path is None:
+        return None
+    schema = _resume_schema_module
+    verdict = schema.classify_checkpoint(path)
+    if verdict['kind'] != schema.KIND_RESUMABLE:
+        # Weights-only, corrupt or from a newer schema: not a continuation.
+        # The caller's existing warm-start path handles the first case.
+        return None
+    return schema.load_raw(path)
+
+
+def _load_model_state(model, state):
+    if state:
+        _unwrap(model).load_state_dict(state)
+
+
+def _restore_rng_state(state):
+    if not state:
+        return
+    for warning in _resume_schema_module.restore_rng_state(state):
+        print(f'[resume] {warning}', flush=True)
+
+
+def _supported_fit_kwargs(model, **candidates):
+    """Only the kwargs this model's ``fit`` actually accepts.
+
+    A model that defines its own training loop keeps its own signature, so
+    nothing here changes how it is called.
+    """
+    try:
+        parameters = inspect.signature(model.fit).parameters
+    except (TypeError, ValueError):
+        return {}
+    return {
+        name: value for name, value in candidates.items()
+        if name in parameters and value is not None
+    }
+
+
+def _resume_checkpoint_writer(self, model, seed, ts):
+    """A per-epoch callback that writes a resumable checkpoint, or None.
+
+    Cadence follows the model's own ``checkpoint_freq``, so this adds no
+    extra writes beyond the ones training already performed — it makes those
+    writes carry optimizer, epoch and RNG state as well as the weights.
+    """
+    schema = _resume_schema_module
+    workspace = getattr(model, 'workspace', None)
+    frequency = getattr(model, 'checkpoint_freq', None)
+    if workspace is None or not frequency:
+        return None
+
+    def on_epoch_end(epoch, context):
+        if (epoch + 1) % frequency != 0:
+            return
+        inner = _unwrap(context.get('model', model))
+        optimizer = context.get('optimizer')
+        payload = schema.build_checkpoint(
+            model_state=inner.state_dict(),
+            optimizer_state=optimizer.state_dict() if optimizer is not None else None,
+            epoch=epoch + 1,
+            target_total_epochs=context.get('total_epochs'),
+            # What this layer can state truthfully. The dataset and task are
+            # the web layer's vocabulary, not the pipeline's, so they are not
+            # invented here; validate_resume reports any field it could not
+            # compare rather than assuming a match.
+            training_identity={
+                'seed': str(seed),
+                # The registered class, recorded under its own name. It is
+                # deliberately NOT called model_key: that is the web layer's
+                # vocabulary ("cnn"), and this is the config's
+                # ("CNNRULPredictor"). Storing one under the other's name
+                # would make a legitimate resume look like a mismatch.
+                'model_class': str(self.config['model'].get('name', '')),
+                'config_fingerprint': schema.config_fingerprint(self.config),
+            },
+        )
+        schema.save_checkpoint(
+            payload,
+            Path(workspace) / f'{ts}_seed_{seed}_epoch_{epoch + 1}.resume.ckpt',
+        )
+
+    return on_epoch_end

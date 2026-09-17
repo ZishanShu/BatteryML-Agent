@@ -22,6 +22,7 @@ Run from the repository root:
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -38,9 +39,18 @@ from tests.test_readiness import (  # noqa: E402
 from batteryml_web.agent.results import SMOKE_RUN_WARNING  # noqa: E402
 from batteryml_web.agent.run_policy import SMOKE_NOTICE  # noqa: E402
 from batteryml_web.core import device_inventory as di  # noqa: E402
+from batteryml_web.agent.catalog import (  # noqa: E402
+    REQUEST_TEMPLATE_STRUCTURE,
+)
+from batteryml_web.core.run_identity import is_run_id  # noqa: E402
+from batteryml_web.core.project_context import (  # noqa: E402
+    agent_workspace,
+    resolve_project,
+)
 from batteryml_web.ui import agent_workflow as ui  # noqa: E402
 from batteryml_web.ui import feedback as ui_feedback  # noqa: E402
 from batteryml_web.ui import llm_state as ui_llm_state  # noqa: E402
+from batteryml_web.ui import settings_panel as ui_settings  # noqa: E402
 
 #: A fixed two-GPU inventory. Seeded into session state by every render test
 #: so the UI never shells out to nvidia-smi during the suite and the device
@@ -89,15 +99,97 @@ class _ExpanderCtx:
         return False
 
 
+def _code_without_prose(module) -> str:
+    """A module's code with docstrings and comments dropped.
+
+    Static scans in this file assert what the code *does*. A docstring or a
+    ``#`` comment that quotes an old label, an example metric or a GPU name
+    while explaining why it is gone is documentation, and reading it as
+    behaviour makes a test that punishes the codebase for being explained.
+    """
+    import ast
+
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            body = getattr(node, "body", [])
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                node.body = body[1:] or [ast.Pass()]
+    # ast.unparse drops ``#`` comments as a side effect of re-rendering
+    # from the tree, which is the other half of what this needs.
+    return ast.unparse(tree)
+
+
+class _FakeRunManager:
+    """Records what the page asks of the manager; starts nothing.
+
+    The page no longer calls the streaming executor itself — it hands the
+    validated plan to a RunManager that executes on its own thread. These
+    tests assert the page's half of that contract: which run it started, that
+    it started exactly one, and that it started none for a refused plan.
+    """
+
+    def __init__(self, snapshots=None):
+        self.started: list[dict] = []
+        self.cancelled: list[str] = []
+        self._snapshots = dict(snapshots or {})
+
+    def start(self, *, run_id, run_dir, plan, repo_root, env=None, on_finished=None):
+        self.started.append({"run_id": run_id, "run_dir": str(run_dir), "plan": plan})
+        return None
+
+    def snapshot(self, run_id):
+        return self._snapshots.get(str(run_id))
+
+    def get(self, run_id):
+        return None
+
+    def cancel(self, run_id, **kwargs):
+        self.cancelled.append(str(run_id))
+        return True
+
+    def forget(self, run_id):
+        pass
+
+    def live_run_ids(self):
+        return list(self._snapshots)
+
+
 class _Col:
-    def __init__(self, rec: dict):
-        self._rec = rec
+    """Stand-in for one st.columns() cell.
+
+    It holds the fake itself, not just its recorder, because a widget in a
+    column is a widget: a button here must honour the same clicked set as one
+    rendered at top level, or a two-button row (Save / Connect) could never
+    be exercised.
+    """
+
+    def __init__(self, fake: "FakeStreamlit"):
+        self._fake = fake
+        self._rec = fake.rec
 
     def metric(self, label, value, **kwargs):
         self._rec["metrics"].append((str(label), str(value)))
 
     def caption(self, text, **kwargs):
         self._rec["captions"].append(str(text))
+
+    def button(self, label, **kwargs):
+        return self._fake.button(label, **kwargs)
+
+    def markdown(self, text, **kwargs):
+        self._rec["markdown"].append(str(text))
+
+    def write(self, *args, **kwargs):
+        self._fake.write(*args, **kwargs)
 
 
 class _Slot:
@@ -134,11 +226,15 @@ class FakeStreamlit:
         clicked_buttons: set[str] | None = None,
         checkbox_values: dict[str, bool] | None = None,
         multiselect_values: dict[str, list] | None = None,
+        radio_values: dict[str, str] | None = None,
+        selectbox_values: dict[str, str] | None = None,
     ):
         self.session_state = session
         self._clicked = set(clicked_buttons or ())
         self._checkbox_values = dict(checkbox_values or {})
         self._multiselect_values = dict(multiselect_values or {})
+        self._radio_values = dict(radio_values or {})
+        self._selectbox_values = dict(selectbox_values or {})
         self.rec: dict[str, list] = {
             "markdown": [],
             "captions": [],
@@ -158,6 +254,11 @@ class FakeStreamlit:
             "expander_writes": [],
             "multiselects": [],
             "headings": [],
+            "radios": [],
+            "text_inputs": [],
+            "text_areas": [],
+            "dialogs": [],
+            "fragments": [],
         }
         self.in_expander = False
 
@@ -199,19 +300,66 @@ class FakeStreamlit:
 
     def columns(self, spec, **kwargs):
         count = spec if isinstance(spec, int) else len(spec)
-        return [_Col(self.rec) for _ in range(count)]
+        return [_Col(self) for _ in range(count)]
 
     # --- widgets -------------------------------------------------------
     def text_area(self, label, value="", **kwargs):
+        # The placeholder is recorded because the request suggestion *is*
+        # the placeholder: grey, and not the user's request until accepted.
+        self.rec["text_areas"].append(
+            {
+                "label": str(label),
+                "value": str(value or ""),
+                "placeholder": str(kwargs.get("placeholder", "")),
+            }
+        )
+        key = kwargs.get("key")
+        if key is not None and str(key) in self.session_state:
+            return str(self.session_state[str(key)] or "")
         return str(value or "")
 
     def selectbox(self, label, options, index=0, **kwargs):
         opts = list(options)
         self.rec["selectboxes"].append({"label": str(label), "options": [str(o) for o in opts]})
-        return opts[index if index is not None else 0]
+        if str(label) in self._selectbox_values:
+            return self._selectbox_values[str(label)]
+        return opts[index if index is not None else 0] if opts else None
 
     def checkbox(self, label, **kwargs):
         return bool(self._checkbox_values.get(str(label), False))
+
+    def text_input(self, label, value="", **kwargs):
+        # ``type`` is recorded because the API key field must be masked; the
+        # *value* of a password field is deliberately not echoed anywhere a
+        # test recorder could leak it beyond this dict.
+        self.rec["text_inputs"].append(
+            {"label": str(label), "type": str(kwargs.get("type", "default"))}
+        )
+        key = kwargs.get("key")
+        if key is not None and str(key) in self.session_state:
+            return str(self.session_state[str(key)] or "")
+        return str(value or "")
+
+    def dialog(self, title, **kwargs):
+        """Stand-in for ``st.dialog``: records the title, runs the body.
+
+        The real decorator needs a live script run; here it simply returns
+        the function, so calling it executes the body inline and the widgets
+        inside land in the same recorder as everything else.
+        """
+        self.rec["dialogs"].append(str(title))
+
+        def decorator(func):
+            return func
+
+        return decorator
+
+    def radio(self, label, options, index=0, **kwargs):
+        opts = [str(o) for o in options]
+        self.rec["radios"].append({"label": str(label), "options": opts})
+        if str(label) in self._radio_values:
+            return self._radio_values[str(label)]
+        return opts[index if index is not None else 0]
 
     def multiselect(self, label, options, default=None, **kwargs):
         self.rec["multiselects"].append(
@@ -253,6 +401,21 @@ class FakeStreamlit:
 
     def rerun(self):
         raise _Rerun()
+
+    def fragment(self, func=None, **kwargs):
+        """Stand-in for st.fragment(run_every=...).
+
+        The real decorator re-executes only its own block on a timer. Here it
+        returns the function unchanged, so calling it runs the body once —
+        which is what a render test wants: one deterministic draw, not a
+        timer.
+        """
+        self.rec["fragments"].append(dict(kwargs))
+
+        def decorator(inner):
+            return inner
+
+        return decorator if func is None else func
 
 
 #: Example requests as the backend would build them for this stub catalog.
@@ -345,14 +508,26 @@ _MICH_CONTEXT = {
 }
 
 
-def _ok_plan(model: str = "cptransformer", epochs: int | None = None) -> dict:
+def _ok_plan(
+    model: str = "cptransformer",
+    epochs: int | None = None,
+    workspace: str = "runs/agent_matr_cptransformer",
+) -> dict:
+    """A planner stub shaped like a real plan.
+
+    ``workspace`` is threaded into the argv because that is where the real
+    planner puts it and where provenance reads it back from: a fixture that
+    ignored the caller's workspace would have the stub, not the page, decide
+    which project a run belongs to — exactly the bug these tests exist to
+    catch.
+    """
     command = [
         "python",
         "batteryml_web/core/run_batteryml_cli.py",
         "run",
         "configs/external/cptransformer/matr_1.yaml",
         "--workspace",
-        "runs/agent_matr_cptransformer",
+        str(workspace),
         "--train",
         "--eval",
         "--device",
@@ -402,8 +577,13 @@ def _render(
     clicked: set[str] | None = None,
     checkboxes: dict[str, bool] | None = None,
     multiselect_values: dict[str, list] | None = None,
+    radio_values: dict[str, str] | None = None,
+    selectbox_values: dict[str, str] | None = None,
 ) -> FakeStreamlit:
-    fake = FakeStreamlit(session, clicked, checkboxes, multiselect_values)
+    fake = FakeStreamlit(
+        session, clicked, checkboxes, multiselect_values, radio_values,
+        selectbox_values,
+    )
     with _fake_streamlit(fake):
         try:
             ui.render_agent_workflow()
@@ -415,12 +595,14 @@ def _render(
 class _fake_streamlit:
     """Point every UI module that reads Streamlit at the same fake.
 
-    Three modules hold their own ``st``: the page, the feedback helper
-    (which reads ``st.session_state`` to deduplicate toasts) and the LLM
-    settings helper (which reads the credentials). Missing one does not
-    raise — it silently reads the *real* Streamlit's empty session state,
-    which is how ``is_llm_configured()`` quietly returned False and made a
-    test look like a production bug.
+    Four modules hold their own ``st``: the page, the feedback helper
+    (which reads ``st.session_state`` to deduplicate toasts), the LLM
+    credential store and the settings panel (which opens the configuration
+    form and writes those credentials). Missing one does not raise — it
+    silently reads the *real* Streamlit's empty session state, which is how
+    ``is_llm_configured()`` quietly returned False and made a test look like
+    a production bug, and how the settings panel reached the real
+    ``st.dialog`` and raised ``open() is not a valid Streamlit command``.
     """
 
     def __init__(self, fake: FakeStreamlit):
@@ -428,7 +610,7 @@ class _fake_streamlit:
         self._saved: list = []
 
     def __enter__(self):
-        for module in (ui, ui_feedback, ui_llm_state):
+        for module in (ui, ui_feedback, ui_llm_state, ui_settings):
             self._saved.append((module, module.st))
             module.st = self._fake
         return self._fake
@@ -533,12 +715,35 @@ class TestPureBoundaryHelpers(unittest.TestCase):
         self.assertEqual(rows["Figures"], "ws/fig1.png")
 
     def test_workspace_stays_inside_runs_area(self) -> None:
-        ws = ui.workspace_for_request("MATR", "cptransformer", True)
-        self.assertTrue(ws.startswith("runs/"))
-        self.assertTrue(ws.endswith("_smoke"))
-        self.assertFalse(ui.workspace_for_request("MATR", "cptransformer", False).endswith("_smoke"))
-        escaped = ui.workspace_for_request("MATR", "cptransformer", False, project_root="/tmp/elsewhere")
+        """The UI owns no workspace rule of its own.
+
+        There used to be a second copy of this logic in the page, with its
+        own literal default path. Workspaces now come from
+        ``core.project_context`` only, so this asserts that module's
+        guarantees: always under ``runs/``, smoke runs kept apart, and a
+        project root that tries to leave the runs area brought back into it.
+        """
+        smoke = agent_workspace(
+            resolve_project(project_root=None), "MATR", "cptransformer", smoke=True
+        )
+        self.assertTrue(smoke.startswith("runs/"))
+        self.assertTrue(smoke.endswith("_smoke"))
+        full = agent_workspace(
+            resolve_project(project_root=None), "MATR", "cptransformer", smoke=False
+        )
+        self.assertFalse(full.endswith("_smoke"))
+        escaped = agent_workspace(
+            resolve_project(project_root="/tmp/elsewhere"),
+            "MATR",
+            "cptransformer",
+            smoke=False,
+        )
         self.assertTrue(escaped.startswith("runs/"))
+        self.assertNotIn("/tmp/", escaped)
+
+    def test_the_page_defines_no_workspace_of_its_own(self) -> None:
+        source = Path(ui.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("def workspace_for_request", source)
 
 
 class TestRenderBoundaries(unittest.TestCase):
@@ -556,6 +761,16 @@ class TestRenderBoundaries(unittest.TestCase):
         def stub_build(dataset, task, model, **kwargs):
             self._plan_calls.append({"dataset": dataset, "task": task, "model": model, **kwargs})
             return kwargs.get("__plan__") or _ok_plan(model, epochs=kwargs.get("epochs"))
+
+        self.manager = _FakeRunManager()
+        self._real_manager = ui.get_run_manager
+        self._real_write = ui.write_manifest
+        ui.get_run_manager = lambda: self.manager
+        # Nothing in a render test may touch the real runs/ directory.
+        self._manifests: list = []
+        ui.write_manifest = lambda run_dir, manifest: self._manifests.append(
+            (str(run_dir), manifest)
+        )
 
         def stub_execute(plan, **kwargs):
             self._exec_calls.append(plan)
@@ -600,6 +815,8 @@ class TestRenderBoundaries(unittest.TestCase):
         ui.execute_plan_streaming = self._real_execute
         ui.build_result_context = self._real_result_ctx
         ui.is_llm_configured = self._real_llm
+        ui.get_run_manager = self._real_manager
+        ui.write_manifest = self._real_write
 
     def _session(self, context: dict) -> dict:
         return {
@@ -625,18 +842,33 @@ class TestRenderBoundaries(unittest.TestCase):
         self.assertTrue(run_buttons and run_buttons[0]["disabled"] is False)
 
     def test_run_requires_explicit_button_and_validated_plan(self) -> None:
-        # Button not clicked: nothing executed.
+        """Run hands one job to the manager; nothing else starts anything.
+
+        Execution moved off the script's thread, so what the page is
+        responsible for is starting exactly one run, exactly when the button
+        is pressed, and never for a plan the backend refused.
+        """
+        # Button not clicked: nothing started.
         _render(self._session(_MATR_CONTEXT))
+        self.assertEqual(self.manager.started, [])
         self.assertEqual(self._exec_calls, [])
-        # Button clicked with a can_execute plan: executed exactly once.
+        # Button clicked with a can_execute plan: started exactly once, with
+        # a real run id, and recorded on disk before anything ran.
         _render(self._session(_MATR_CONTEXT), clicked={"Run"})
-        self.assertEqual(len(self._exec_calls), 1)
-        # Blocked plan (can_execute False): Run disabled, executor untouched.
-        self._exec_calls.clear()
-        self._real_build  # noqa: B018 (documented seam)
+        self.assertEqual(len(self.manager.started), 1)
+        self.assertTrue(is_run_id(self.manager.started[0]["run_id"]))
+        self.assertEqual(len(self._manifests), 1)
+        self.assertEqual(
+            self._manifests[0][1]["status"], "PLANNED",
+            "the manifest must exist before execution, not after",
+        )
+        # The page itself never calls the blocking executor any more.
+        self.assertEqual(self._exec_calls, [])
+        # Blocked plan (can_execute False): Run disabled, manager untouched.
+        self.manager.started.clear()
         ui.build_execution_plan = lambda dataset, task, model, **kw: _failed_plan(model)
         fake = _render(self._session(_MATR_CONTEXT), clicked={"Run"})
-        self.assertEqual(self._exec_calls, [])
+        self.assertEqual(self.manager.started, [])
         run_buttons = [b for b in fake.rec["buttons"] if b["label"] == ui.RUN_BUTTON_LABEL]
         self.assertTrue(run_buttons and run_buttons[0]["disabled"] is True)
 
@@ -707,11 +939,16 @@ class TestRenderBoundaries(unittest.TestCase):
             "provenance_warnings": ["Provenance could not be verified"],
         }
         fake = _render(session)
-        labels = dict(fake.rec["metrics"])
-        self.assertEqual(labels["RMSE"], "455.5853271484375")
-        self.assertEqual(labels["MAE"], "393.8516540527344")
-        self.assertEqual(labels["MAPE"], "0.6621854901313782")  # raw ratio preserved
-        self.assertTrue(any("66.22%" in c for c in fake.rec["captions"]))
+        # Compact row: short enough to read, canonical value preserved.
+        compact = " ".join(fake.rec["markdown"])
+        self.assertIn("455.585", compact)
+        self.assertIn("393.852", compact)
+        self.assertIn("0.662", compact)
+        self.assertIn("66.22%", compact)
+        # Full precision remains available in the details expander.
+        details = " ".join(fake.rec["captions"] + fake.rec["expander_writes"])
+        self.assertIn("455.5853271484375", details)
+        self.assertIn("0.6621854901313782", details)
         self.assertTrue(any("smoke run" in w.lower() for w in fake.rec["warnings"]))
         self.assertTrue(any("Provenance" in w for w in fake.rec["warnings"]))
 
@@ -809,14 +1046,10 @@ class TestBatLiNetSmokeRender(unittest.TestCase):
         self.assertEqual(call["model"], "batlinet")
         self.assertEqual(call["epochs"], 1)
         self.assertEqual(call["device"], "cpu")
-        # The compute control lists every enumerated GPU; none ticked means CPU.
-        gpu_box = [
-            box
-            for box in fake.rec["multiselects"]
-            if box["label"].startswith("GPUs")
-        ]
-        self.assertTrue(gpu_box, "the compute control is missing")
-        self.assertEqual(gpu_box[0]["options"], ["cuda:0", "cuda:1"])
+        # CPU is the default compute mode, chosen explicitly.
+        modes = [box for box in fake.rec["radios"] if box["label"] == ui.COMPUTE_LABEL]
+        self.assertTrue(modes, "the compute-device control is missing")
+        self.assertEqual(modes[0]["options"], ["CPU", "GPU"])
         self.assertEqual(
             session["agent_device_selection"], {"mode": "cpu", "gpu_ids": []}
         )
@@ -828,12 +1061,29 @@ class TestBatLiNetSmokeRender(unittest.TestCase):
         _render(session, checkboxes={ui.SMOKE_CHECKBOX_LABEL: False})
         self.assertIsNone(self._plan_calls[-1]["epochs"])
 
-    def test_gpu_inventory_is_displayed_not_invented(self) -> None:
-        fake = _render(self._batlinet_session())
-        rows = [row for frame in fake.rec["dataframes"] if isinstance(frame, list) for row in frame]
-        gpu_rows = [row for row in rows if isinstance(row, dict) and "GPU" in row]
-        self.assertEqual([row["Device"] for row in gpu_rows], ["cuda:0", "cuda:1"])
-        self.assertEqual(gpu_rows[0]["Free (MiB)"], "2076")
+    def test_gpu_information_is_displayed_not_invented(self) -> None:
+        """Runtime facts still reach the user — now in the selector itself.
+
+        The separate inventory table was dropped when the device UX was
+        simplified to CPU / one GPU: the option labels already carry index,
+        name, free memory and utilization, and a second table repeated them.
+        What must remain true is that every figure comes from the enumerated
+        device rather than from a constant.
+        """
+        fake = _render(
+            self._batlinet_session(),
+            radio_values={ui.COMPUTE_LABEL: "GPU"},
+            selectbox_values={ui.GPU_SELECT_LABEL: "cuda:0"},
+        )
+        boxes = [s for s in fake.rec["selectboxes"] if s["label"] == ui.GPU_SELECT_LABEL]
+        self.assertEqual(boxes[0]["options"], ["cuda:0", "cuda:1"])
+
+        inventory = _FAKE_GPU_INVENTORY["devices"]
+        for device in inventory:
+            label = ui.gpu_option_label(device["device"], _FAKE_GPU_INVENTORY)
+            self.assertIn(str(device["name"]), label)
+            self.assertIn(f"{device['memory_free_mib'] / 1024:.1f} GB free", label)
+            self.assertIn(f"{device['utilization_pct']}% util", label)
 
     def test_cuda_oom_result_shows_actionable_message_and_keeps_stderr(self) -> None:
         session = self._batlinet_session()
@@ -853,13 +1103,22 @@ class TestBatLiNetSmokeRender(unittest.TestCase):
             "dry_run": False,
         }
         fake = _render(session)
+        # The plain answer is the error line; the detail and the suggested
+        # actions follow it. Asserted across everything the page rendered,
+        # so the layout can change without the substance being lost.
         errors = " ".join(fake.rec["errors"])
-        self.assertIn("CUDA out of memory on cuda:0", errors)
-        actions = " ".join(fake.rec["writes"])
-        self.assertIn("CPU", actions)
-        self.assertIn("cuda:1", actions)  # only the GPU with more free memory
-        self.assertIn("never moves a failed run", actions)
-        # The raw traceback is still displayed verbatim.
+        self.assertIn("GPU memory", errors)
+        visible = " ".join(
+            fake.rec["errors"] + fake.rec["writes"] + fake.rec["markdown"]
+            + fake.rec["captions"]
+        )
+        self.assertIn("CUDA out of memory on cuda:0", visible)
+        self.assertIn("CPU", visible)
+        self.assertIn("cuda:1", visible)  # only the GPU with more free memory
+        self.assertIn("never moves a failed run", visible)
+        # ...and the page says outright that nothing was retried or swapped.
+        self.assertIn("Nothing was retried", visible)
+        # The raw traceback is still displayed verbatim, behind the details.
         self.assertTrue(any("OutOfMemoryError" in w for w in fake.rec["writes"]))
         # No metrics for a failed run.
         self.assertFalse(any(label in {"RMSE", "MAE", "MAPE"} for label, _ in fake.rec["metrics"]))
@@ -876,12 +1135,15 @@ class TestLiveProgressRendering(unittest.TestCase):
     def test_caption_shows_counter_only_when_the_run_reported_one(self) -> None:
         with_counter = ui.progress_caption("Training", 3, 10, 65.0)
         self.assertIn("Training", with_counter)
-        self.assertIn("step 3/10", with_counter)
-        self.assertIn("00:01:05", with_counter)
+        self.assertIn("3 / 10", with_counter)
+        self.assertIn("01:05", with_counter)
         without = ui.progress_caption("Loading data", None, None, 5.0)
         self.assertIn("Loading data", without)
-        self.assertNotIn("step", without)
+        self.assertIn("elapsed 00:05", without)
+        # No counter, no ETA, no invented countdown.
+        self.assertNotIn("/", without)
         self.assertNotIn("%", without)
+        self.assertNotIn("ETA", without)
 
     def test_bar_is_drawn_only_for_a_reported_fraction(self) -> None:
         fake, progress = self._slots()
@@ -921,137 +1183,162 @@ class TestLiveProgressRendering(unittest.TestCase):
             )
         self.assertEqual(len(fake.rec["infos"]), drawn)
 
-    def test_progress_is_drawn_while_the_run_is_still_going(self) -> None:
-        """R8: the page consumes callbacks during the run, not a final status.
+    def test_the_page_never_blocks_on_the_executor(self) -> None:
+        """The structural guarantee behind a working Cancel button.
 
-        The stub records what the page had drawn at the moment each event was
-        delivered. If the UI were blocking until the subprocess exited, every
-        event would arrive with nothing drawn and the result already stored.
+        Progress used to be proof that the page consumed events during the
+        run. It is now stronger than that: the page does not call the
+        blocking executor at all. It hands the plan to the RunManager, which
+        owns the thread, and returns — which is the only reason a Cancel
+        button drawn afterwards can ever receive a click.
         """
-        drawn_at_event: list[int] = []
-        result_stored_at_event: list[bool] = []
+        import ast
 
-        def stub_stream(plan, on_event=None, **kwargs):
-            for event in (
-                {"type": "stage", "stage": "Loading data", "current": None,
-                 "total": None, "fraction": None, "message": "Seed is set to 0."},
-                {"type": "training_progress", "stage": "Training", "current": 1,
-                 "total": 4, "fraction": 0.25, "message": "Training X:  25%|#| 1/4"},
-                {"type": "training_progress", "stage": "Training", "current": 4,
-                 "total": 4, "fraction": 1.0, "message": "Training X: 100%|#| 4/4"},
-            ):
-                if on_event is not None:
-                    on_event(event)
-                drawn_at_event.append(len(fake_holder[0].rec["infos"]))
-                result_stored_at_event.append(
-                    "agent_result_context" in fake_holder[0].session_state
-                )
-            return {
-                "started": True, "completed": True, "success": True, "returncode": 0,
-                "command": plan["command"], "workspace": "runs/w",
-                "stdout": "", "stderr": "", "error": None,
-                "artifacts": {}, "dry_run": False,
-                "final_stage": "Complete", "elapsed_s": 1.0,
-            }
-
-        real_stream = ui.execute_plan_streaming
-        real_build = ui.build_execution_plan
-        real_ctx = ui.build_result_context
-        real_llm = ui.is_llm_configured
-        ui.execute_plan_streaming = stub_stream
-        ui.build_execution_plan = lambda d, t_, m, **kw: _ok_plan(m, epochs=kw.get("epochs"))
-        ui.build_result_context = lambda ws, **kw: {
-            "workspace": ws, "success": True, "metrics": {}, "warnings": []
+        source = Path(ui.__file__).read_text(encoding="utf-8")
+        called = {
+            node.func.id
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
         }
-        ui.is_llm_configured = lambda: False
-        fake_holder: list = []
+        self.assertNotIn("execute_plan_streaming", called)
+        self.assertIn("get_run_manager", called)
+
+    def test_live_progress_is_drawn_from_the_managers_real_state(self) -> None:
+        """What is drawn is what the run reported — nothing is invented."""
+        snapshot = {
+            "run_id": "run_1",
+            "status": "RUNNING",
+            "finished": False,
+            "elapsed_s": 65.0,
+            "event": {
+                "type": "training_progress",
+                "stage": "Training",
+                "current": 3,
+                "total": 10,
+                "fraction": 0.3,
+                "message": "Training X:  30%|###| 3/10",
+            },
+            "tail": ["Training X:  30%|###| 3/10"],
+        }
+        manager = _FakeRunManager({"run_1": snapshot})
+        real_manager = ui.get_run_manager
+        ui.get_run_manager = lambda: manager
         try:
-            session = {
-                "agent_workflow_context": _MATR_CONTEXT,
-                "gpu_inventory": _FAKE_GPU_INVENTORY,
-            }
-            fake = FakeStreamlit(session, {"Run"})
-            fake_holder.append(fake)
+            fake = FakeStreamlit({})
+            with _fake_streamlit(fake):
+                ui._render_active_run("run_1", plan={}, smoke=False, device="cpu")
+        finally:
+            ui.get_run_manager = real_manager
+
+        captions = " ".join(fake.rec["captions"])
+        self.assertIn("Training", captions)
+        self.assertIn("3 / 10", captions)
+        self.assertIn("01:05", captions)
+        # The bar is drawn only because the run reported a fraction.
+        self.assertEqual(fake.rec["progress"], [0.3])
+        # The refresh is a timed fragment, not a rerun loop.
+        self.assertTrue(fake.rec["fragments"])
+        self.assertEqual(
+            fake.rec["fragments"][0]["run_every"], ui.PROGRESS_POLL_SECONDS
+        )
+
+    def test_a_running_run_offers_a_cancel_button_that_reaches_the_manager(self) -> None:
+        snapshot = {
+            "run_id": "run_1", "status": "RUNNING", "finished": False,
+            "elapsed_s": 5.0, "event": {"stage": "Training"}, "tail": [],
+        }
+        manager = _FakeRunManager({"run_1": snapshot})
+        real_manager = ui.get_run_manager
+        ui.get_run_manager = lambda: manager
+        try:
+            fake = FakeStreamlit({}, {ui.CANCEL_BUTTON_LABEL})
             with _fake_streamlit(fake):
                 try:
-                    ui.render_agent_workflow()
+                    ui._render_active_run("run_1", plan={}, smoke=False, device="cpu")
                 except _Rerun:
                     pass
         finally:
-            ui.execute_plan_streaming = real_stream
-            ui.build_execution_plan = real_build
-            ui.build_result_context = real_ctx
-            ui.is_llm_configured = real_llm
+            ui.get_run_manager = real_manager
+        self.assertEqual(manager.cancelled, ["run_1"])
 
-        self.assertEqual(len(drawn_at_event), 3, "the page did not consume the events")
-        # Something was drawn by the time the first event had been handled...
-        self.assertGreater(drawn_at_event[0], 0)
-        # ...and the drawing grew as later events arrived, which cannot happen
-        # if the page waits for the process to exit before rendering.
-        self.assertGreater(drawn_at_event[-1], 0)
-        # The result context did not exist yet while progress was being drawn.
-        self.assertEqual(result_stored_at_event, [False, False, False])
-
-    def test_run_click_streams_and_stores_no_fabricated_metrics(self) -> None:
-        emitted: list[dict] = []
-
-        def stub_stream(plan, on_event=None, **kwargs):
-            for event in (
-                {"type": "stage", "stage": "Loading data", "current": None,
-                 "total": None, "fraction": None, "message": "Seed is set to 0."},
-                {"type": "training_progress", "stage": "Training", "current": 1,
-                 "total": 1, "fraction": 1.0, "message": "Training BatLiNet: 100%|##| 1/1"},
-                {"type": "completed", "stage": "Complete", "current": None,
-                 "total": None, "fraction": 1.0, "message": "Finished in 6.8s."},
-            ):
-                emitted.append(event)
-                if on_event is not None:
-                    on_event(event)
-            return {
-                "started": True, "completed": True, "success": True, "returncode": 0,
-                "command": plan["command"], "workspace": "runs/agent_matr_batlinet_smoke",
-                "stdout": "{'RMSE': 794.32}", "stderr": "", "error": None,
-                "artifacts": {"prediction_files": []}, "dry_run": False,
-                "final_stage": "Complete", "elapsed_s": 6.8,
-            }
-
-        real_stream = ui.execute_plan_streaming
-        real_build = ui.build_execution_plan
+    def test_no_metric_is_ever_read_out_of_the_runs_output(self) -> None:
+        """stdout may contain something that looks like a metric. It is not one."""
+        captured: list = []
         real_ctx = ui.build_result_context
-        real_llm = ui.is_llm_configured
-        seen: list[dict] = []
+        real_manager = ui.get_run_manager
 
-        def stub_ctx(workspace, **kwargs):
-            seen.append(kwargs)
-            return {"workspace": workspace, "success": True, "metrics": {}, "warnings": []}
-
-        ui.execute_plan_streaming = stub_stream
-        ui.build_execution_plan = lambda d, t_, m, **kw: _ok_plan(m, epochs=kw.get("epochs"))
-        ui.build_result_context = stub_ctx
-        ui.is_llm_configured = lambda: False
-        try:
-            session = {
-                "agent_workflow_context": _MATR_CONTEXT,
-                "agent_original_request": "Use BatLiNet on MATR to predict battery lifetime.",
-                "gpu_inventory": _FAKE_GPU_INVENTORY,
+        class _Handle:
+            run_dir = Path("/tmp/does-not-matter")
+            result = {
+                "success": True,
+                "workspace": "runs/web_projects/alpha/agent_matr_batlinet/run_1",
+                "returncode": 0,
+                # A number in the output that must never become a metric.
+                "stdout": "{'RMSE': 794.32}",
+                "stderr": "",
+                "command": [],
             }
-            fake = _render(session, clicked={"Run"}, checkboxes={ui.SMOKE_CHECKBOX_LABEL: True})
-        finally:
-            ui.execute_plan_streaming = real_stream
-            ui.build_execution_plan = real_build
-            ui.build_result_context = real_ctx
-            ui.is_llm_configured = real_llm
 
-        self.assertEqual(len(emitted), 3)
-        # Every fraction drawn came from an event that carried one; the UI
-        # never manufactures a position of its own.
-        carried = {e["fraction"] for e in emitted if e.get("fraction") is not None}
-        self.assertTrue(fake.rec["progress"])
-        self.assertTrue(set(fake.rec["progress"]) <= carried)
-        # Metrics come from build_result_context, never from the streamed stdout.
-        self.assertTrue(seen)
-        self.assertEqual(seen[0]["run_status"], "SUCCESS")
-        self.assertFalse(any("794.32" in text for text in fake.rec["infos"]))
+        class _Manager(_FakeRunManager):
+            def get(self, run_id):
+                return _Handle()
+
+        manager = _Manager()
+        ui.get_run_manager = lambda: manager
+        ui.build_result_context = lambda ws, **kw: (
+            captured.append(ws) or {"workspace": ws, "success": True,
+                                    "metrics": {}, "warnings": []}
+        )
+        try:
+            session = {"agent_execution_plan": _ok_plan("batlinet")}
+            fake = FakeStreamlit(session)
+            with _fake_streamlit(fake):
+                ui._finish_active_run(
+                    "run_1", {"status": "COMPLETED"}, smoke=False
+                )
+        finally:
+            ui.build_result_context = real_ctx
+            ui.get_run_manager = real_manager
+
+        # Metrics came from the canonical backend reader, given the run's own
+        # workspace — never parsed from the text above.
+        self.assertEqual(captured, ["runs/web_projects/alpha/agent_matr_batlinet/run_1"])
+        self.assertEqual(session["agent_result_context"]["metrics"], {})
+        self.assertNotIn("794.32", json.dumps(session["agent_result_context"]))
+
+    def test_a_cancelled_run_never_produces_a_result_context(self) -> None:
+        """A killed run has measured nothing, so it offers no metrics."""
+        real_ctx = ui.build_result_context
+        real_manager = ui.get_run_manager
+        built: list = []
+
+        class _Handle:
+            run_dir = Path("/tmp/does-not-matter")
+            result = {"success": False, "workspace": "w", "returncode": -15,
+                      "stdout": "partial", "stderr": "", "command": []}
+
+        class _Manager(_FakeRunManager):
+            def get(self, run_id):
+                return _Handle()
+
+        ui.get_run_manager = lambda: _Manager()
+        ui.build_result_context = lambda ws, **kw: built.append(ws) or {}
+        try:
+            session = {"agent_execution_plan": _ok_plan("batlinet")}
+            fake = FakeStreamlit(session)
+            with _fake_streamlit(fake):
+                ui._finish_active_run(
+                    "run_1", {"status": "CANCELLED"}, smoke=False
+                )
+        finally:
+            ui.build_result_context = real_ctx
+            ui.get_run_manager = real_manager
+
+        self.assertEqual(built, [], "no result context for a cancelled run")
+        # The key is removed rather than set to None: there is no result to
+        # show, so nothing stale can be rendered from it either.
+        self.assertNotIn("agent_result_context", session)
+        self.assertEqual(session["last_run_status"], "cancelled")
 
 
 class TestHandoverFromHome(unittest.TestCase):
@@ -1319,13 +1606,15 @@ class TestLlmAssistedIntentInTheUi(unittest.TestCase):
         self.assertEqual(session["agent_suggestions"]["blocked"], ["PBT"])
 
 
-class TestRequestTabsAndExamples(unittest.TestCase):
-    """B: two ways to supply a request; examples fill the box and stop there."""
+class TestRequestAreaIsOneControl(unittest.TestCase):
+    """One box, one template helper: no tabs, no gallery, no key hooks."""
+
+    TEMPLATE = "Use CPTransformer on MATR to predict battery lifetime."
 
     def setUp(self) -> None:
         self._real_resolve = ui.resolve_workflow_intent_with_llm
         self._real_catalog = ui.build_intent_catalog
-        self._real_examples = ui.build_example_requests
+        self._real_template = ui.build_request_template
         self._real_stream = ui.execute_plan_streaming
         self._real_llm = ui.is_llm_configured
         self.analysed: list[str] = []
@@ -1333,178 +1622,182 @@ class TestRequestTabsAndExamples(unittest.TestCase):
 
         def stub_resolve(request, **kwargs):
             self.analysed.append(request)
-            raise AssertionError("clicking an example must not analyse")
+            raise AssertionError("using the template must not analyse")
 
         def stub_stream(plan, **kwargs):
             self.executed.append(plan)
-            raise AssertionError("clicking an example must not execute")
+            raise AssertionError("using the template must not execute")
 
         ui.resolve_workflow_intent_with_llm = stub_resolve
         ui.execute_plan_streaming = stub_stream
         ui.build_intent_catalog = lambda **kw: _FAKE_CATALOG
-        ui.build_example_requests = lambda catalog, **kw: list(_FAKE_EXAMPLES)
+        ui.build_request_template = lambda catalog, **kw: self.TEMPLATE
         ui.is_llm_configured = lambda: False
 
     def tearDown(self) -> None:
         ui.resolve_workflow_intent_with_llm = self._real_resolve
         ui.build_intent_catalog = self._real_catalog
-        ui.build_example_requests = self._real_examples
+        ui.build_request_template = self._real_template
         ui.execute_plan_streaming = self._real_stream
         ui.is_llm_configured = self._real_llm
 
-    def test_the_two_tabs_are_rendered_in_order(self) -> None:
+    # --- the gallery is gone ------------------------------------------
+    def test_no_tabs_are_rendered_for_the_request(self) -> None:
         fake = _render({"gpu_inventory": _FAKE_GPU_INVENTORY})
-        self.assertIn(["Describe request", "Examples"], fake.rec["tabs"])
-        self.assertEqual(ui.REQUEST_TABS, ("Describe request", "Examples"))
+        for group in fake.rec["tabs"]:
+            self.assertNotIn("Examples", group)
+            self.assertNotIn("Describe request", group)
+        self.assertFalse(hasattr(ui, "REQUEST_TABS"))
 
-    def test_examples_are_offered_as_buttons(self) -> None:
+    def test_the_example_gallery_is_gone_from_the_source(self) -> None:
+        source = Path(ui.__file__).read_text(encoding="utf-8")
+        for gone in (
+            "REQUEST_TABS",
+            "_render_examples",
+            "build_example_requests",
+            "agent_example_requests",
+            "build_request_suggestion",
+        ):
+            self.assertNotIn(gone, source, f"{gone} still present in the page")
+
+    def test_no_gallery_of_example_buttons_is_rendered(self) -> None:
         fake = _render({"gpu_inventory": _FAKE_GPU_INVENTORY})
-        labels = [button["label"] for button in fake.rec["buttons"]]
-        for example in _FAKE_EXAMPLES:
-            self.assertIn(example, labels)
+        labels = [b["label"] for b in fake.rec["buttons"]]
+        # Exactly one suggestion affordance, not a list of requests.
+        self.assertEqual(labels.count(ui.USE_TEMPLATE_LABEL), 1)
+        for label in labels:
+            self.assertNotIn("帮我用", label)
 
-    def test_clicking_an_example_fills_the_box_and_does_nothing_else(self) -> None:
-        session = {"gpu_inventory": _FAKE_GPU_INVENTORY, "agent_request_input": "stale text"}
-        chosen = _FAKE_EXAMPLES[0]
-        _render(session, clicked={chosen})
-        # Written into the same field the Describe request tab reads...
-        self.assertEqual(session["agent_original_request"], chosen)
-        # ...the stale widget value is cleared so the box shows it...
-        self.assertNotIn("agent_request_input", session)
-        # ...and nothing was analysed or executed.
-        self.assertEqual(self.analysed, [])
-        self.assertEqual(self.executed, [])
-        self.assertNotIn("agent_workflow_context", session)
+    # --- one suggestion ------------------------------------------------
+    def test_the_empty_box_shows_the_generic_template_shape(self) -> None:
+        """The placeholder teaches the pattern, not a curated example."""
+        fake = _render({"gpu_inventory": _FAKE_GPU_INVENTORY})
+        areas = [a for a in fake.rec["text_areas"] if a["label"] == ui.REQUEST_LABEL]
+        self.assertEqual(len(areas), 1)
+        self.assertEqual(areas[0]["placeholder"], REQUEST_TEMPLATE_STRUCTURE)
+        # The slots are visible in the hint; the filled values arrive only
+        # when the user asks for them.
+        for slot in ("[Model]", "[dataset]", "[task]"):
+            self.assertIn(slot, areas[0]["placeholder"])
+        self.assertEqual(areas[0]["value"], "")
 
-    def test_examples_are_computed_once_and_cached(self) -> None:
+    def test_the_suggestion_is_computed_once_and_cached(self) -> None:
         calls: list = []
 
         def counting(catalog, **kwargs):
             calls.append(kwargs)
-            return list(_FAKE_EXAMPLES)
+            return self.TEMPLATE
 
-        ui.build_example_requests = counting
+        ui.build_request_template = counting
         session = {"gpu_inventory": _FAKE_GPU_INVENTORY}
         _render(session)
         _render(session)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(session["agent_example_requests"], list(_FAKE_EXAMPLES))
+        self.assertEqual(session["agent_request_template"], self.TEMPLATE)
 
-    def test_an_empty_catalog_offers_no_example_rather_than_a_fake_one(self) -> None:
-        ui.build_example_requests = lambda catalog, **kw: []
-        fake = _render({"gpu_inventory": _FAKE_GPU_INVENTORY})
-        self.assertTrue(any("No example can be offered" in text for text in fake.rec["infos"]))
-
-    def test_no_model_name_is_written_into_the_example_ui(self) -> None:
-        """The examples come from the backend; the page names no model."""
+    def test_the_page_names_no_model_or_dataset_of_its_own(self) -> None:
         source = Path(ui.__file__).read_text(encoding="utf-8")
-        render_examples = source.split("def _render_examples")[1].split("\ndef ")[0]
+        block = source.split("def request_template")[1].split("\ndef ")[0]
         for name in ("CPTransformer", "BatLiNet", "XGBoost", "PBT", "MATR"):
-            self.assertNotIn(name, render_examples)
+            self.assertNotIn(name, block)
 
+    # --- accepting it ---------------------------------------------------
+    def test_accepting_writes_the_canonical_request_state(self) -> None:
+        """Two runs, because that is how a keyed widget is re-seeded.
 
-class TestGpuMultiSelectRender(unittest.TestCase):
-    """G: CPU / one GPU / several, with Run gated on backend capability."""
+        The click records the intent and reruns; the next run writes the
+        widget key *before* the text area is built. A browser check of the
+        first attempt — which popped the key and leaned on ``value=`` —
+        showed the box still empty, so this asserts the text really lands in
+        the widget, not only in the canonical state.
+        """
+        session = {"gpu_inventory": _FAKE_GPU_INVENTORY}
+        _render(session, clicked={ui.USE_TEMPLATE_LABEL})
+        self.assertTrue(session[ui.USE_TEMPLATE_KEY])
 
-    def setUp(self) -> None:
-        self._real_build = ui.build_execution_plan
-        self._real_stream = ui.execute_plan_streaming
-        self._real_llm = ui.is_llm_configured
-        self.plans: list[dict] = []
-        self.executed: list = []
+        fake = _render(session)
+        # The same key manual typing writes — one state, not three.
+        self.assertEqual(session[ui.REQUEST_STATE_KEY], self.TEMPLATE)
+        self.assertEqual(ui.REQUEST_STATE_KEY, "agent_original_request")
+        # ...and the box itself now holds it.
+        self.assertEqual(session[ui.REQUEST_WIDGET_KEY], self.TEMPLATE)
+        areas = [a for a in fake.rec["text_areas"] if a["label"] == ui.REQUEST_LABEL]
+        self.assertEqual(areas[0]["value"], self.TEMPLATE)
+        # The one-shot flag is consumed, so a later rerun cannot re-accept
+        # over text the user has since typed.
+        self.assertNotIn(ui.USE_TEMPLATE_KEY, session)
 
-        def stub_build(dataset, task, model, **kwargs):
-            self.plans.append({"model": model, **kwargs})
-            return _ok_plan(model, epochs=kwargs.get("epochs"))
+    def test_accepting_does_not_analyse_call_the_llm_or_execute(self) -> None:
+        session = {"gpu_inventory": _FAKE_GPU_INVENTORY}
+        _render(session, clicked={ui.USE_TEMPLATE_LABEL})
+        _render(session)
+        self.assertEqual(self.analysed, [])
+        self.assertEqual(self.executed, [])
+        self.assertNotIn("agent_workflow_context", session)
+        self.assertNotIn("agent_execution_plan", session)
 
-        ui.build_execution_plan = stub_build
-        ui.execute_plan_streaming = lambda plan, **kw: self.executed.append(plan)
-        ui.is_llm_configured = lambda: False
-
-    def tearDown(self) -> None:
-        ui.build_execution_plan = self._real_build
-        ui.execute_plan_streaming = self._real_stream
-        ui.is_llm_configured = self._real_llm
-
-    def _session(self) -> dict:
-        return {
-            "agent_workflow_context": _MATR_CONTEXT,
-            "agent_original_request": "Use BatLiNet on MATR to predict battery lifetime.",
-            "agent_selected_model": "batlinet",
+    def test_typed_text_is_never_overwritten_by_the_suggestion(self) -> None:
+        typed = "Run BatLiNet on HUST"
+        session = {
             "gpu_inventory": _FAKE_GPU_INVENTORY,
+            ui.REQUEST_STATE_KEY: typed,
+            "agent_request_input": typed,
         }
+        fake = _render(session, clicked={ui.USE_TEMPLATE_LABEL})
+        # The accept control is not even offered once the field has content.
+        labels = [b["label"] for b in fake.rec["buttons"]]
+        self.assertNotIn(ui.USE_TEMPLATE_LABEL, labels)
+        self.assertEqual(session[ui.REQUEST_STATE_KEY], typed)
 
-    def test_no_gpu_selected_runs_on_cpu(self) -> None:
-        session = self._session()
-        fake = _render(session, multiselect_values={"GPUs (leave empty to run on CPU)": []})
-        self.assertEqual(session["agent_device_selection"], {"mode": "cpu", "gpu_ids": []})
-        self.assertEqual(self.plans[-1]["device"], "cpu")
-        run_buttons = [b for b in fake.rec["buttons"] if b["label"] == ui.RUN_BUTTON_LABEL]
-        self.assertTrue(run_buttons and run_buttons[0]["disabled"] is False)
+    def test_text_typed_before_the_click_lands_is_not_overwritten(self) -> None:
+        """The race a browser check exposed.
 
-    def test_one_gpu_selected_stays_executable(self) -> None:
-        session = self._session()
-        fake = _render(
-            session, multiselect_values={"GPUs (leave empty to run on CPU)": ["cuda:1"]}
-        )
-        self.assertEqual(
-            session["agent_device_selection"], {"mode": "single_gpu", "gpu_ids": [1]}
-        )
-        self.assertEqual(self.plans[-1]["device"], "cuda:1")
-        run_buttons = [b for b in fake.rec["buttons"] if b["label"] == ui.RUN_BUTTON_LABEL]
-        self.assertTrue(run_buttons and run_buttons[0]["disabled"] is False)
+        Streamlit commits a text area on blur, so the accept control can
+        still be on screen while the user types. Clicking it blurs the box,
+        which commits their text on the very run that applies the
+        acceptance. Their text must win.
+        """
+        typed = "Run BatLiNet on MATR"
+        session = {"gpu_inventory": _FAKE_GPU_INVENTORY}
+        _render(session, clicked={ui.USE_TEMPLATE_LABEL})
+        self.assertTrue(session[ui.USE_TEMPLATE_KEY])
+        # The blur commits what they typed, then the accepting run happens.
+        session[ui.REQUEST_WIDGET_KEY] = typed
+        _render(session)
+        self.assertEqual(session[ui.REQUEST_WIDGET_KEY], typed)
+        self.assertNotEqual(session.get(ui.REQUEST_STATE_KEY), self.TEMPLATE)
 
-    def test_several_gpus_disable_run_with_the_exact_message(self) -> None:
-        session = self._session()
-        fake = _render(
-            session,
-            multiselect_values={"GPUs (leave empty to run on CPU)": ["cuda:0", "cuda:1"]},
-        )
-        # The selection is kept exactly as chosen, not reduced to one GPU.
-        self.assertEqual(
-            session["agent_device_selection"], {"mode": "multi_gpu", "gpu_ids": [0, 1]}
-        )
-        # No plan was built, so no device string was needed.
-        self.assertEqual(self.plans, [])
-        self.assertEqual(self.executed, [])
-        errors = " ".join(fake.rec["errors"])
-        self.assertIn(
-            "This model/runtime does not yet support multi-GPU execution.", errors
-        )
-        run_buttons = [b for b in fake.rec["buttons"] if b["label"] == ui.RUN_BUTTON_LABEL]
-        self.assertTrue(run_buttons)
-        self.assertTrue(all(button["disabled"] for button in run_buttons))
+    def test_the_accept_rule_is_pure_and_refuses_a_non_empty_field(self) -> None:
+        self.assertTrue(ui.accept_template(self.TEMPLATE, ""))
+        self.assertTrue(ui.accept_template(self.TEMPLATE, "   "))
+        self.assertFalse(ui.accept_template(self.TEMPLATE, "typed"))
+        self.assertFalse(ui.accept_template("", ""))
 
-    def test_a_multi_gpu_selection_cannot_be_executed_by_clicking(self) -> None:
-        session = self._session()
-        _render(
-            session,
-            clicked={ui.RUN_BUTTON_LABEL},
-            multiselect_values={"GPUs (leave empty to run on CPU)": ["cuda:0", "cuda:1"]},
-        )
-        self.assertEqual(self.executed, [])
+    def test_analyze_remains_the_explicit_action(self) -> None:
+        fake = _render({"gpu_inventory": _FAKE_GPU_INVENTORY})
+        self.assertIn("Analyze", [b["label"] for b in fake.rec["buttons"]])
+        self.assertEqual(self.analysed, [])
 
-    def test_the_capability_fields_are_shown(self) -> None:
-        session = self._session()
-        fake = _render(
-            session,
-            multiselect_values={"GPUs (leave empty to run on CPU)": ["cuda:0", "cuda:1"]},
-        )
-        captions = " ".join(fake.rec["captions"])
-        self.assertIn("supports_multi_gpu: False", captions)
-        self.assertIn("multi_gpu_strategy: None", captions)
+    def test_no_keyboard_interception_is_claimed_or_injected(self) -> None:
+        """Section 4: do not fake Tab completion.
 
-    def test_the_inventory_table_shows_utilization(self) -> None:
-        fake = _render(self._session(), multiselect_values={})
-        rows = [
-            row
-            for frame in fake.rec["dataframes"]
-            if isinstance(frame, list)
-            for row in frame
-            if isinstance(row, dict) and "GPU" in row
-        ]
-        self.assertTrue(rows)
-        self.assertIn("Utilization (%)", rows[0])
+        The page must not inject a key handler, and must not tell the user
+        that Tab does something it does not do.
+        """
+        source = Path(ui.__file__).read_text(encoding="utf-8")
+        for forbidden in (
+            "keydown",
+            "addEventListener",
+            "preventDefault",
+            "window.parent",
+            "unsafe_allow_html",
+            "declare_component",
+            "_bidi_component",
+        ):
+            self.assertNotIn(forbidden, source)
+        rendered = repr(_render({"gpu_inventory": _FAKE_GPU_INVENTORY}).rec)
+        self.assertNotIn("Press Tab", rendered)
+        self.assertNotIn("press Tab", rendered)
 
 
 class TestTheFakeCoversTheRealSurface(unittest.TestCase):
@@ -1526,7 +1819,7 @@ class TestTheFakeCoversTheRealSurface(unittest.TestCase):
         import ast
 
         used: set[str] = set()
-        for module in (ui, ui_feedback, ui_llm_state):
+        for module in (ui, ui_feedback, ui_llm_state, ui_settings):
             tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
             for node in ast.walk(tree):
                 if (
@@ -1647,6 +1940,587 @@ class TestTheLlmResolverIsOnTheRealPath(unittest.TestCase):
         )
         self.assertEqual(presentation["mode"], "recommendation")
         self.assertEqual([e["model"] for e in presentation["primary"]], ["cptransformer"])
+
+
+def _inventory_with(count: int) -> dict:
+    """An inventory of exactly ``count`` GPUs, built like the real one."""
+    csv = "".join(
+        f"{i}, NVIDIA GeForce RTX 3090, 24576, 22500, 2076, {40 + i}\n"
+        for i in range(count)
+    )
+    devices = di.parse_nvidia_smi_gpu_csv(csv)
+    return {
+        "source": "nvidia-smi",
+        "available": bool(devices),
+        "device_count": len(devices),
+        "devices": devices,
+        "error": None if devices else "nvidia-smi reported no GPU.",
+    }
+
+
+class TestComputeDeviceSelector(unittest.TestCase):
+    """The product supports CPU and one GPU. Nothing else is offered.
+
+    Multi-GPU selection was removed from the normal UI: no model can execute
+    a distributed run (docs/DDP_CONTRACT.md), so offering the choice put an
+    error box in front of anyone who tried it. The DDP infrastructure and its
+    tests remain; only the user-facing offer is gone.
+    """
+
+    def setUp(self) -> None:
+        self._real_build = ui.build_execution_plan
+        self._real_stream = ui.execute_plan_streaming
+        self._real_llm = ui.is_llm_configured
+        self._real_manager = ui.get_run_manager
+        self._real_write = ui.write_manifest
+        self.plans: list[dict] = []
+        ui.build_execution_plan = lambda d, t_, m, **kw: (
+            self.plans.append({"model": m, **kw})
+            or _ok_plan(m, epochs=kw.get("epochs"), workspace=kw["workspace"])
+        )
+        ui.execute_plan_streaming = lambda plan, **kw: None
+        ui.is_llm_configured = lambda: False
+        ui.get_run_manager = lambda: _FakeRunManager()
+        ui.write_manifest = lambda run_dir, manifest: None
+
+    def tearDown(self) -> None:
+        ui.build_execution_plan = self._real_build
+        ui.execute_plan_streaming = self._real_stream
+        ui.is_llm_configured = self._real_llm
+        ui.get_run_manager = self._real_manager
+        ui.write_manifest = self._real_write
+
+    def _session(self, inventory: dict) -> dict:
+        return {
+            "agent_workflow_context": _MATR_CONTEXT,
+            "agent_selected_model": "batlinet",
+            "gpu_inventory": inventory,
+            "project_root": "runs/web_projects/alpha",
+        }
+
+    def test_the_only_compute_choices_are_cpu_and_gpu(self) -> None:
+        fake = _render(self._session(_inventory_with(2)))
+        modes = [b for b in fake.rec["radios"] if b["label"] == ui.COMPUTE_LABEL]
+        self.assertEqual(modes[0]["options"], ["CPU", "GPU"])
+
+    def test_cpu_needs_no_gpu_interaction(self) -> None:
+        session = self._session(_inventory_with(2))
+        fake = _render(session, radio_values={ui.COMPUTE_LABEL: "CPU"})
+        self.assertEqual(
+            [s for s in fake.rec["selectboxes"] if s["label"] == ui.GPU_SELECT_LABEL], []
+        )
+        self.assertEqual(session["agent_device_selection"], {"mode": "cpu", "gpu_ids": []})
+        self.assertEqual(self.plans[-1]["device"], "cpu")
+
+    def test_gpu_mode_offers_exactly_the_discovered_gpus(self) -> None:
+        for count in (1, 4, 8):
+            with self.subTest(gpus=count):
+                self.plans.clear()
+                fake = _render(
+                    self._session(_inventory_with(count)),
+                    radio_values={ui.COMPUTE_LABEL: "GPU"},
+                )
+                boxes = [
+                    s for s in fake.rec["selectboxes"] if s["label"] == ui.GPU_SELECT_LABEL
+                ]
+                self.assertEqual(len(boxes), 1, "exactly one GPU control")
+                self.assertEqual(boxes[0]["options"], [f"cuda:{i}" for i in range(count)])
+
+    def test_no_multi_gpu_widget_is_rendered_at_all(self) -> None:
+        fake = _render(
+            self._session(_inventory_with(4)), radio_values={ui.COMPUTE_LABEL: "GPU"}
+        )
+        self.assertEqual(fake.rec["multiselects"], [])
+
+    def test_exactly_one_gpu_is_selected_and_becomes_cuda_n(self) -> None:
+        session = self._session(_inventory_with(4))
+        _render(
+            session,
+            radio_values={ui.COMPUTE_LABEL: "GPU"},
+            selectbox_values={ui.GPU_SELECT_LABEL: "cuda:2"},
+        )
+        self.assertEqual(
+            session["agent_device_selection"], {"mode": "single_gpu", "gpu_ids": [2]}
+        )
+        self.assertEqual(self.plans[-1]["device"], "cuda:2")
+
+    def test_no_multi_device_string_can_be_built(self) -> None:
+        session = self._session(_inventory_with(8))
+        _render(
+            session,
+            radio_values={ui.COMPUTE_LABEL: "GPU"},
+            selectbox_values={ui.GPU_SELECT_LABEL: "cuda:3"},
+        )
+        blob = repr(session) + repr(self.plans)
+        self.assertNotIn("cuda:0,1", blob)
+        self.assertNotIn(",cuda:", blob)
+
+    def test_no_ddp_warning_reaches_an_ordinary_user(self) -> None:
+        """§9: the distributed internals belong in docs, not on the page."""
+        fake = _render(
+            self._session(_inventory_with(4)),
+            radio_values={ui.COMPUTE_LABEL: "GPU"},
+            selectbox_values={ui.GPU_SELECT_LABEL: "cuda:1"},
+        )
+        rendered = repr(fake.rec)
+        for leak in (
+            "multi-GPU", "multi_gpu", "DDP_CONTRACT", "supports_multi_gpu",
+            "rank", "sharding", "torchrun",
+        ):
+            self.assertNotIn(leak, rendered)
+
+    def test_a_machine_with_no_gpu_defaults_to_cpu(self) -> None:
+        session = self._session(di.empty_inventory("nvidia-smi was not found"))
+        _render(session)
+        self.assertEqual(session["agent_device_selection"], {"mode": "cpu", "gpu_ids": []})
+        self.assertEqual(self.plans[-1]["device"], "cpu")
+
+    def test_gpu_labels_come_from_the_runtime_inventory(self) -> None:
+        inventory = _inventory_with(2)
+        label = ui.gpu_option_label("cuda:1", inventory)
+        self.assertTrue(label.startswith("cuda:1"))
+        self.assertIn(str(inventory["devices"][1]["name"]), label)
+        self.assertIn("free", label)
+        self.assertIn("util", label)
+
+    def test_a_healthy_gpu_gets_a_caption_not_a_warning_box(self) -> None:
+        """§10: a full-width warning for an idle GPU trains people to ignore them."""
+        # _FAKE_GPU_INVENTORY's cuda:1 reports ~10 GB free of 24 GB.
+        session = dict(self._session(_FAKE_GPU_INVENTORY))
+        fake = _render(
+            session,
+            radio_values={ui.COMPUTE_LABEL: "GPU"},
+            selectbox_values={ui.GPU_SELECT_LABEL: "cuda:1"},
+        )
+        captions = " ".join(fake.rec["captions"])
+        self.assertIn("cuda:1", captions)
+        self.assertIn("GB free", captions)
+        self.assertIn("availability may change", captions)
+        self.assertNotIn("cuda:1", " ".join(fake.rec["warnings"]))
+
+    def test_a_nearly_full_gpu_does_warn(self) -> None:
+        # ...while its cuda:0 reports ~2 GB free of 24 GB, which does.
+        fake = _render(
+            dict(self._session(_FAKE_GPU_INVENTORY)),
+            radio_values={ui.COMPUTE_LABEL: "GPU"},
+            selectbox_values={ui.GPU_SELECT_LABEL: "cuda:0"},
+        )
+        self.assertIn("cuda:0", " ".join(fake.rec["warnings"]))
+        self.assertNotIn("cuda:0", " ".join(fake.rec["captions"]))
+
+
+class TestProjectDeterminesTheWorkspaceInTheUi(unittest.TestCase):
+    """The page's project is the project the plan is built for."""
+
+    def setUp(self) -> None:
+        self._real_build = ui.build_execution_plan
+        self._real_llm = ui.is_llm_configured
+        self.plans: list[dict] = []
+        ui.build_execution_plan = lambda d, t_, m, **kw: (
+            self.plans.append({"model": m, **kw})
+            or _ok_plan(m, epochs=kw.get("epochs"), workspace=kw["workspace"])
+        )
+        ui.is_llm_configured = lambda: False
+
+    def tearDown(self) -> None:
+        ui.build_execution_plan = self._real_build
+        ui.is_llm_configured = self._real_llm
+
+    def _render_for(self, project_root: str | None) -> dict:
+        session = {
+            "agent_workflow_context": _MATR_CONTEXT,
+            "agent_selected_model": "batlinet",
+            "gpu_inventory": _FAKE_GPU_INVENTORY,
+        }
+        if project_root is not None:
+            session["project_root"] = project_root
+        _render(session, radio_values={ui.COMPUTE_LABEL: "CPU"})
+        return session
+
+    def test_the_loaded_project_owns_the_workspace(self) -> None:
+        """Still the project's directory — now with a run of its own inside.
+
+        The plan points at ``<project>/agent_<dataset>_<model>/<run_id>``, so
+        two runs of the same model cannot overwrite each other, and the plan
+        the user reviews is the plan that executes.
+        """
+        self._render_for("runs/web_projects/alpha")
+        workspace = self.plans[-1]["workspace"]
+        base = "runs/web_projects/alpha/agent_matr_batlinet"
+        self.assertTrue(workspace.startswith(base + "/"), workspace)
+        self.assertTrue(is_run_id(workspace.rsplit("/", 1)[-1]), workspace)
+
+    def test_switching_project_switches_the_workspace(self) -> None:
+        self._render_for("runs/web_projects/alpha")
+        alpha = self.plans[-1]["workspace"]
+        self._render_for("runs/web_projects/beta")
+        beta = self.plans[-1]["workspace"]
+        self.assertNotEqual(alpha, beta)
+        self.assertIn("/alpha/", alpha)
+        self.assertIn("/beta/", beta)
+
+    def test_the_run_context_names_the_same_project_and_directory(self) -> None:
+        session = self._render_for("runs/web_projects/gamma")
+        run_context = session["agent_run_context"]
+        self.assertEqual(run_context["project"], "gamma")
+        self.assertEqual(run_context["workspace"], self.plans[-1]["workspace"])
+
+    def test_no_project_is_reported_as_the_default_not_hidden(self) -> None:
+        session = self._render_for(None)
+        self.assertTrue(session["agent_run_context"]["project_is_default"])
+        self.assertIn("default", self.plans[-1]["workspace"])
+
+    def test_run_context_is_shown_before_execution(self) -> None:
+        session = {
+            "agent_workflow_context": _MATR_CONTEXT,
+            "agent_selected_model": "batlinet",
+            "gpu_inventory": _FAKE_GPU_INVENTORY,
+            "project_root": "runs/web_projects/alpha",
+        }
+        fake = _render(session, radio_values={ui.COMPUTE_LABEL: "CPU"})
+        # The provenance block is the frame carrying "Project"; the execution
+        # plan renders its own table, and merging the two would let one
+        # table's "Device" answer for the other's.
+        frames = [
+            f
+            for f in fake.rec["dataframes"]
+            if isinstance(f, list)
+            and any(isinstance(r, dict) and r.get("Field") == "Project" for r in f)
+        ]
+        self.assertEqual(len(frames), 1, "expected exactly one run-context table")
+        fields = {r["Field"]: r["Value"] for r in frames[0]}
+        for required in ("Project", "Run directory", "Dataset", "Task", "Model",
+                         "Config", "Seed", "Epochs", "Device"):
+            self.assertIn(required, fields)
+        self.assertEqual(fields["Project"], "alpha")
+        # The readable label, not the argv value the plan table already shows.
+        self.assertEqual(fields["Device"], "CPU")
+        self.assertTrue(
+            fields["Run directory"].startswith(
+                "runs/web_projects/alpha/agent_matr_batlinet/"
+            ),
+            fields["Run directory"],
+        )
+        # The run this page is about to create is named before it starts.
+        self.assertTrue(is_run_id(fields["Run ID"]), fields["Run ID"])
+        self.assertTrue(fields["Run directory"].endswith(fields["Run ID"]))
+
+
+class TestExplainOpensConfigurationInsteadOfDeadEnding(unittest.TestCase):
+    """The Explain button is always actionable."""
+
+    def setUp(self) -> None:
+        self._real_explain = ui.explain_run_result
+        self._real_llm = ui.is_llm_configured
+        self.explain_calls: list = []
+        ui.explain_run_result = lambda ctx, **kw: (
+            self.explain_calls.append(kw) or {"summary": "explained"}
+        )
+
+    def tearDown(self) -> None:
+        ui.explain_run_result = self._real_explain
+        ui.is_llm_configured = self._real_llm
+
+    def _session(self) -> dict:
+        return {
+            "agent_workflow_context": _MATR_CONTEXT,
+            "agent_selected_model": "batlinet",
+            "gpu_inventory": _FAKE_GPU_INVENTORY,
+            "project_root": "runs/web_projects/alpha",
+            "agent_result_context": {
+                "workspace": "runs/web_projects/alpha/agent_matr_batlinet",
+                "success": True,
+                "metrics": {"RMSE": 1.0, "MAE": 2.0, "MAPE": 0.25},
+                "warnings": [],
+                "predictions_file": "runs/web_projects/alpha/agent_matr_batlinet/p.pkl",
+            },
+        }
+
+    def test_the_button_is_never_disabled(self) -> None:
+        ui.is_llm_configured = lambda: False
+        fake = _render(self._session(), radio_values={ui.COMPUTE_LABEL: "CPU"})
+        buttons = [
+            b for b in fake.rec["buttons"] if b["label"] == ui.EXPLAIN_BUTTON_LABEL
+        ]
+        self.assertTrue(buttons)
+        self.assertFalse(any(b["disabled"] for b in buttons))
+
+    def test_clicking_without_configuration_opens_the_form_and_calls_nothing(
+        self,
+    ) -> None:
+        ui.is_llm_configured = lambda: False
+        session = self._session()
+        _render(
+            session,
+            clicked={ui.EXPLAIN_BUTTON_LABEL},
+            radio_values={ui.COMPUTE_LABEL: "CPU"},
+        )
+        self.assertEqual(self.explain_calls, [])
+        self.assertTrue(session.get(ui_settings.FORM_OPEN_KEY))
+        self.assertEqual(session.get(ui_settings.PENDING_ACTION_KEY), "explain")
+
+    def test_clicking_with_configuration_explains_directly(self) -> None:
+        ui.is_llm_configured = lambda: True
+        session = self._session()
+        session.update(
+            {"llm_base_url": "u", "llm_api_key": "k", "llm_model": "m"}
+        )
+        _render(
+            session,
+            clicked={ui.EXPLAIN_BUTTON_LABEL},
+            radio_values={ui.COMPUTE_LABEL: "CPU"},
+        )
+        self.assertEqual(len(self.explain_calls), 1)
+
+    def test_the_api_key_never_reaches_the_rendered_page(self) -> None:
+        ui.is_llm_configured = lambda: True
+        session = self._session()
+        secret = "sk-do-not-leak-me"
+        session.update({"llm_base_url": "u", "llm_api_key": secret, "llm_model": "m"})
+        fake = _render(session, radio_values={ui.COMPUTE_LABEL: "CPU"})
+        rendered = repr(fake.rec)
+        self.assertNotIn(secret, rendered)
+
+    def test_the_settings_summary_never_carries_the_key(self) -> None:
+        fake = FakeStreamlit({"llm_base_url": "u", "llm_api_key": "sk-secret", "llm_model": "m"})
+        with _fake_streamlit(fake):
+            summary = ui_settings.llm_settings_summary()
+        self.assertTrue(summary["api_key_set"])
+        self.assertNotIn("sk-secret", repr(summary))
+
+    # --- Save and Connect -------------------------------------------
+    def test_the_form_offers_save_and_connect_and_no_cancel_pair(self) -> None:
+        fake = FakeStreamlit({})
+        with _fake_streamlit(fake):
+            ui_settings.render_llm_settings_form(key_prefix="t")
+        labels = [b["label"] for b in fake.rec["buttons"]]
+        self.assertIn(ui_settings.SAVE_LABEL, labels)
+        self.assertIn(ui_settings.CONNECT_LABEL, labels)
+        self.assertEqual(labels, ["Save", "Connect"])
+        # The old primary pair must not survive anywhere.
+        self.assertNotIn("Cancel", labels)
+        self.assertNotIn("Save settings", labels)
+        # ...and the old pair is gone from the code too. Scanned with
+        # docstrings and comments removed: the module explains in prose why
+        # "Cancel / Save settings" was replaced, and that prose is
+        # documentation, not a button.
+        code = _code_without_prose(ui_settings)
+        self.assertNotIn("Save settings", code)
+        self.assertNotIn("Cancel", code)
+
+    def test_save_stores_settings_without_testing_the_connection(self) -> None:
+        calls: list = []
+        real = ui_settings.test_llm_connection
+        ui_settings.test_llm_connection = lambda **kw: calls.append(kw) or (True, "ok")
+        try:
+            fake = FakeStreamlit({}, clicked_buttons={ui_settings.SAVE_LABEL})
+            fake.session_state.update(
+                {"t_base_url": "u", "t_api_key": "k", "t_model": "m"}
+            )
+            with _fake_streamlit(fake):
+                action = ui_settings.render_llm_settings_form(key_prefix="t")
+        finally:
+            ui_settings.test_llm_connection = real
+        self.assertEqual(action, "save")
+        self.assertEqual(calls, [], "Save must not call the connection test")
+        self.assertEqual(fake.session_state["llm_base_url"], "u")
+        self.assertEqual(fake.session_state["llm_model"], "m")
+        self.assertIn(ui_settings.SAVED_MESSAGE, " ".join(fake.rec["toasts"]))
+
+    def test_connect_invokes_the_existing_connection_test(self) -> None:
+        calls: list = []
+        real = ui_settings.test_llm_connection
+        ui_settings.test_llm_connection = lambda **kw: (
+            calls.append(kw) or (True, "LLM connection verified.")
+        )
+        try:
+            fake = FakeStreamlit({}, clicked_buttons={ui_settings.CONNECT_LABEL})
+            fake.session_state.update(
+                {"t_base_url": "u", "t_api_key": "k", "t_model": "m"}
+            )
+            with _fake_streamlit(fake):
+                action = ui_settings.render_llm_settings_form(key_prefix="t")
+        finally:
+            ui_settings.test_llm_connection = real
+        self.assertEqual(action, "connect")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            fake.session_state["llm_status"], ui_llm_state.LLM_STATUS_CONNECTED
+        )
+        self.assertIn(ui_settings.CONNECTED_MESSAGE, " ".join(fake.rec["toasts"]))
+
+    def test_connection_testing_is_not_reimplemented(self) -> None:
+        """One connection implementation, imported from the agent client."""
+        source = Path(ui_settings.__file__).read_text(encoding="utf-8")
+        self.assertIn("from ..agent.llm_client import test_llm_connection", source)
+        for forbidden in ("requests.post", "urlopen", "httpx", "chat/completions"):
+            self.assertNotIn(forbidden, source)
+        app_source = (Path(ui.__file__).parents[1] / "app.py").read_text(encoding="utf-8")
+        self.assertNotIn("test_llm_connection(base_url=", app_source)
+
+    def test_a_failed_connect_is_persistent_and_leaks_no_key(self) -> None:
+        secret = "sk-never-show-me"
+        real = ui_settings.test_llm_connection
+        ui_settings.test_llm_connection = lambda **kw: (
+            False,
+            "LLM connection failed: Connection refused",
+        )
+        try:
+            fake = FakeStreamlit({}, clicked_buttons={ui_settings.CONNECT_LABEL})
+            fake.session_state.update(
+                {"t_base_url": "u", "t_api_key": secret, "t_model": "m"}
+            )
+            with _fake_streamlit(fake):
+                action = ui_settings.render_llm_settings_form(key_prefix="t")
+        finally:
+            ui_settings.test_llm_connection = real
+        self.assertEqual(action, "connect_failed")
+        self.assertEqual(
+            fake.session_state["llm_status"], ui_llm_state.LLM_STATUS_FAILED
+        )
+        # Persistent, not a toast that vanishes before it can be acted on.
+        self.assertTrue(fake.rec["errors"])
+        self.assertEqual(fake.rec["toasts"], [])
+        self.assertNotIn(secret, repr(fake.rec))
+
+    def test_connect_with_a_missing_field_never_reaches_the_network(self) -> None:
+        calls: list = []
+        real = ui_settings.test_llm_connection
+        ui_settings.test_llm_connection = lambda **kw: calls.append(kw) or (True, "ok")
+        try:
+            fake = FakeStreamlit({}, clicked_buttons={ui_settings.CONNECT_LABEL})
+            fake.session_state.update({"t_base_url": "u", "t_api_key": "", "t_model": "m"})
+            with _fake_streamlit(fake):
+                ui_settings.render_llm_settings_form(key_prefix="t")
+        finally:
+            ui_settings.test_llm_connection = real
+        self.assertEqual(calls, [])
+        self.assertIn(ui_settings.INCOMPLETE_MESSAGE, " ".join(fake.rec["errors"]))
+
+    def test_the_signature_used_for_toasts_never_carries_the_key(self) -> None:
+        fake = FakeStreamlit(
+            {"llm_base_url": "u", "llm_api_key": "sk-secret", "llm_model": "m"}
+        )
+        with _fake_streamlit(fake):
+            signature = ui_settings.llm_settings_signature()
+        self.assertNotIn("sk-secret", signature)
+        self.assertIn("key", signature)
+
+    def test_connecting_from_the_explain_prompt_does_not_auto_explain(self) -> None:
+        """Explicit control: Connect enables Explain, it does not press it."""
+        ui.is_llm_configured = lambda: False
+        real = ui_settings.test_llm_connection
+        ui_settings.test_llm_connection = lambda **kw: (True, "ok")
+        try:
+            session = self._session()
+            session[ui_settings.FORM_OPEN_KEY] = True
+            session[ui_settings.PENDING_ACTION_KEY] = "explain"
+            session.update(
+                {
+                    "dialog_llm_base_url": "u",
+                    "dialog_llm_api_key": "k",
+                    "dialog_llm_model": "m",
+                }
+            )
+            _render(
+                session,
+                clicked={ui_settings.CONNECT_LABEL},
+                radio_values={ui.COMPUTE_LABEL: "CPU"},
+            )
+        finally:
+            ui_settings.test_llm_connection = real
+        self.assertEqual(self.explain_calls, [], "Connect must not send the result")
+        # The prompt closed, so the page is back on the result workflow.
+        self.assertNotIn(ui_settings.FORM_OPEN_KEY, session)
+
+    def test_one_configuration_source_backs_both_entry_points(self) -> None:
+        source = Path(ui_settings.__file__).read_text(encoding="utf-8")
+        # Both the sidebar and the dialog go through the same form, which
+        # writes the existing llm_state keys.
+        self.assertIn("render_llm_settings_form", source)
+        self.assertIn("set_llm_settings", source)
+        self.assertNotIn("st.secrets", source)
+        for key in ("llm_base_url", "llm_api_key", "llm_model"):
+            self.assertIn(key, source)
+
+
+class TestNothingRuntimeIsHardcoded(unittest.TestCase):
+    """Designed to fail if someone later writes a runtime value into the UI."""
+
+    UI_SOURCES = ("agent_workflow.py", "workflow_sidebar.py", "settings_panel.py",
+                  "formatting.py", "feedback.py")
+
+    def _ui_text(self) -> str:
+        """The UI layer's *code*, with docstrings removed.
+
+        Scanned via the AST rather than as raw text, for the same reason the
+        other static scans in this suite are: a docstring is documentation,
+        not behaviour. ``formatting.py`` explains itself with a worked
+        example of a long metric, and a raw-text scan read that prose as a
+        hardcoded metric value. Stripping docstrings keeps the scan pointed
+        at code, where a hardcoded runtime value would actually do harm.
+
+        Non-vacuity: temporarily writing ``RMSE = 455.58`` into any of these
+        modules makes both value scans below fail.
+        """
+        import ast
+
+        base = Path(ui.__file__).parent
+        chunks: list[str] = []
+        for name in self.UI_SOURCES:
+            tree = ast.parse((base / name).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(
+                    node,
+                    (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef),
+                ):
+                    body = getattr(node, "body", [])
+                    if (
+                        body
+                        and isinstance(body[0], ast.Expr)
+                        and isinstance(body[0].value, ast.Constant)
+                        and isinstance(body[0].value.value, str)
+                    ):
+                        node.body = body[1:] or [ast.Pass()]
+            chunks.append(ast.unparse(tree))
+        return "\n".join(chunks)
+
+    def test_no_gpu_hardware_is_named(self) -> None:
+        text = self._ui_text()
+        for forbidden in ("RTX 3090", "Tesla", "A100", "24576", "cuda:1", "cuda:7"):
+            self.assertNotIn(forbidden, text)
+
+    def test_no_fixed_gpu_count(self) -> None:
+        text = self._ui_text()
+        for forbidden in ("range(8)", "range(4)", "8 GPUs", "GPU_COUNT ="):
+            self.assertNotIn(forbidden, text)
+
+    def test_no_fixed_project_or_workspace(self) -> None:
+        text = self._ui_text()
+        for forbidden in ("web_projects/default", "web_projects/1", "/root/share"):
+            self.assertNotIn(forbidden, text)
+
+    def test_no_metric_values_are_written_into_the_ui(self) -> None:
+        text = self._ui_text()
+        for forbidden in ("794.32", "455.58", "0.1819", "RMSE ="):
+            self.assertNotIn(forbidden, text)
+
+    def test_no_fixed_model_or_blocked_counts(self) -> None:
+        text = self._ui_text()
+        for forbidden in ("23 models", "= 23", "blocked_count = 1"):
+            self.assertNotIn(forbidden, text)
+
+    def test_counts_come_from_the_context_not_a_constant(self) -> None:
+        """Changing the context changes what the page reports."""
+        small = dict(_MATR_CONTEXT, runnable_models=_MATR_CONTEXT["runnable_models"][:1])
+        fake_small = FakeStreamlit({})
+        with _fake_streamlit(fake_small):
+            ui._render_context(small)
+        fake_full = FakeStreamlit({})
+        with _fake_streamlit(fake_full):
+            ui._render_context(_MATR_CONTEXT)
+        self.assertIn("1 model(s) runnable", " ".join(fake_small.rec["captions"]))
+        self.assertIn("2 model(s) runnable", " ".join(fake_full.rec["captions"]))
 
 
 class TestNoFrontendDuplication(unittest.TestCase):

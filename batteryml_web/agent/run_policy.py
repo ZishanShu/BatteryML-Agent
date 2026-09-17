@@ -124,6 +124,62 @@ def smoke_device_recommendation(
     }
 
 
+#: Fraction of a GPU's own memory below which its free figure is worth a
+#: warning rather than a caption. Relative to that card's total, never an
+#: absolute floor: this platform does not know any model's memory
+#: requirement, and inventing one would be a claim it cannot support.
+LOW_MEMORY_FRACTION = 0.10
+
+
+def gpu_status_line(
+    device: str,
+    inventory: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """A compact status for the selected GPU, and how loudly to say it.
+
+    Returns ``{"text", "severity"}`` where severity is ``"caption"`` for the
+    ordinary case and ``"warning"`` when the figure deserves attention — the
+    card is nearly full, or nothing was enumerated for it.
+
+    The long paragraph this replaces said the same thing in four lines and
+    used a warning box even when the GPU was empty, which trains people to
+    ignore warning boxes.
+    """
+    from ..core.device_inventory import find_device
+
+    name = str(device or "").strip()
+    if not name or name == CPU_DEVICE:
+        return {"text": "", "severity": "caption"}
+
+    entry = find_device(name, inventory)
+    if entry is None:
+        return {
+            "text": (
+                f"{name} was not enumerated on this machine; its availability "
+                "is unknown. The run is still sent to it exactly as selected."
+            ),
+            "severity": "warning",
+        }
+
+    label = str(entry.get("name") or name)
+    free = entry.get("memory_free_mib")
+    total = entry.get("memory_total_mib")
+    if not isinstance(free, int):
+        return {
+            "text": f"{name} · {label} · free memory not reported by nvidia-smi.",
+            "severity": "warning",
+        }
+
+    text = f"{name} · {label} · {free / 1024:.1f} GB free"
+    utilization = entry.get("utilization_pct")
+    if isinstance(utilization, int):
+        text += f" · {utilization}% util"
+    text += " (shared GPU; availability may change)"
+
+    low = isinstance(total, int) and total > 0 and (free / total) < LOW_MEMORY_FRACTION
+    return {"text": text, "severity": "warning" if low else "caption"}
+
+
 def gpu_memory_advisory(
     device: str,
     inventory: Optional[Dict[str, Any]],
@@ -359,16 +415,114 @@ def _no_failure() -> Dict[str, Any]:
 # place a future DDP implementation registers a model, and it names no model
 # now — an entry here would be a claim that something works.
 
+#: Model families whose training loop persists and restores enough state for
+#: a real resume. Derived from what the loop actually saves, not from whether
+#: a ``.ckpt`` exists on disk — see docs/TRAINING_STATE_AUDIT.md.
+#:
+#: ``NNModel.fit`` now accepts a resume state and hands out its live optimizer
+#: each epoch, so any model whose training goes through that loop can produce
+#: and consume a resumable checkpoint. BatLiNet overrides ``fit`` with its own
+#: loop and is therefore not included yet.
+RESUME_CAPABLE_FAMILIES: frozenset[str] = frozenset({"nn_model"})
+
+#: Per-model reasons, for the models this platform knows cannot resume.
+#: Stated per model because the reasons genuinely differ.
+RESUME_BLOCKERS: Dict[str, str] = {
+    "batlinet": (
+        "BatLiNet overrides the shared training loop with its own epoch loop "
+        "(batteryml_web/models/batlinet.py:813), which does not yet persist "
+        "its optimizer, epoch or the RNG state its per-epoch permutation and "
+        "support sampling draw from."
+    ),
+}
+
+#: Model keys that are not iterative learners at all.
+NON_ITERATIVE_MODELS: frozenset[str] = frozenset(
+    {"xgb", "random_forest", "extra_trees", "lasso", "ridge", "elastic_net",
+     "huber", "knn", "kernel_ridge", "svr", "pcr", "plsr", "gpr",
+     "linear_regression", "decision_tree", "gradient_boosting"}
+)
+
+NON_ITERATIVE_RESUME_REASON = (
+    "This model is not trained in epochs: fitting is a single call with no "
+    "intermediate training state, so there is nothing to resume. Re-run it "
+    "instead — it is inexpensive by comparison."
+)
+
+
+def resume_capability(model_key: str, *, family: str = "") -> Dict[str, Any]:
+    """Whether ``model_key`` can be resumed, and if not, why.
+
+    Returns ``{"model", "supports_resume", "resume_reason"}``. Backend-derived
+    so no page has to name a model: the UI shows or hides Resume from this.
+
+    A checkpoint file existing is deliberately *not* an input here. The old
+    weights-only artifact exists for every neural run and resuming from it
+    would restart the optimizer and the epoch count — the exact fiction this
+    milestone removes.
+    """
+    key = str(model_key or "").strip()
+    lowered = key.lower()
+
+    if lowered in NON_ITERATIVE_MODELS:
+        return {
+            "model": key,
+            "supports_resume": False,
+            "resume_reason": NON_ITERATIVE_RESUME_REASON,
+        }
+    if lowered in RESUME_BLOCKERS:
+        return {
+            "model": key,
+            "supports_resume": False,
+            "resume_reason": RESUME_BLOCKERS[lowered],
+        }
+    if family and family in RESUME_CAPABLE_FAMILIES:
+        return {"model": key, "supports_resume": True, "resume_reason": ""}
+    return {
+        "model": key,
+        "supports_resume": False,
+        "resume_reason": (
+            "This model's training loop has not been audited for resume "
+            "support. Resume is offered only where the loop is known to "
+            "persist optimizer, epoch and RNG state; see "
+            "docs/TRAINING_STATE_AUDIT.md."
+        ),
+    }
+
+
 MULTI_GPU_CAPABLE_MODELS: frozenset[str] = frozenset()
 
 #: Strategy per capable model (e.g. "ddp"). Keys must appear in
 #: :data:`MULTI_GPU_CAPABLE_MODELS`; empty for the same reason.
 MULTI_GPU_STRATEGIES: Dict[str, str] = {}
 
+#: Why each known model is not DDP-capable. Per model, because the reasons
+#: genuinely differ — and a shared "not supported yet" would hide that
+#: BatLiNet's blocker is scientific while CPTransformer's is an audit gap.
+MULTI_GPU_BLOCKERS: Dict[str, str] = {
+    "batlinet": (
+        "BatLiNet draws an inter-cell support set for every batch from the "
+        "full training tensor (batteryml_web/models/batlinet.py:884). Under "
+        "DDP each rank holds one shard, so either the support set is drawn "
+        "only from that shard — changing which inter-cell comparisons the "
+        "model ever sees, and so the objective — or every rank keeps the whole "
+        "tensor, which removes the memory benefit and still changes the "
+        "sampling distribution. Distributing it requires a redesign of the "
+        "support semantics, not a sampler. See docs/DDP_CONTRACT.md §6."
+    ),
+    "cptransformer": (
+        "CPTransformer's network source lives in third_party/BatteryLife, "
+        "which is not present in the environment this build was audited in, "
+        "so its forward and loss could not be read and its DDP-safety could "
+        "not be established. It is gated rather than assumed; see "
+        "docs/DDP_CONTRACT.md for the audit that would enable it."
+    ),
+}
+
 #: Shown when a multi-GPU selection is made for a model that cannot use one.
 #: Exact wording, because it is what the user reads instead of a Run button.
 MULTI_GPU_UNSUPPORTED_MESSAGE = (
-    "This model/runtime does not yet support multi-GPU execution."
+    "True multi-GPU execution is not yet supported for this model/runtime."
 )
 
 
@@ -394,10 +548,14 @@ def multi_gpu_capability(model_key: str) -> Dict[str, Any]:
             if supported
             else (
                 MULTI_GPU_UNSUPPORTED_MESSAGE
-                + " BatteryML sends a single torch device through the whole run "
-                "and the dataset is placed on it in one piece, so no model is "
-                "registered as multi-GPU capable yet. See "
-                "docs/GPU_MULTI_GPU_AUDIT.md."
+                + " "
+                + MULTI_GPU_BLOCKERS.get(
+                    key.lower(),
+                    "The distributed launch contract, rank mapping, sharding "
+                    "and rank-0 rules are implemented and tested, but no "
+                    "model has been verified DDP-safe against its own source "
+                    "on real GPUs yet. See docs/DDP_CONTRACT.md.",
+                )
             )
         ),
     }

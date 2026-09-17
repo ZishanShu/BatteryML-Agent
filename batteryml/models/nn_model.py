@@ -47,7 +47,24 @@ class NNModel(BaseModel, nn.Module, abc.ABC):
     def fit(self,
             dataset: DataBundle,
             timestamp: str = None,
-            seed: int = 0):
+            seed: int = 0,
+            resume_state: dict = None,
+            on_epoch_end=None):
+        """Train, optionally continuing from a resumable checkpoint.
+
+        ``resume_state`` is the payload built by
+        ``batteryml.training_checkpoint``. When given, the optimizer
+        state and the completed-epoch count are restored, so training runs
+        from ``epoch + 1`` to ``self.train_epochs`` rather than restarting at
+        zero. The RNG generators are restored by the caller *before* this is
+        entered, because the DataLoader's shuffle order is drawn from them.
+
+        ``on_epoch_end(epoch, context)`` is called after each epoch with the
+        live optimizer, so a caller can persist a full resumable checkpoint
+        without this module having to know the checkpoint format. Both
+        parameters default to None, so every existing call site behaves
+        exactly as before.
+        """
         self.train()
         train_data = dataset.train_data
         loader = DataLoader(
@@ -56,10 +73,21 @@ class NNModel(BaseModel, nn.Module, abc.ABC):
         # TODO: support customization of optimizers
         optimizer = optim.Adam(self.parameters(), lr=self.lr)
 
+        start_epoch = 0
+        if resume_state:
+            # Adam's moment estimates are part of the training trajectory, not
+            # an implementation detail: without them the first steps after a
+            # resume behave like the first steps of a fresh run.
+            if resume_state.get('optimizer_state') is not None:
+                optimizer.load_state_dict(resume_state['optimizer_state'])
+            completed = resume_state.get('epoch')
+            if isinstance(completed, int) and completed > 0:
+                start_epoch = completed
+
         timestamp = timestamp or 'UnknownTime'
 
         latest = None
-        for epoch in tqdm(range(self.train_epochs), desc='Traning'):
+        for epoch in tqdm(range(start_epoch, self.train_epochs), desc='Traning'):
             self.train()
             for batch in loader:
                 loss = self.forward(**batch, return_loss=True)
@@ -82,6 +110,17 @@ class NNModel(BaseModel, nn.Module, abc.ABC):
                 pred = self.predict(dataset)
                 score = dataset.evaluate(pred, 'RMSE')
                 print(f'[{epoch+1}/{self.train_epochs}] RMSE {score:.2f}', flush=True)
+
+            if on_epoch_end is not None:
+                # The optimizer is a local created above (and replaced on a
+                # non-finite loss), so it is handed out here rather than
+                # stored on self: a caller that wants to persist it must see
+                # the object actually in use.
+                on_epoch_end(epoch, {
+                    'optimizer': optimizer,
+                    'model': self,
+                    'total_epochs': self.train_epochs,
+                })
 
         if self.workspace is not None:
             self.link_latest_checkpoint(latest)

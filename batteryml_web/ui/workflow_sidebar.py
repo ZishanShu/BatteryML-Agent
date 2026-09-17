@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import streamlit as st
 
+from ..core.project_context import resolve_project
+from .settings_panel import render_sidebar_settings
+
 #: Ordered for Prev/Next. ``group`` decides where a step is drawn:
 #: ``home`` at the top, ``agent`` in its own block, ``workflow`` in the
 #: numbered protocol list. ``step_no`` exists only for ``workflow`` steps.
@@ -83,15 +86,21 @@ def get_current_step_index() -> int:
 
 
 def current_project_label() -> str:
-    """The project name to show, from session state only."""
-    root = st.session_state.get("project_root")
-    if root:
-        return str(root).rstrip("/").split("/")[-1]
-    return (
-        st.session_state.get("project_name")
-        or st.session_state.get("current_project")
-        or "No project loaded"
+    """The project a run would be written to, resolved the same way it is.
+
+    Reads through :func:`resolve_project`, which is what the Agent Workflow
+    page uses to build a workspace — so the name in the sidebar is the name
+    the next run will actually use, not a separately-derived display string
+    that can drift from it.
+    """
+    project = resolve_project(
+        project_root=st.session_state.get("project_root"),
+        project_name=st.session_state.get("project_name")
+        or st.session_state.get("current_project"),
     )
+    if project["source"] == "default":
+        return f"{project['name']} (no project loaded)"
+    return str(project["name"])
 
 
 def llm_status_badge() -> tuple[str, str]:
@@ -147,7 +156,7 @@ def render_sidebar_workflow():
         st.markdown("### 🔋 BatteryML")
         st.caption("Protocol Navigator")
 
-        st.markdown("**Project**")
+        st.markdown("**Current project**")
         st.caption(current_project_label())
 
         st.divider()
@@ -173,6 +182,9 @@ def render_sidebar_workflow():
         with next_col:
             if st.button("Next →", disabled=(idx == len(NAV_STEPS) - 1), use_container_width=True, key="sidebar_next_step"):
                 set_current_step(NAV_STEPS[idx + 1]["key"])
+
+        st.divider()
+        render_sidebar_settings()
 
         st.divider()
         label, color = llm_status_badge()

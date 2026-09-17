@@ -277,6 +277,30 @@ def free_memory_mib(device: str, inventory: Optional[Dict[str, Any]]) -> Optiona
     return int(value) if isinstance(value, int) else None
 
 
+def gpu_option_label(device: str, inventory: Optional[Dict[str, Any]]) -> str:
+    """One GPU as an option line: index, name, free memory, utilization.
+
+    Every component is read from the enumerated device. A figure the driver
+    did not report is omitted rather than shown as zero, so the label is
+    shorter on a machine that reports less — it never fills a gap with a
+    plausible number.
+    """
+    name = str(device or "").strip()
+    entry = find_device(name, inventory)
+    if entry is None:
+        return f"{name} (not enumerated)"
+    # Led by the device string the run actually receives, so the option the
+    # user picks and the ``--device`` value in the plan read the same.
+    parts = [name, str(entry.get("name") or name)]
+    free = entry.get("memory_free_mib")
+    if isinstance(free, int):
+        parts.append(f"{free / 1024:.1f} GB free")
+    utilization = entry.get("utilization_pct")
+    if isinstance(utilization, int):
+        parts.append(f"{utilization}% util")
+    return " · ".join(parts)
+
+
 def inventory_rows(inventory: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Table rows for display; empty when nothing was enumerated."""
     if not isinstance(inventory, dict):
