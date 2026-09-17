@@ -20,6 +20,7 @@ from batteryml.data import DataBundle
 from batteryml.builders import MODELS
 from batteryml.utils import import_config
 from batteryml.models.base import BaseModel
+from batteryml import training_checkpoint as _resume_schema_module
 
 
 class Pipeline:
@@ -272,20 +273,12 @@ def timestamp(marker: bool = False):
 
 # --- resumable checkpoints -------------------------------------------------
 #
-# The schema lives in batteryml_web.core.training_checkpoint, which owns
-# writing, classifying and validating these files. It is imported lazily and
-# optionally: upstream BatteryML used standalone has no web layer, and in that
-# case every function below becomes a no-op and training behaves exactly as it
-# did before. Recorded in docs/UPSTREAM_PATCHES.md (UP-02).
-
-
-def _resume_schema():
-    """The checkpoint schema module, or None when the web layer is absent."""
-    try:
-        from batteryml_web.core import training_checkpoint
-    except Exception:  # noqa: BLE001 - standalone upstream has no web layer
-        return None
-    return training_checkpoint
+# The schema lives in batteryml.training_checkpoint — the training layer,
+# beside the code that writes and reads these files. It used to live in the web
+# layer, which meant core BatteryML had to import the web application to resume
+# its own training; that dependency is gone. The web layer re-exports the same
+# module, so there is still one schema, one serializer and one validator.
+# Recorded in docs/UPSTREAM_PATCHES.md (UP-02).
 
 
 def _unwrap(model):
@@ -308,9 +301,7 @@ def _load_resume_state(path):
     """The resume payload at ``path``, or None if it is not a resumable one."""
     if path is None:
         return None
-    schema = _resume_schema()
-    if schema is None:
-        return None
+    schema = _resume_schema_module
     verdict = schema.classify_checkpoint(path)
     if verdict['kind'] != schema.KIND_RESUMABLE:
         # Weights-only, corrupt or from a newer schema: not a continuation.
@@ -325,10 +316,9 @@ def _load_model_state(model, state):
 
 
 def _restore_rng_state(state):
-    schema = _resume_schema()
-    if schema is None or not state:
+    if not state:
         return
-    for warning in schema.restore_rng_state(state):
+    for warning in _resume_schema_module.restore_rng_state(state):
         print(f'[resume] {warning}', flush=True)
 
 
@@ -355,10 +345,10 @@ def _resume_checkpoint_writer(self, model, seed, ts):
     extra writes beyond the ones training already performed — it makes those
     writes carry optimizer, epoch and RNG state as well as the weights.
     """
-    schema = _resume_schema()
+    schema = _resume_schema_module
     workspace = getattr(model, 'workspace', None)
     frequency = getattr(model, 'checkpoint_freq', None)
-    if schema is None or workspace is None or not frequency:
+    if workspace is None or not frequency:
         return None
 
     def on_epoch_end(epoch, context):

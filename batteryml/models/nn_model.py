@@ -53,7 +53,7 @@ class NNModel(BaseModel, nn.Module, abc.ABC):
         """Train, optionally continuing from a resumable checkpoint.
 
         ``resume_state`` is the payload built by
-        ``batteryml_web.core.training_checkpoint``. When given, the optimizer
+        ``batteryml.training_checkpoint``. When given, the optimizer
         state and the completed-epoch count are restored, so training runs
         from ``epoch + 1`` to ``self.train_epochs`` rather than restarting at
         zero. The RNG generators are restored by the caller *before* this is

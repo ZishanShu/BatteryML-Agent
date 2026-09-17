@@ -376,12 +376,21 @@ class TestUpstreamResumeWiring(unittest.TestCase):
         for key in _unwrap(_Compiled(plain)).state_dict():
             self.assertFalse(key.startswith("_orig_mod."))
 
-    def test_the_web_layer_is_an_optional_import_upstream(self) -> None:
-        """Standalone BatteryML must still work with no web layer present."""
-        source = self._pipeline_source()
-        block = source.split("def _resume_schema")[1].split("\ndef ")[0]
-        self.assertIn("except Exception", block)
-        self.assertIn("return None", block)
+    def test_the_pipeline_does_not_need_the_web_layer(self) -> None:
+        """Standalone BatteryML must still work with no web layer present.
+
+        This used to be satisfied by importing
+        ``batteryml_web.core.training_checkpoint`` inside a ``try`` and
+        degrading to a no-op. The schema now lives in the training layer
+        (``batteryml.training_checkpoint``), so the pipeline needs no web
+        import at all — a stronger property, and the one asserted here.
+        ``tests/test_core_independence.py`` enforces it for the whole core
+        package by AST; this keeps the claim next to the resume wiring.
+        """
+        from batteryml import pipeline, training_checkpoint
+
+        self.assertIs(pipeline._resume_schema_module, training_checkpoint)
+        self.assertNotIn("batteryml_web", self._pipeline_source())
 
 
 if __name__ == "__main__":

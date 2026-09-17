@@ -94,18 +94,19 @@ resumed runs.
   saving or loading, so a checkpoint is not tied to how the model was
   wrapped.
 
-### The optional dependency, stated plainly
+### Where the schema lives
 
-These helpers import `batteryml_web.core.training_checkpoint` lazily, inside
-a `try`. When the web layer is absent — upstream BatteryML used standalone —
-every helper returns `None` and training behaves exactly as it did before.
+These helpers use `batteryml.training_checkpoint` (UP-03) — an ordinary
+module-level import of a sibling in the training layer.
 
-This is a dependency from core toward the web layer, which `CLAUDE.md` §3
-otherwise avoids. The alternatives were worse: duplicating the schema
-upstream creates two sources of truth for a format whose whole purpose is to
-be read back correctly, and running resumed runs through a different entry
-point creates the second execution system this milestone was told not to
-build. Recorded here so the choice is visible rather than discovered.
+An earlier revision of this patch imported
+`batteryml_web.core.training_checkpoint` lazily, inside a `try`, so that
+standalone upstream degraded to a no-op. That was a dependency from core
+toward the web application layer, which `CLAUDE.md` §3 forbids. It has been
+removed: the module moved down into `batteryml/`, the web layer re-exports
+it, and there is still exactly one schema. With the schema beside the code
+that reads and writes it, no `try` and no `None` degradation is needed, so
+the three `if schema is None` branches are gone as well.
 
 ### What was deliberately not changed
 
@@ -119,3 +120,52 @@ build. Recorded here so the choice is visible rather than discovered.
 **No scientific semantics changed.** With no `ckpt_to_resume`, `train()` is
 the previous behaviour.
 
+---
+
+## UP-03 — `batteryml/training_checkpoint.py` (new file in the upstream tree)
+
+| Field | Value |
+| --- | --- |
+| File | `batteryml/training_checkpoint.py` (moved, via `git mv`, from `batteryml_web/core/training_checkpoint.py`) |
+| Milestone | Remove the web dependency from the training checkpoint core |
+| Basis | `[VERIFIED]` — `tests/test_training_resume.py` and `tests/test_resume_launch.py` import the old path and pass unchanged; `tests/test_core_independence.py` asserts `batteryml/` contains no `batteryml_web` import |
+
+### Why it is here and not in `batteryml_web/`
+
+The resumable-checkpoint format belongs to training. `Pipeline.train` both
+writes these files (`on_epoch_end`) and reads them back (`_load_resume_state`),
+so as long as the schema lived in the web layer, core BatteryML had to import
+the web application to resume its own training. That is the dependency UP-02
+recorded as a concession; this patch removes it by moving the module down
+rather than by duplicating it.
+
+The module was already neutral — no Streamlit, no `batteryml_web` import,
+`torch` imported lazily — so the move is a relocation, not a rewrite.
+
+### The diff, in words
+
+* `batteryml_web/core/training_checkpoint.py` → `batteryml/training_checkpoint.py`,
+  contents unchanged apart from the module docstring;
+* `batteryml_web/core/training_checkpoint.py` is now a compatibility
+  re-export listing the same 20 public names in `__all__`. The re-exported
+  objects are *the same objects* (`shim.classify_checkpoint is
+  core.classify_checkpoint`), so there is one schema, one serializer and one
+  validator, and every existing web-layer caller and test keeps its import
+  path;
+* `batteryml/pipeline.py` imports the sibling directly and drops the lazy
+  `_resume_schema()` indirection together with its three `None` branches.
+
+### What was deliberately not changed
+
+* **the checkpoint format is untouched** — same `SCHEMA_KEY`, same
+  `SCHEMA_VERSION = 1`, same payload layout, so checkpoints written before
+  this change remain readable and resumable;
+* no resume test was edited; they still import
+  `batteryml_web.core.training_checkpoint`;
+* the web UI stays capability-driven — it asks the schema whether a file is
+  resumable, exactly as before;
+* no circular import: `batteryml/__init__.py` does not import `pipeline`, and
+  `training_checkpoint` imports nothing from `batteryml`.
+
+**No scientific semantics changed.** This patch moves a file and deletes an
+import.
