@@ -134,6 +134,16 @@ class Pipeline:
                 'data': dataset.to('cpu'),
                 'seed': seed,
             }
+            # For a cycle-level task, a row index identifies nothing: one cell
+            # contributed many rows. Persisting the sample index is what lets
+            # a prediction be traced to the cell and observed cycle it was
+            # made for, and what makes an SOH-vs-cycle view possible at all.
+            # Absent for a whole-cell task, where the row order is the cell
+            # order and nothing is lost.
+            sample_index = getattr(dataset.test_data, 'sample_index', None)
+            if sample_index is not None:
+                obj['sample_index'] = sample_index.to_records()
+                obj['task_metadata'] = _task_metadata(self.config)
             filename = f'predictions_seed_{seed}_{ts}.pkl'
             with open(Path(self.config['workspace']) / filename, 'wb') as f:
                 pickle.dump(obj, f)
@@ -264,6 +274,28 @@ def hash_string(string):
     hash_value = sha256_hash.hexdigest()
     truncated_hash = hash_value[:32]
     return truncated_hash
+
+
+def _task_metadata(config: dict) -> dict:
+    """The label conventions a result artifact must carry to be interpretable.
+
+    An SOH number means nothing without the reference capacity it is a ratio
+    of, so the mode travels with the predictions rather than living only in a
+    config file that may be edited later. Read from the config as configured;
+    nothing is inferred and nothing is defaulted here.
+    """
+    label = config.get('label', {}) if isinstance(config, dict) else {}
+    if not isinstance(label, dict):
+        return {}
+    metadata = {'label_annotator': label.get('name')}
+    for field in ('reference_capacity_mode', 'reference_n_cycles',
+                  'min_cycle', 'max_cycle', 'cycle_stride'):
+        if field in label:
+            metadata[field] = label[field]
+    feature = config.get('feature', {}) if isinstance(config, dict) else {}
+    if isinstance(feature, dict) and feature.get('name'):
+        metadata['feature_extractor'] = feature['name']
+    return metadata
 
 
 def timestamp(marker: bool = False):

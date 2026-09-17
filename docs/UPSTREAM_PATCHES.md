@@ -272,3 +272,43 @@ have (a factor of two in the test fixture).
 * the `soh_filepath` path still reads a supplied label file — but a missing
   file now raises instead of silently falling back to computed labels, which
   would have been two different label sources under one config.
+
+---
+
+## UP-06 — the prediction artifact carries sample identity and label conventions
+
+| Field | Value |
+| --- | --- |
+| File | `batteryml/pipeline.py` (`Pipeline.evaluate`, `_task_metadata`) |
+| Milestone | SOH route, commit 2 |
+| Basis | `[VERIFIED]` — `tests/test_soh_pipeline.py::TestSOHTrainEvaluateArtifact` reads the written `.pkl` back |
+
+### Why it could not go in `batteryml_web/`
+
+`Pipeline.evaluate` is what writes `predictions_seed_*.pkl`. For a cycle-level
+task the row index identifies nothing — one cell contributed many rows — so a
+prediction could not be traced to the cell and cycle it was made for, and
+"SOH vs cycle" could not be drawn at all. The information exists only inside
+`evaluate`, at the moment the artifact is assembled.
+
+### The diff, in words
+
+* when the evaluated `Dataset` carries a `sample_index` (UP-04), the artifact
+  gains `sample_index`: one `{cell_id, cycle_index}` per prediction, in row
+  order;
+* it also gains `task_metadata`: the label annotator, the reference-capacity
+  mode and sample policy as configured, and the feature extractor. An SOH
+  number is meaningless without the reference capacity it is a ratio of, so
+  the convention travels with the predictions rather than living only in a
+  config file that may be edited afterwards;
+* `_task_metadata` reads the config as configured. Nothing is inferred and
+  nothing is defaulted, so the artifact cannot claim a convention the run did
+  not use.
+
+### What was deliberately not changed
+
+* a whole-cell task writes exactly the previous four keys — `sample_index` is
+  absent, not `None`, because there row order *is* the cell order and nothing
+  was lost;
+* the existing keys, the filename and the pickle format are untouched, so
+  every existing reader keeps working.

@@ -101,12 +101,20 @@ def cohort(n_cells: int = 6, n_cycles: int = 10,
     """A small cohort for split and sample-count tests.
 
     Cell ``k`` fades linearly from 1.0 at a rate that differs per cell, so a
-    model cannot do well on a held-out cell by memorising a single curve.
+    model cannot do well on a held-out cell by memorising one curve.
+
+    The rate is expressed as a fraction of the cell's life rather than a
+    per-cycle constant, so **every cycle keeps a positive capacity** whatever
+    ``n_cycles`` is. A constant rate silently drove late cycles negative,
+    which the label annotator correctly excluded — and a count test then
+    failed for a reason that had nothing to do with the code under test.
     """
     cells = []
     for k in range(n_cells):
-        fade = 0.01 * (k + 1)
-        capacities = [1.0 - fade * i for i in range(n_cycles)]
+        total_fade = 0.1 + 0.05 * k        # 10%..(10+5k)% lost over the cell's life
+        per_cycle = total_fade / max(1, n_cycles - 1)
+        capacities = [1.0 - per_cycle * i for i in range(n_cycles)]
+        assert min(capacities) > 0.0, "cohort fixture must not produce a dead cell"
         cells.append(make_cell(f"{prefix}_{k}", capacities))
     return cells
 

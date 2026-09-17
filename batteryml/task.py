@@ -18,6 +18,18 @@ from batteryml.feature.base import BaseCycleFeatureExtractor
 from batteryml.label.base import BaseCycleLabelAnnotator
 
 
+def _usable_rows(features: torch.Tensor) -> torch.Tensor:
+    """Which rows of ``features`` are entirely finite.
+
+    A row with a NaN or an infinity is a sample whose features could not be
+    computed. Returned as a mask rather than raising so a run reports how
+    many samples it dropped instead of failing on the first unreadable cycle.
+    """
+    if features.ndim == 1:
+        return torch.isfinite(features)
+    return torch.isfinite(features.view(len(features), -1)).all(dim=1)
+
+
 class Task:
     def __init__(self,
                  train_test_splitter: dict,
@@ -92,10 +104,14 @@ class Task:
             test_index = SampleIndex.for_whole_cells(
                 [cell.cell_id for cell in test_cells])
 
-        # Omit NaN label samples. The sample index is filtered by the same
-        # mask, so a row's identity still matches its feature and label.
-        train_mask = ~torch.isnan(train_labels)
-        test_mask = ~torch.isnan(test_labels)
+        # Omit samples that cannot be used: a NaN label, and — for a
+        # cycle-level task — a row whose features could not be computed,
+        # because a cycle with no readable voltage trace is not a sample. It
+        # is dropped rather than zero-filled or borrowed from a neighbour.
+        # The sample index is filtered by the same mask, so a row's identity
+        # still matches its feature and label.
+        train_mask = ~torch.isnan(train_labels) & _usable_rows(train_features)
+        test_mask = ~torch.isnan(test_labels) & _usable_rows(test_features)
         train_features = train_features[train_mask]
         test_features = test_features[test_mask]
         train_index = train_index.select(train_mask.tolist())
