@@ -633,6 +633,9 @@ def render_home_page():
     if not config_path.exists():
         st.error("Config file missing: configs/baselines/sklearn/xgb/matr_1.yaml")
     q1, q2 = st.columns(2)
+    # Reserved outside the columns for the same reason as Run Model: the
+    # demo's progress bar spans the content area rather than q2's half.
+    demo_progress_host = st.container()
     with q1:
         if st.button("Load MATR Demo", use_container_width=True, key="home_load_matr_demo"):
             st.session_state["selected_dataset"] = "MATR"
@@ -675,6 +678,7 @@ def render_home_page():
                     (95, "Collect outputs"),
                     (100, "Demo completed"),
                 ],
+                container=demo_progress_host,
             )
             st.session_state["last_run_status"] = "success" if result["success"] else "failed"
             st.session_state["last_run_time"] = result["elapsed"]
@@ -1602,10 +1606,14 @@ def render_run_model_page():
             st.warning("Processed dataset missing. Go to Prepare Data and run preprocessing first.")
         if config_path is None or not Path(str(config_path)).exists():
             st.warning("Config missing for the selected dataset/model combination.")
+        # Reserved outside the columns, so the run's progress spans the whole
+        # content area instead of inheriting c2's two-thirds. The buttons stay
+        # side by side; only what the run draws moves out from under them.
+        run_progress_host = st.container()
         with c2:
             if st.button("Run BatteryML", disabled=not can_run, use_container_width=True, key="run_batteryml_btn"):
                 log_path = (_project_root() or Path("runs/web_projects/default")) / "logs" / "run_model.log"
-                result = run_command_with_progress(command=command, cwd=REPO_ROOT, log_path=log_path, steps=[(5, "Initialize"), (10, "Check dataset"), (20, "Load config"), (30, "Start BatteryML run"), (70, "Training/evaluation running"), (90, "Collect outputs"), (100, "Done")])
+                result = run_command_with_progress(command=command, cwd=REPO_ROOT, log_path=log_path, steps=[(5, "Initialize"), (10, "Check dataset"), (20, "Load config"), (30, "Start BatteryML run"), (70, "Training/evaluation running"), (90, "Collect outputs"), (100, "Done")], container=run_progress_host)
                 st.session_state["last_run_status"] = "success" if result["success"] else "failed"
                 st.session_state["last_run_time"] = result["elapsed"]
                 st.session_state["last_run_code"] = result["return_code"]

@@ -882,5 +882,178 @@ class TestSidebarStructure(unittest.TestCase):
                 )
 
 
+class TestRunProgressSpansTheContentArea(unittest.TestCase):
+    """A progress bar is read as a proportion of the page, so it gets the page.
+
+    Both Run buttons sit in ``st.columns`` so they can share a row with
+    another control, and anything drawn under a button inherits that column's
+    width. Measured in a browser before the fix: the bar came out at 66% of
+    the content area on Run Model (``columns([1, 2])``) and 49% on the Home
+    demo (``columns(2)``). The fix is a container reserved *outside* the
+    columns and handed to the renderer — not a width forced onto the widget,
+    which is why it stays responsive and cannot overflow.
+    """
+
+    def test_the_renderer_draws_everything_into_the_container_it_is_given(self) -> None:
+        """All of it or none of it: a half-redirected renderer still splits.
+
+        If the bar moved out of the column but its status line, log box or
+        error stayed behind, the run's output would be torn across two
+        widths — worse than the narrow bar it replaced.
+        """
+        import inspect
+        import textwrap
+
+        from batteryml_web.ui import progress_utils
+
+        source = textwrap.dedent(
+            inspect.getsource(progress_utils.run_command_with_progress)
+        )
+        tree = ast.parse(source)
+
+        # Read by AST, not by substring: "st.error(" is a substring of
+        # "host.error(", so a text scan passes or fails for the wrong reason.
+        bare_st = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "st"
+        }
+        # `st.code` is the single legitimate one: it sits inside
+        # `with host.expander(...)`, where the active container is already
+        # the expander, so it lands in the caller's container anyway.
+        self.assertEqual(
+            bare_st, {"code"},
+            f"{sorted(bare_st - {'code'})} bypass the caller's container, so "
+            "those elements would stay behind in the narrow column",
+        )
+        inside_expander = {
+            inner.func.attr
+            for node in ast.walk(tree) if isinstance(node, ast.With)
+            for item in node.items
+            if isinstance(item.context_expr, ast.Call)
+            and isinstance(item.context_expr.func, ast.Attribute)
+            and item.context_expr.func.attr == "expander"
+            and isinstance(item.context_expr.func.value, ast.Name)
+            and item.context_expr.func.value.id == "host"
+            for inner in ast.walk(node)
+            if isinstance(inner, ast.Call)
+            and isinstance(inner.func, ast.Attribute)
+            and isinstance(inner.func.value, ast.Name)
+            and inner.func.value.id == "st"
+        }
+        self.assertEqual(
+            inside_expander, {"code"},
+            "st.code must be the one inside `with host.expander(...)`",
+        )
+        self.assertIn("host = container if container is not None else st", source)
+
+    def test_the_container_is_reserved_outside_the_button_columns(self) -> None:
+        """The whole point: reserved *before* the ``with`` block, not inside.
+
+        Reserving it inside ``with c2:`` would compile and run and look
+        correct, and the bar would still be two-thirds width — so the
+        position is what this asserts, by AST.
+        """
+        tree = ast.parse(APP_PATH.read_text(encoding="utf-8"))
+
+        def _hosts(scope: ast.AST) -> set[str]:
+            """`<name>_progress_host = st.container()` anywhere under ``scope``."""
+            return {
+                node.targets[0].id
+                for node in ast.walk(scope)
+                if isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and node.value.func.attr == "container"
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id.endswith("progress_host")
+            }
+
+        # The names bound by `a, b = st.columns(...)`. Only these matter: an
+        # enclosing `with tabs[2]:` is a tab, not a width constraint, and the
+        # container is legitimately inside one of those.
+        column_names: set[str] = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and node.value.func.attr == "columns"
+                and isinstance(node.targets[0], ast.Tuple)
+            ):
+                column_names.update(
+                    element.id for element in node.targets[0].elts
+                    if isinstance(element, ast.Name)
+                )
+        self.assertTrue(column_names, "no st.columns unpacking found in app.py")
+
+        inside_a_column = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.With):
+                continue
+            if any(
+                isinstance(item.context_expr, ast.Name)
+                and item.context_expr.id in column_names
+                for item in node.items
+            ):
+                inside_a_column |= _hosts(node)
+
+        self.assertEqual(
+            _hosts(tree), {"run_progress_host", "demo_progress_host"},
+            "both Run buttons must reserve a full-width progress container",
+        )
+        self.assertEqual(
+            inside_a_column, set(),
+            f"{sorted(inside_a_column)} is reserved inside a column's `with` "
+            "block, so it inherits that column's width and the bar is narrow "
+            "again",
+        )
+
+    def test_every_column_bound_run_passes_its_container(self) -> None:
+        """Reserving a container helps nothing if the call does not use it."""
+        tree = ast.parse(APP_PATH.read_text(encoding="utf-8"))
+        calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "run_command_with_progress"
+        ]
+        self.assertEqual(len(calls), 3, "the known run/preprocess call sites")
+        with_container = [
+            call for call in calls
+            if any(kw.arg == "container" for kw in call.keywords)
+        ]
+        # Two of the three are inside columns and must pass one; the
+        # preprocessing call is already at full width and needs nothing.
+        self.assertEqual(
+            len(with_container), 2,
+            "the two column-bound Run buttons must pass container=",
+        )
+        passed = {
+            kw.value.id
+            for call in with_container for kw in call.keywords
+            if kw.arg == "container" and isinstance(kw.value, ast.Name)
+        }
+        self.assertEqual(passed, {"run_progress_host", "demo_progress_host"})
+
+    def test_no_pixel_or_viewport_width_is_forced_on_the_progress_bar(self) -> None:
+        """Responsiveness comes from filling a container, not from a number.
+
+        ``100vw`` in particular includes the sidebar, so it would overflow
+        horizontally rather than fit the content area.
+        """
+        for path in (APP_PATH, REPO_ROOT / "batteryml_web" / "ui" / "progress_utils.py",
+                     STYLES_PATH):
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(path=path.name):
+                self.assertNotIn("100vw", text)
+                self.assertNotIn("stProgress", text,
+                                 "the widget is not targeted directly; its "
+                                 "container is what decides its width")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
