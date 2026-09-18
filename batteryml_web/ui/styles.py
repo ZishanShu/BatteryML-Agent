@@ -123,43 +123,44 @@ SIDEBAR_COMPACT_CSS = """
 }
 
 /* The brand block at the very top: "BatteryML" over "Protocol Navigator".
-   These two lines are one lockup and must read as one, which means the space
-   between them has to be smaller than the space below them — and, before
-   this rule, it was negative.
 
-   Streamlit gives every markdown container `margin-bottom: -16px`. On a
-   caption that is harmless; on the heading it collapses a 28px title into a
-   12px container, so the element after it starts *inside* the title's own
-   line box. Measured in a browser: the title's ink ran to y=84.0 while the
-   caption beneath it began at y=74.4 — a 9.6px overlap, which is why
-   "Protocol Navigator" sat jammed under "BatteryML" with its capitals
-   touching the title's descenders.
+   The sidebar has two label-over-caption pairs, and they are built from the
+   same two calls — a markdown line and an `st.caption` (see render_sidebar).
+   They should therefore be spaced the same, and the pair to match is
+   "Current project" over its project name, because that one gets Streamlit's
+   spacing untouched. This rule is what makes the brand pair match it.
 
-   Replacing it with a known value lets the heading occupy the height it
-   actually draws. Negative, not 0: the pair has to read as one, which means
-   the space inside it must be smaller than the space below it. At 0 both
-   came out the same and the subtitle was equally attached to the title above
-   it and to "Current project" below — no grouping at all.
+   Why a rule is needed at all: Streamlit gives every markdown container
+   `margin-bottom: -16px`. Under "Current project" that is cancelled by the
+   paragraph's own `+16px` bottom margin, so its element container comes out
+   exactly as tall as its text and the block gap alone separates the two
+   lines — measured, 11.2px. A heading carries no bottom margin of its own,
+   so nothing cancels the -16px: it collapses a 28px title into a 12px
+   container and the caption begins *inside* the title's line box. Measured
+   before any rule existed: the title's ink ran to y=84.0 while the caption
+   began at y=74.4, a 9.6px overlap, which is why "Protocol Navigator" sat
+   jammed under "BatteryML" with its capitals touching the descenders.
 
-   **This value is kept equal and opposite to the block gap above.** Cancelling
-   exactly one gap lands the subtitle against the heading's own 0.2rem bottom
-   padding whatever that gap is, so the brand lockup holds still while the
-   rest of the sidebar's rhythm is tuned: measured at 2.8px between the two
-   lines of text at gap 0.4rem, and the same 2.8px at 0.25rem and at 0.7rem.
-   The heading's
-   padding is what guarantees that clearance, which is why this can tighten
-   the pair without ever reaching the title's ink. If the gap changes again,
-   change this with it — it is the pairing, not either number, that keeps the
-   title off its caption.
+   So the value has to be pinned; the question is only to what. It was
+   -0.7rem, kept equal and opposite to the block gap, which cured the overlap
+   but cancelled the gap along with it: measured, 0px between the heading's
+   box and the caption's while every other label/caption pair in the sidebar
+   had 11.2px. The brand read tighter than the rest of the column.
+
+   0 is the value that makes the two pairs identical. The container becomes
+   the height the heading actually draws, exactly as "Current project"'s
+   does, and the one block gap then spaces both pairs the same. It is still a
+   pin — it still overrides the -16px, so the overlap cannot come back — and
+   unlike the old value it does not move when the block gap is retuned.
 
    Scoped by `:has(> h3)` because the sidebar contains exactly one heading —
    the brand title — so this cannot reach "Current project", "Protocol
    Workflow", any caption or any navigation entry. Where `:has()` is
-   unsupported the rule simply does not match and the header keeps its
-   previous spacing, which is the same graceful failure as every other
-   selector here. */
+   unsupported the rule simply does not match and the header keeps Streamlit's
+   own spacing, which is the same graceful failure as every other selector
+   here. */
 [data-testid="stSidebar"] [data-testid="stMarkdownContainer"]:has(> h3) {
-    margin-bottom: -0.7rem;
+    margin-bottom: 0;
 }
 
 /* Captions — the grey secondary lines under each entry. Type size only.
@@ -239,18 +240,48 @@ SIDEBAR_COMPACT_CSS = """
 </style>
 """
 
-#: The scroll-to-top component (``ui/scroll.py``) is injected at zero height
-#: and carries no visible content, but Streamlit still wraps it in an
-#: element container with the standard block gap. Collapsing that container
-#: keeps navigation from adding a strip of blank space at the foot of the
-#: page. ``:has()`` is unsupported on older browsers, where the cost of not
-#: matching is a few pixels of padding — not a missing control.
+#: Element containers that render nothing, but still cost a full block gap.
+#:
+#: Two kinds exist. The scroll-to-top component (``ui/scroll.py``) is injected
+#: at zero height and carries no visible content, but Streamlit still wraps it
+#: in an element container; collapsing that keeps navigation from adding a
+#: strip of blank space at the foot of the page. The stylesheets in this module
+#: are the other kind: ``st.markdown("<style>…")`` produces an ordinary element
+#: container holding nothing but a ``<style>`` tag, and there are four of them
+#: at the top of every page.
+#:
+#: That second kind was the whole of the page's opening whitespace. Measured in
+#: a browser: the main column's first four children were the injected
+#: stylesheets, each 0px tall, each followed by the column's 16px gap — 64px of
+#: blank space between the top of the content area and the page title, spent on
+#: four invisible boxes.
+#:
+#: Zeroing the height is not enough, which is why the gap survived here for as
+#: long as it did: a flex ``gap`` is not a margin, and an empty box does not
+#: collapse it. The negative bottom margin is what removes it, and it is exactly
+#: one gap of the block these sit in — Streamlit's main column, measured at
+#: 16px. Cancelling one gap makes the neighbours sit as though the invisible
+#: container were not there; it cannot pull two *visible* elements together,
+#: because the gap it removes is the one the empty container introduced.
+#:
+#: ``:has()`` is unsupported on older browsers, where the cost of not matching
+#: is a strip of padding — not a missing control. The stylesheet arm is pinned
+#: to ``style:only-child`` so a markdown block that renders a stylesheet *and*
+#: text cannot match: only a container with literally nothing to show is
+#: collapsed. Measured: 4 matches, all in the main column, all 0px tall, none
+#: in the sidebar.
 ZERO_HEIGHT_COMPONENT_CSS = """
 <style>
 [data-testid="stElementContainer"]:has(> iframe[height="0"]) {
     height: 0;
     margin: 0;
     padding: 0;
+}
+[data-testid="stMain"] [data-testid="stElementContainer"]:has([data-testid="stMarkdownContainer"] > style:only-child) {
+    height: 0;
+    margin: 0;
+    padding: 0;
+    margin-bottom: -1rem;
 }
 </style>
 """

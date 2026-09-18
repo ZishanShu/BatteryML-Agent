@@ -404,6 +404,48 @@ class TestSidebarIsCompact(unittest.TestCase):
         self.assertIn(self.styles.SIDEBAR_COMPACT_CSS, emitted)
         self.assertIn(self.styles.ZERO_HEIGHT_COMPONENT_CSS, emitted)
 
+    def test_an_invisible_container_costs_no_block_gap(self) -> None:
+        """The page's opening whitespace, and why zero height was not enough.
+
+        ``render_layout_css`` writes its stylesheets with ``st.markdown``, and
+        each one becomes an ordinary element container holding nothing but a
+        ``<style>`` tag. Measured in a browser, the main column's first four
+        children were exactly those: 0px tall, and each still followed by the
+        column's 16px gap — 64px of blank space above the page title, spent on
+        four invisible boxes.
+
+        A flex ``gap`` is not a margin, so an empty box does not collapse it;
+        only a negative margin removes it. That is the property this asserts,
+        together with the two things that keep the rule from reaching anything
+        visible: ``style:only-child``, so a markdown block rendering a
+        stylesheet *and* text cannot match, and no ``display``/``visibility``,
+        so a rule that over-matches costs pixels rather than a control.
+        """
+        css = self.styles.ZERO_HEIGHT_COMPONENT_CSS
+        self.assertIn("style:only-child", css)
+        block = re.search(
+            r"style:only-child\)\s*\{([^}]*)\}", css, re.DOTALL
+        )
+        self.assertIsNotNone(
+            block, "the stylesheet-container rule is gone"
+        )
+        margin = re.search(r"margin-bottom:\s*(-?[0-9.]+)rem", block.group(1))
+        self.assertIsNotNone(
+            margin,
+            "zeroing the height leaves the flex gap behind; the negative "
+            "bottom margin is what removes it",
+        )
+        self.assertLess(
+            float(margin.group(1)), 0.0,
+            "a non-negative margin cannot cancel a gap",
+        )
+        for forbidden in ("display:", "visibility:"):
+            self.assertNotIn(
+                forbidden, css,
+                f"{forbidden} can make an element unreachable; this rule may "
+                "only reclaim space",
+            )
+
     def test_nothing_in_the_sidebar_is_hidden(self) -> None:
         """Spacing only: a control the user cannot reach is not 'compact'."""
         for forbidden in ("display: none", "display:none", "visibility: hidden", "visibility:hidden"):
@@ -460,35 +502,46 @@ class TestSidebarIsCompact(unittest.TestCase):
             "below 0.25rem the sidebar's controls stop reading as separate rows",
         )
 
-    def test_the_brand_margin_stays_coupled_to_the_block_gap(self) -> None:
-        """What now keeps the title off its own caption, in place of a floor.
+    def test_the_brand_pair_is_spaced_like_every_other_label_and_caption(self) -> None:
+        """The brand margin is pinned at 0, and 0 is the value that matters.
 
-        The gap used to be floored at 0.4rem because the heading's ~16px
-        overflow had nothing else holding it back. It does now: the brand
-        rule cancels exactly one block gap, which lands the subtitle against
-        the heading's own padding *whatever the gap is*. Measured in a
-        browser at both values — 2.8px between the two lines of text at
-        0.4rem, and the same 2.8px at 0.25rem.
+        The sidebar has two label-over-caption pairs built from the same two
+        calls — "BatteryML" over "Protocol Navigator", and "Current project"
+        over the project name. The second gets Streamlit's own spacing, and
+        it is the one to match.
 
-        So the invariant is the pairing, not either number, and this asserts
-        the pairing. Tuning the sidebar's rhythm without moving the brand
-        margin with it is the regression this catches — and it is a stronger
-        guarantee than the floor it replaces, because it holds at any gap.
+        The margin still has to be *pinned*, because Streamlit's
+        ``margin-bottom: -16px`` on a heading has nothing to cancel it and
+        collapses a 28px title into a 12px container — measured, a 9.6px
+        overlap of the caption onto the title. But it was pinned at minus one
+        block gap, which cured the overlap by spending the gap: measured,
+        0px between the brand's two boxes against 11.2px for every other
+        label/caption pair in the column.
+
+        At 0 the container is the height the heading draws and the single
+        block gap spaces both pairs alike — measured in a browser at 11.2px
+        for each. So this asserts a pin that is not negative: any negative
+        value takes the brand tighter than the pair it is supposed to match,
+        which is the regression this catches. It replaces an earlier
+        assertion that the margin cancel exactly one gap, which encoded the
+        opposite intent.
         """
-        gap = re.search(r"stVerticalBlock\"\]\s*\{[^}]*gap:\s*([0-9.]+)rem", self.css)
-        self.assertIsNotNone(gap, "the sidebar must still set the block gap")
         brand = re.search(
-            r":has\(> h3\)\s*\{[^}]*margin-bottom:\s*(-?[0-9.]+)rem", self.css
+            r":has\(> h3\)\s*\{[^}]*margin-bottom:\s*(-?[0-9.]+)(?:rem)?", self.css
         )
         self.assertIsNotNone(
-            brand, "the brand heading rule must still set a bottom margin"
+            brand,
+            "the brand heading rule must still pin its bottom margin, or "
+            "Streamlit's -16px puts 'Protocol Navigator' back on top of "
+            "'BatteryML'",
         )
-        self.assertAlmostEqual(
-            float(brand.group(1)), -float(gap.group(1)), places=4,
+        self.assertGreaterEqual(
+            float(brand.group(1)), 0.0,
             msg=(
-                f"the brand margin ({brand.group(1)}rem) no longer cancels the "
-                f"block gap ({gap.group(1)}rem); 'Protocol Navigator' will "
-                "drift into or away from 'BatteryML'"
+                f"the brand margin is {brand.group(1)}rem. A negative value "
+                "eats the block gap, which spaces the brand pair tighter than "
+                "'Current project' over its project name — the pair it is "
+                "supposed to match"
             ),
         )
         headings = re.search(

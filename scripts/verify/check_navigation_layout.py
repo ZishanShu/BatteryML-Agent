@@ -15,10 +15,11 @@ second:
 * **`UX-10`** — the sidebar stylesheet adjusts spacing only, is scoped to
   the sidebar, hides nothing, relies on no generated class name, and keeps
   the values a browser run pinned down: the block gap at or above
-  `0.25rem`, a non-zero heading padding, and a brand margin that cancels
-  exactly one block gap. The sidebar heading overflows its own container by
-  ~16px; that last pairing is what stops it landing on its caption, and it
-  holds at any gap.
+  `0.25rem`, a non-zero heading padding, and a brand margin that is pinned
+  and not negative. The sidebar heading overflows its own container by ~16px,
+  so the pin is what stops it landing on its caption; keeping the pin at or
+  above zero is what keeps the brand pair spaced like "Current project" over
+  its project name, the one label/caption pair Streamlit spaces itself.
 
 This check renders nothing, starts no server and writes nothing outside its
 own report.
@@ -91,8 +92,8 @@ CAPTION_FORBIDDEN_ROOTS = {"margin", "padding", "height", "overflow"}
 #: legibility, not collision — below it the controls stop reading as separate
 #: rows. It used to be 0.4rem for a different reason: the heading's ~16px
 #: overflow had nothing else holding it back, so a smaller gap put the title
-#: on its own caption. The brand rule now cancels exactly one block gap, which
-#: holds the header steady at any value, and the pairing is checked below.
+#: on its own caption. The brand rule now pins that overflow at 0 whatever the
+#: gap is, so the two are independent; the pin is checked below.
 MINIMUM_BLOCK_GAP_REM = 0.25
 
 _GENERATED_CLASS = re.compile(r"\.(css|st-emotion)-[0-9a-z]{4,}")
@@ -350,7 +351,7 @@ def _check_sidebar_stylesheet(root: Path, errors: list[str], observed: dict) -> 
                 "controls stop reading as separate rows (UX-10)."
             )
         brand = re.search(
-            r":has\(> h3\)\s*\{[^}]*margin-bottom:\s*(-?[0-9.]+)rem",
+            r":has\(> h3\)\s*\{[^}]*margin-bottom:\s*(-?[0-9.]+)(?:rem)?",
             SIDEBAR_COMPACT_CSS,
         )
         if brand is None:
@@ -362,13 +363,14 @@ def _check_sidebar_stylesheet(root: Path, errors: list[str], observed: dict) -> 
             )
         else:
             observed["brand_margin_rem"] = float(brand.group(1))
-            if abs(float(brand.group(1)) + float(gap.group(1))) > 1e-4:
+            if float(brand.group(1)) < 0.0:
                 errors.append(
-                    f"the sidebar brand margin is {brand.group(1)}rem but the "
-                    f"block gap is {gap.group(1)}rem. The margin must cancel "
-                    "exactly one gap, or 'Protocol Navigator' drifts into or "
-                    "away from 'BatteryML' whenever the rhythm is retuned "
-                    "(UX-10, UX-11)."
+                    f"the sidebar brand margin is {brand.group(1)}rem. A "
+                    "negative value spends the block gap, which spaces "
+                    "'BatteryML' over 'Protocol Navigator' more tightly than "
+                    "'Current project' over its project name — the one "
+                    "label/caption pair Streamlit spaces itself, and the one "
+                    "the brand is meant to match (UX-10, UX-11)."
                 )
 
     headings = re.search(r"stSidebar\"\]\s*h4\s*\{([^}]*)\}", SIDEBAR_COMPACT_CSS)
