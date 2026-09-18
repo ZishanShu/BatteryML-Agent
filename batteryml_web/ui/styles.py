@@ -20,21 +20,20 @@ from __future__ import annotations
 
 import streamlit as st
 
-#: The sidebar's vertical rhythm, tightened.
+#: The sidebar's vertical rhythm.
 #:
 #: The default sidebar spends most of the first screen on padding: a tall
 #: band above the title, a full text line of gap between every element, and
-#: dividers with roughly a line of air on each side. On a laptop that pushed
-#: the numbered protocol steps below the fold, which is the one thing the
-#: sidebar exists to show.
+#: dividers with roughly a line of air on each side. The band above the title
+#: is worth reclaiming. The gap between controls is not — it was cut to 4px
+#: here once and the navigation read as one welded strip, so it is back to a
+#: comfortable 0.7rem and only the header band stays tight.
 #:
 #: The values below were not guessed. Streamlit's sidebar heading is a 50px
 #: box that occupies only 34px of layout — it overflows the element below it
-#: by a constant ~16px, and the default 1rem gap is what hides that. Squeeze
-#: the gap to 0.3rem and zero the heading's padding, as a first attempt did,
-#: and the title lands on top of its own caption. So the gap stays at 0.4rem
-#: and the heading keeps a small padding: measured in a browser against the
-#: unstyled sidebar, that is 42% shorter with the text still clear.
+#: by a constant ~16px. Zeroing the heading's padding, as a first attempt
+#: did, lands the title on top of its own caption; the brand rule below now
+#: pins that overflow explicitly instead of relying on the gap to hide it.
 SIDEBAR_COMPACT_CSS = """
 <style>
 /* The band above the sidebar title — the "forehead", and the largest single
@@ -76,9 +75,13 @@ SIDEBAR_COMPACT_CSS = """
    the single value that sets the sidebar's vertical rhythm: measured in a
    browser, *every* top-level block is separated by exactly this and nothing
    else, from the project label down to the LLM status line.
-   0.4rem (6.4px) left the list looking loose against its own 40px buttons;
-   0.25rem (4px) is a visible tightening that still reads as separation
-   rather than as two controls touching.
+   0.7rem (11.2px). It was taken down to 0.25rem (4px) to save height, and
+   that was the wrong trade: at 4px the navigation buttons read as one
+   welded strip rather than as a list of separate controls, which is the
+   complaint this value now answers. A 40px control needs roughly a quarter
+   of its own height around it before the eye accepts it as standing alone,
+   and saving 90px in a column that had 600px of empty space beneath it
+   bought nothing.
 
    The old floor of 0.4rem was not about rhythm. It existed because
    Streamlit's sidebar heading overflows its container by ~16px, so a
@@ -88,14 +91,15 @@ SIDEBAR_COMPACT_CSS = """
    here. Change one and the other must change with it; the test and UI-01
    both check the pair, not the number. */
 [data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
-    gap: 0.25rem;
+    gap: 0.7rem;
 }
 
 /* Dividers: keep the rule, drop the air around it. Held below the block gap
    so the rule never adds height of its own — measured, these margins collapse
    against the gap and contribute nothing, and the section break the divider
-   marks comes out at two gaps (8px) against the list's 4px. That contrast is
-   what still reads as a break rather than as one more row. */
+   marks comes out at the group margin plus a gap, against the 11.2px between
+   two buttons. That contrast is what reads as a break rather than as one
+   more row. */
 [data-testid="stSidebar"] hr,
 [data-testid="stSidebar"] [data-testid="stDivider"] {
     margin-top: 0.2rem;
@@ -134,7 +138,8 @@ SIDEBAR_COMPACT_CSS = """
    exactly one gap lands the subtitle against the heading's own 0.2rem bottom
    padding whatever that gap is, so the brand lockup holds still while the
    rest of the sidebar's rhythm is tuned: measured at 2.8px between the two
-   lines of text at gap 0.4rem, and the same 2.8px at 0.25rem. The heading's
+   lines of text at gap 0.4rem, and the same 2.8px at 0.25rem and at 0.7rem.
+   The heading's
    padding is what guarantees that clearance, which is why this can tighten
    the pair without ever reaching the title's ink. If the gap changes again,
    change this with it — it is the pairing, not either number, that keeps the
@@ -147,7 +152,7 @@ SIDEBAR_COMPACT_CSS = """
    previous spacing, which is the same graceful failure as every other
    selector here. */
 [data-testid="stSidebar"] [data-testid="stMarkdownContainer"]:has(> h3) {
-    margin-bottom: -0.25rem;
+    margin-bottom: -0.7rem;
 }
 
 /* Captions — the grey secondary lines under each entry. Type size only.
@@ -190,12 +195,13 @@ SIDEBAR_COMPACT_CSS = """
    and its own value, a heading and its own list — and it is deliberately
    tight. This is the space *between* two groups, and it has to be clearly
    larger or the sidebar reads as one undifferentiated column: at a uniform
-   4px, "Protocol Navigator" sat as close to "Current project" as "Current
+   gap, "Protocol Navigator" sat as close to "Current project" as "Current
    project" did to the project name belonging to it.
 
-   0.85rem against the 0.25rem gap is a ratio of about 3.4:1 — enough that
-   the grouping is read rather than measured. The first group takes no top
-   margin: its space above is the header band's, already set.
+   1.6rem against the 0.7rem gap measures 36.8px between groups against
+   11.2px within one — about 3.3:1, enough that the grouping is read rather
+   than measured. The first group takes no top margin: its space above is
+   the header band's, already set.
 
    Keyed off the class Streamlit writes for `st.container(key=...)`, which is
    the author's own name (see SIDEBAR_GROUP_KEYS in ui/workflow_sidebar.py),
@@ -207,7 +213,7 @@ SIDEBAR_COMPACT_CSS = """
 [data-testid="stSidebar"] .st-key-sb_protocol,
 [data-testid="stSidebar"] .st-key-sb_pager,
 [data-testid="stSidebar"] .st-key-sb_foot {
-    margin-top: 0.85rem;
+    margin-top: 1.6rem;
 }
 
 /* The protocol group opens with the one rule in the sidebar, which already
@@ -215,13 +221,13 @@ SIDEBAR_COMPACT_CSS = """
    two separations on top of each other, so it takes a smaller one and the
    rule does the rest. */
 [data-testid="stSidebar"] .st-key-sb_protocol {
-    margin-top: 0.35rem;
+    margin-top: 0.7rem;
 }
 
 /* Prev/Next is the protocol list's own control, not a new subject, so it
    sits closer to the list than the groups do to each other. */
 [data-testid="stSidebar"] .st-key-sb_pager {
-    margin-top: 0.5rem;
+    margin-top: 1.4rem;
 }
 </style>
 """

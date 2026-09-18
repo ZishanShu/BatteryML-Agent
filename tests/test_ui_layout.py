@@ -907,16 +907,21 @@ class TestSidebarStructure(unittest.TestCase):
     #: The one group whose separation is not its margin: it opens with the
     #: sidebar's single rule, which announces the boundary on its own. Its
     #: margin is deliberately *smaller* so the two do not stack — measured,
-    #: it still lands at 17.1px from the entry group above, the same as the
+    #: it still lands at ~30px from the entry group above, comparable to the
     #: groups that use a margin alone.
     RULE_SEPARATED_GROUP = "sb_protocol"
 
     def test_the_gap_between_groups_is_clearly_larger_than_the_gap_within_one(self) -> None:
         """The whole point of the grouping, as a number.
 
-        Measured in a browser after the change: 4.0px inside a group against
-        17.6px between two — a ratio the eye reads as grouping rather than
-        has to measure. Anything under about 2:1 stops reading as a break.
+        Measured in a browser: 11.2px inside a group against 36.8px between
+        two — a ratio the eye reads as grouping rather than has to measure.
+        Anything under about 2:1 stops reading as a break.
+
+        The gap itself is not floored here on purpose. It was once cut to
+        4px to save height and the navigation buttons welded into a strip;
+        what that proved is that the *ratio* is the invariant and the
+        absolute value is a judgement, so only the ratio is asserted.
         """
         from batteryml_web.ui.styles import SIDEBAR_COMPACT_CSS as css
 
