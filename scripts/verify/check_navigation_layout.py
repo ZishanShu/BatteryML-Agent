@@ -67,6 +67,10 @@ ALLOWED_CSS_PROPERTIES = {
     "padding", "padding-top", "padding-bottom", "padding-left", "padding-right",
     "margin", "margin-top", "margin-bottom", "margin-left", "margin-right",
     "gap", "line-height", "height", "min-height",
+    # The sidebar's own width, admitted on the same reasoning as height: a
+    # narrower box still renders every control, still wraps and still
+    # scrolls. What stays out is what can make a control unreachable.
+    "width", "min-width",
     # Type size, for the sidebar's grey secondary lines (UX-11). A size is
     # not a disappearance: the text still renders, still wraps and is still
     # selectable. Colour, display, visibility, content and overflow stay out

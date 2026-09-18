@@ -163,16 +163,39 @@ def _nav_button(step: dict, current_step: str) -> None:
             set_current_step(step["key"])
 
 
+#: The sidebar's logical groups, in order. Each becomes a keyed container so
+#: the stylesheet can space *between* groups differently from *within* one —
+#: a label and its own value belong together, and two different kinds of
+#: thing do not. Without them every element sat the same distance from its
+#: neighbour, which is even but says nothing: "Protocol Navigator" looked as
+#: closely related to "Current project" as "Current project" did to the
+#: project name underneath it.
+#:
+#: The key becomes a ``st-key-<key>`` class on the container. That is an
+#: author-chosen name, not one of Streamlit's generated ``css-1x2y3z``
+#: hashes, so it is stable across releases and safe to style against.
+SIDEBAR_GROUP_KEYS: tuple[str, ...] = (
+    "sb_brand",     # BatteryML / Protocol Navigator
+    "sb_project",   # Current project / its name
+    "sb_entry",     # Home / Agent Workflow — the two ways in
+    "sb_protocol",  # the rule, the heading and the numbered route
+    "sb_pager",     # Prev / Next
+    "sb_foot",      # Settings / LLM status
+)
+
+
 def render_sidebar_workflow():
     # Spacing only, and injected before the sidebar is drawn so the first
     # paint is already compact. See ui/styles.py for what it may not do.
     render_layout_css()
     with st.sidebar:
-        st.markdown("### 🔋 BatteryML")
-        st.caption("Protocol Navigator")
+        with st.container(key="sb_brand"):
+            st.markdown("### 🔋 BatteryML")
+            st.caption("Protocol Navigator")
 
-        st.markdown("**Current project**")
-        st.caption(current_project_label())
+        with st.container(key="sb_project"):
+            st.markdown("**Current project**")
+            st.caption(current_project_label())
 
         # Exactly one rule in the whole sidebar, immediately above the
         # numbered protocol list. A divider says "a different kind of thing
@@ -181,30 +204,34 @@ def render_sidebar_workflow():
         # rules that used to sit above Prev/Next, above settings and above
         # the status line separated a list from its own controls, and a
         # single-line control from a single-line readout — boundaries that
-        # do not exist. Vertical rhythm does that work now.
+        # do not exist. The space between groups does that work now.
         current_step = st.session_state.get("current_step", "home")
-        _nav_button(NAV_STEPS[0], current_step)
-        for step in AGENT_STEPS:
-            _nav_button(step, current_step)
+        with st.container(key="sb_entry"):
+            _nav_button(NAV_STEPS[0], current_step)
+            for step in AGENT_STEPS:
+                _nav_button(step, current_step)
 
-        st.divider()
-        st.markdown("**Protocol Workflow**")
-        for step in WORKFLOW_STEPS:
-            _nav_button(step, current_step)
+        with st.container(key="sb_protocol"):
+            st.divider()
+            st.markdown("**Protocol Workflow**")
+            for step in WORKFLOW_STEPS:
+                _nav_button(step, current_step)
 
         idx = get_current_step_index()
-        prev_col, next_col = st.columns(2)
-        with prev_col:
-            if st.button("← Prev", disabled=(idx == 0), use_container_width=True, key="sidebar_prev_step"):
-                set_current_step(NAV_STEPS[idx - 1]["key"])
-        with next_col:
-            if st.button("Next →", disabled=(idx == len(NAV_STEPS) - 1), use_container_width=True, key="sidebar_next_step"):
-                set_current_step(NAV_STEPS[idx + 1]["key"])
+        with st.container(key="sb_pager"):
+            prev_col, next_col = st.columns(2)
+            with prev_col:
+                if st.button("← Prev", disabled=(idx == 0), use_container_width=True, key="sidebar_prev_step"):
+                    set_current_step(NAV_STEPS[idx - 1]["key"])
+            with next_col:
+                if st.button("Next →", disabled=(idx == len(NAV_STEPS) - 1), use_container_width=True, key="sidebar_next_step"):
+                    set_current_step(NAV_STEPS[idx + 1]["key"])
 
-        render_sidebar_settings()
+        with st.container(key="sb_foot"):
+            render_sidebar_settings()
 
-        label, color = llm_status_badge()
-        st.markdown(
-            f"<div style='font-size:0.9rem; color:{color}; font-weight:600;'>LLM: {label}</div>",
-            unsafe_allow_html=True,
-        )
+            label, color = llm_status_badge()
+            st.markdown(
+                f"<div style='font-size:0.9rem; color:{color}; font-weight:600;'>LLM: {label}</div>",
+                unsafe_allow_html=True,
+            )

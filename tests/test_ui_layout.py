@@ -579,6 +579,12 @@ class TestSidebarIsCompact(unittest.TestCase):
             "padding", "padding-top", "padding-bottom", "padding-left", "padding-right",
             "margin", "margin-top", "margin-bottom", "margin-left", "margin-right",
             "gap", "line-height", "height", "min-height", "font-size",
+            # The sidebar's own width, in the same family as height/min-height
+            # and admitted on the same reasoning: a box that is narrower still
+            # renders every control, still wraps, still scrolls. The properties
+            # that stay out are the ones that can make a control unreachable —
+            # display, visibility, overflow, content, colour.
+            "width", "min-width",
         }
         self.assertTrue(properties, "the stylesheet declares nothing")
         self.assertEqual(
@@ -717,6 +723,20 @@ class _SidebarRecorder:
         count = spec if isinstance(spec, int) else len(spec)
         return [self for _ in range(count)]
 
+    def container(self, **kwargs):
+        """A group wrapper, recorded by key and kept transparent.
+
+        Returning ``self`` keeps the recorded sequence flat, which is what
+        the order assertions below read: grouping the sidebar changed where
+        elements sit relative to each other in *space*, not in order, and a
+        recorder that nested them would make those assertions about the
+        recorder rather than about the sidebar.
+        """
+        key = kwargs.get("key")
+        if key is not None:
+            self.sequence.append(("container", str(key)))
+        return self
+
 
 class TestSidebarStructure(unittest.TestCase):
     """One rule, in the one place a boundary exists.
@@ -851,6 +871,148 @@ class TestSidebarStructure(unittest.TestCase):
         self.assertNotEqual(
             kinds[heading + 1], "caption",
             f"a caption follows the Protocol Workflow heading: {labels[heading + 1]!r}",
+        )
+
+    def test_the_sidebar_is_drawn_as_groups_not_as_one_flat_list(self) -> None:
+        """Every row used to sit the same distance from its neighbour.
+
+        That is even, but it says nothing: "Protocol Navigator" read as
+        closely related to "Current project" as "Current project" did to the
+        project name belonging to it. The groups are what let the stylesheet
+        space *between* subjects differently from *within* one.
+        """
+        from batteryml_web.ui import workflow_sidebar as sidebar
+
+        opened = [text for kind, text in self._render() if kind == "container"]
+        self.assertEqual(
+            opened, list(sidebar.SIDEBAR_GROUP_KEYS),
+            "the sidebar's groups, in order, are what the stylesheet spaces",
+        )
+
+    def test_each_group_key_is_styled_and_each_styled_key_exists(self) -> None:
+        """A key with no rule, or a rule with no key, silently does nothing."""
+        from batteryml_web.ui import workflow_sidebar as sidebar
+
+        from batteryml_web.ui.styles import SIDEBAR_COMPACT_CSS as css
+
+        styled = set(re.findall(r"\.st-key-(sb_\w+)", css))
+        declared = set(sidebar.SIDEBAR_GROUP_KEYS)
+        # The first group takes no top margin: its space above is the header
+        # band's, so it is deliberately not styled here.
+        self.assertEqual(
+            styled, declared - {"sb_brand"},
+            "a group is styled that does not exist, or exists unstyled",
+        )
+
+    #: The one group whose separation is not its margin: it opens with the
+    #: sidebar's single rule, which announces the boundary on its own. Its
+    #: margin is deliberately *smaller* so the two do not stack — measured,
+    #: it still lands at 17.1px from the entry group above, the same as the
+    #: groups that use a margin alone.
+    RULE_SEPARATED_GROUP = "sb_protocol"
+
+    def test_the_gap_between_groups_is_clearly_larger_than_the_gap_within_one(self) -> None:
+        """The whole point of the grouping, as a number.
+
+        Measured in a browser after the change: 4.0px inside a group against
+        17.6px between two — a ratio the eye reads as grouping rather than
+        has to measure. Anything under about 2:1 stops reading as a break.
+        """
+        from batteryml_web.ui.styles import SIDEBAR_COMPACT_CSS as css
+
+        gap = re.search(r"stVerticalBlock\"\]\s*\{[^}]*gap:\s*([0-9.]+)rem", css)
+        self.assertIsNotNone(gap, "the sidebar must still set the block gap")
+        within = float(gap.group(1))
+
+        # The margin each group's selector actually ends up with: later rules
+        # override earlier ones, so a per-group override is what counts.
+        margins: dict[str, float] = {}
+        for block in css.split("}"):
+            if ".st-key-sb_" not in block:
+                continue
+            found = re.search(r"margin-top:\s*([0-9.]+)rem", block)
+            if not found:
+                continue
+            for key in re.findall(r"\.st-key-(sb_\w+)", block):
+                margins[key] = float(found.group(1))
+        self.assertTrue(margins, "no group carries a separating margin")
+
+        for key, margin in sorted(margins.items()):
+            if key == self.RULE_SEPARATED_GROUP:
+                continue
+            with self.subTest(group=key):
+                self.assertGreaterEqual(
+                    margin / within, 2.0,
+                    f"{key} separates itself by {margin}rem against a "
+                    f"{within}rem gap within a group, so it stops reading as "
+                    "a separate group",
+                )
+
+    def test_the_rule_separated_group_leans_on_its_rule_not_a_big_margin(self) -> None:
+        """Non-vacuity for the exemption above: it is exempt for a reason.
+
+        Stacking a full group margin on top of the divider would separate
+        that one boundary twice as hard as every other, which is its own kind
+        of uneven. So its margin is smaller than the rest — and that is
+        asserted, rather than the group simply being skipped.
+        """
+        from batteryml_web.ui.styles import SIDEBAR_COMPACT_CSS as css
+
+        margins: dict[str, float] = {}
+        for block in css.split("}"):
+            if ".st-key-sb_" not in block:
+                continue
+            found = re.search(r"margin-top:\s*([0-9.]+)rem", block)
+            if not found:
+                continue
+            for key in re.findall(r"\.st-key-(sb_\w+)", block):
+                margins[key] = float(found.group(1))
+
+        exempt = margins.get(self.RULE_SEPARATED_GROUP)
+        self.assertIsNotNone(exempt, "the rule-separated group carries no margin")
+        others = [m for key, m in margins.items() if key != self.RULE_SEPARATED_GROUP]
+        self.assertTrue(others)
+        self.assertLess(
+            exempt, max(others),
+            "the group that opens with the rule takes the full group margin "
+            "as well, so that boundary is separated twice",
+        )
+        # And it really does open with the rule.
+        sidebar = SIDEBAR_PATH.read_text(encoding="utf-8")
+        block = sidebar.split(f'key="{self.RULE_SEPARATED_GROUP}"', 1)[1]
+        self.assertLess(
+            block.index("st.divider()"), block.index("Protocol Workflow"),
+            "the rule is no longer the first thing in that group",
+        )
+
+    def test_the_content_column_has_gutters_so_controls_are_not_stretched(self) -> None:
+        """Why the sidebar looked too wide: the panel is not what changed.
+
+        Streamlit writes the panel's width inline because the sidebar is
+        drag-resizable, so pinning it in CSS needs ``!important`` — measured,
+        that does narrow the panel and does stop the drag handle working.
+        The gutter narrows the content column instead and leaves the control
+        alone.
+        """
+        from batteryml_web.ui.styles import SIDEBAR_COMPACT_CSS as css
+
+        match = re.search(
+            r'stSidebarUserContent"\]\s*\{([^}]*)\}', css, re.DOTALL
+        )
+        self.assertIsNotNone(match, "the sidebar content rule is gone")
+        for side in ("padding-left", "padding-right"):
+            found = re.search(rf"{side}:\s*([0-9.]+)rem", match.group(1))
+            with self.subTest(side=side):
+                self.assertIsNotNone(found, f"the content column has no {side}")
+                self.assertGreater(float(found.group(1)), 0.0)
+        # Declarations only: the rule above explains in prose *why* the
+        # panel is not pinned with !important, and that explanation must not
+        # be what trips this.
+        declarations = re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
+        self.assertNotIn(
+            "!important", declarations,
+            "!important on the sidebar pins its width and stops the user "
+            "dragging it; the gutter achieves the same look without that",
         )
 
     def test_the_agent_entry_keeps_the_one_description_that_carries_a_promise(self) -> None:

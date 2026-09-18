@@ -52,9 +52,24 @@ SIDEBAR_COMPACT_CSS = """
     padding-top: 0.25rem;
     padding-bottom: 0;
 }
+/* The content column's own gutters. The panel is 300px wide and left 240px
+   for content whose widest line — "default (no project loaded)" — measures
+   146px, so every button stretched across ~90px of slack and the column read
+   as half empty.
+
+   The gutter is what narrows here, not the panel. Streamlit writes the
+   panel's width as an *inline* style because the sidebar is drag-resizable,
+   so a stylesheet can only win with `!important` — and that was measured:
+   the panel does go to 17rem, and dragging the handle then does nothing at
+   all, because the inline width the drag writes is overridden on every
+   frame. Twenty-eight pixels is not worth silently removing a control the
+   user has, and anyone who wants the panel narrower can simply drag it.
+   A gutter costs nothing and fixes what the eye was actually objecting to. */
 [data-testid="stSidebarUserContent"] {
     padding-top: 0.25rem;
     padding-bottom: 1rem;
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
 }
 
 /* The gap Streamlit puts between every stacked element in the sidebar, and
@@ -169,6 +184,44 @@ SIDEBAR_COMPACT_CSS = """
 [data-testid="stSidebar"] [data-testid="stExpander"] {
     margin-top: 0;
     margin-bottom: 0;
+}
+
+/* Group rhythm. The block gap above is the space *inside* a group — a label
+   and its own value, a heading and its own list — and it is deliberately
+   tight. This is the space *between* two groups, and it has to be clearly
+   larger or the sidebar reads as one undifferentiated column: at a uniform
+   4px, "Protocol Navigator" sat as close to "Current project" as "Current
+   project" did to the project name belonging to it.
+
+   0.85rem against the 0.25rem gap is a ratio of about 3.4:1 — enough that
+   the grouping is read rather than measured. The first group takes no top
+   margin: its space above is the header band's, already set.
+
+   Keyed off the class Streamlit writes for `st.container(key=...)`, which is
+   the author's own name (see SIDEBAR_GROUP_KEYS in ui/workflow_sidebar.py),
+   not one of the generated `css-1x2y3z` hashes this file may not rely on. A
+   group whose key is ever renamed simply stops matching and falls back to
+   the block gap — no overlap, nothing hidden. */
+[data-testid="stSidebar"] .st-key-sb_project,
+[data-testid="stSidebar"] .st-key-sb_entry,
+[data-testid="stSidebar"] .st-key-sb_protocol,
+[data-testid="stSidebar"] .st-key-sb_pager,
+[data-testid="stSidebar"] .st-key-sb_foot {
+    margin-top: 0.85rem;
+}
+
+/* The protocol group opens with the one rule in the sidebar, which already
+   announces the boundary. Giving it the full group margin *as well* stacked
+   two separations on top of each other, so it takes a smaller one and the
+   rule does the rest. */
+[data-testid="stSidebar"] .st-key-sb_protocol {
+    margin-top: 0.35rem;
+}
+
+/* Prev/Next is the protocol list's own control, not a new subject, so it
+   sits closer to the list than the groups do to each other. */
+[data-testid="stSidebar"] .st-key-sb_pager {
+    margin-top: 0.5rem;
 }
 </style>
 """
