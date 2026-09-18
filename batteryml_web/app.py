@@ -118,11 +118,31 @@ refresh_llm_status_from_config()
 st.markdown(
     """
 <style>
+/* The band the page opens with. Both rules here were written once and both
+   were quietly doing nothing; measured, the page still opened on 96px of
+   padding under a 60px toolbar, which is why the title sat 160px down.
+
+   `stMainBlockContainer` is the current name. `stAppViewBlockContainer` is
+   what Streamlit called this element when the rule was written, and it no
+   longer exists — a selector that matches nothing fails silently, which is
+   exactly how 96px went unnoticed. Both names are listed so the rule works
+   either side of that rename.
+
+   2.5rem (40px) clears the 36px toolbar with a little air. It cannot go
+   much below that: the toolbar is `position: absolute` with a z-index of
+   999990, so content under 36px slides beneath the ⋮ menu rather than
+   pushing it down. */
+[data-testid="stMainBlockContainer"],
 [data-testid="stAppViewBlockContainer"] {
-    padding-top: 1.5rem;
+    padding-top: 2.5rem;
 }
 [data-testid="stHeader"] {
+    /* min-height as well as height, or this does nothing: Streamlit floors
+       the band at 60px with its own min-height, and a height alone loses to
+       it. This is the same pair the sidebar's forehead sets — that one works
+       precisely because it sets both. */
     height: 2.25rem;
+    min-height: 2.25rem;
     background: transparent;
 }
 </style>

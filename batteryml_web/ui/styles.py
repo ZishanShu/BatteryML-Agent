@@ -50,6 +50,11 @@ SIDEBAR_COMPACT_CSS = """
     min-height: 2.25rem;
     padding-top: 0.25rem;
     padding-bottom: 0;
+    /* Streamlit hangs a 16px bottom margin off this band, which is the gap
+       between the collapse control and the brand title — measured, the
+       forehead ended at 36px and the first content row began at 56px. The
+       band's own height was already cut; this is the space *after* it. */
+    margin-bottom: 0;
 }
 /* The content column's own gutters. The panel is 300px wide and left 240px
    for content whose widest line — "default (no project loaded)" — measures
@@ -65,6 +70,8 @@ SIDEBAR_COMPACT_CSS = """
    user has, and anyone who wants the panel narrower can simply drag it.
    A gutter costs nothing and fixes what the eye was actually objecting to. */
 [data-testid="stSidebarUserContent"] {
+    /* 4px, which lands the brand title at 40px: the same line the main
+       column's content starts on, so the two columns open level. */
     padding-top: 0.25rem;
     padding-bottom: 1rem;
     padding-left: 0.75rem;

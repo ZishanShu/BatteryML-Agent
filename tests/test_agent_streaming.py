@@ -226,13 +226,27 @@ class TestStreamingExecution(unittest.TestCase):
         self.assertIn("\r", result["stderr"])
 
     def test_stage_sequence_is_observed_not_invented(self) -> None:
-        stdout = b"Seed is set to 0.\n"
+        """One stream, because a sequence is what this asserts.
+
+        The seed line used to be fed on stdout while the bars went to stderr,
+        and the two reader threads race: whichever pipe is drained first
+        decides whether "Loading data" is ever reported at all, because once
+        a counter has advanced the stage the never-walk-backwards rule
+        rightly refuses to go back to the coarser prose stage. That made the
+        test pass on luck — it failed the moment thread timing shifted — and
+        it was asserting an ordering the OS does not guarantee, since a real
+        run's stdout and stderr genuinely can interleave either way.
+
+        Two pipes cannot express "before". One can, so the marker that comes
+        first in a real run is written first here.
+        """
         stderr = (
+            b"Seed is set to 0.\n"
             b"Reading train data: 100%|##| 41/41 [00:02<00:00]\n"
             b"\rTraining BatLiNet:   0%|  | 0/1 [00:00<?, ?it/s]"
             b"\rTraining BatLiNet: 100%|##| 1/1 [00:06<00:00]\n"
         )
-        result, events = _collect(_plan(), _FakeProc(stdout=stdout, stderr=stderr))
+        result, events = _collect(_plan(), _FakeProc(stderr=stderr))
         stages = [e["stage"] for e in events]
         self.assertIn(STAGE_LOADING, stages)
         self.assertIn(STAGE_TRAINING, stages)
