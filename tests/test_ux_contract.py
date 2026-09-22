@@ -201,12 +201,34 @@ class TestOneSettingsSourceOfTruth(unittest.TestCase):
             )
             self.assertNotIn(f'key="{key}"', app_code)
 
-    def test_every_surface_goes_through_the_one_form(self) -> None:
+    def test_settings_is_the_only_surface_that_renders_the_form(self) -> None:
+        """The stronger version of "every surface goes through one form".
+
+        The old assertion required app.py to *call* the shared form, which
+        was the right fix for two forms writing two stores but the wrong
+        end state: Home, Run Model and Review Results each opened their own
+        copy of the provider / Base URL / API key / model block, and a user
+        who had filled it in the sidebar was shown it again three pages
+        later. Sharing the store did not stop that reading as "it forgot".
+
+        So the form now has one call site, in the sidebar's Settings
+        section, and app.py may not render it at all. What app.py must do
+        instead is name where the setting lives.
+        """
         app_code = _code_without_prose(REPO_ROOT / "batteryml_web" / "app.py")
         sidebar_code = _code_without_prose(UI_DIR / "workflow_sidebar.py")
-        self.assertIn("render_inline_llm_settings", app_code)
-        self.assertIn("render_llm_settings_form", app_code)
+        self.assertNotIn(
+            "render_llm_settings_form", app_code,
+            "app.py must not render the credential form on any page",
+        )
+        self.assertIn("render_configure_in_settings_notice", app_code)
         self.assertIn("render_sidebar_settings", sidebar_code)
+
+        settings_code = _code_without_prose(UI_DIR / "settings_panel.py")
+        self.assertEqual(
+            settings_code.count("render_llm_settings_form(key_prefix="), 1,
+            "the form must have exactly one call site",
+        )
 
     def test_status_is_read_from_one_place_not_re_derived(self) -> None:
         app_code = _code_without_prose(REPO_ROOT / "batteryml_web" / "app.py")

@@ -12,6 +12,7 @@ import pandas as pd
 import streamlit as st
 import torch
 
+from batteryml_web.agent.failure_taxonomy import classify_llm_failure
 from batteryml_web.agent.llm_client import run_llm_prompt, save_llm_output
 from batteryml_web.agent.catalog import REQUEST_TEMPLATE_STRUCTURE
 from batteryml_web.agent.execution import build_run_command
@@ -45,7 +46,16 @@ from batteryml_web.ui.feedback import (
     notify_success,
     toast,
 )
-from batteryml_web.ui.llm_state import describe_llm_status, ensure_llm_state_defaults, get_llm_status, is_llm_configured, refresh_llm_status_from_config, set_llm_settings
+from batteryml_web.ui.llm_state import (
+    describe_llm_status,
+    ensure_llm_state_defaults,
+    get_llm_status,
+    is_llm_configured,
+    llm_credentials,
+    llm_settings_fingerprint,
+    refresh_llm_status_from_config,
+    set_llm_connection_result,
+)
 from batteryml_web.core.project_context import resolve_project
 from batteryml_web.core.run_manager import get_run_manager
 from batteryml_web.core.run_manifest import find_run
@@ -65,7 +75,7 @@ from batteryml_web.ui.run_history import (
     render_run_history,
     render_run_location,
 )
-from batteryml_web.ui.settings_panel import render_llm_settings_form
+from batteryml_web.ui.settings_panel import render_configure_in_settings_notice
 from batteryml_web.ui.progress_utils import get_safe_runtime_env, run_command_with_progress
 from batteryml_web.ui.scroll import render_scroll_to_top
 from batteryml_web.ui.errors import error_boundary, render_copy_control
@@ -623,13 +633,12 @@ def render_home_page():
             st.code("runs/web_projects/<project_name>", language="text")
             st.button("Load Project", disabled=True, use_container_width=True, key="home_load_disabled")
 
-    st.markdown("---")
-    # One settings surface, shared with the sidebar and the Explain prompt.
-    # This block used to carry its own three text inputs bound straight to
-    # the session keys, which bypassed set_llm_settings entirely: the status
-    # was never updated, and settings entered here did not register as
-    # configured elsewhere. That is what made the app ask twice.
-    render_inline_llm_settings("home", expanded=False)
+    # The rule belongs to the notice, not to the page: with an assistant
+    # configured the notice draws nothing, and an unconditional rule here
+    # left two horizontal lines stacked against each other.
+    if not is_llm_configured():
+        st.markdown("---")
+        render_llm_availability_notice()
 
     st.markdown("---")
     st.subheader("Quick Start", anchor=False)
@@ -1263,31 +1272,50 @@ def _safe_read_log_tail(log_path: Path, lines: int = 80) -> str:
         return "<unable to read log>"
 
 
-def render_inline_llm_settings(location_key: str, expanded: bool = False):
-    """The LLM settings, wherever a page offers them inline.
+def render_llm_availability_notice() -> None:
+    """What a page says about an assistant it does not configure.
 
-    One form, one credential store: this delegates to
-    :func:`batteryml_web.ui.settings_panel.render_llm_settings_form`, which is
-    the same form the sidebar and the Explain prompt show. It used to carry
-    its own copy of the fields and its own Save/Test handling — and that copy
-    had a real defect: ``test_llm_connection`` *returns* ``(ok, message)`` and
-    does not raise, so its ``except Exception`` never fired and a failed test
-    was reported as "connected". Delegating removes the second
-    implementation and the defect with it.
+    Home, Run Model and Review Results each used to open an "Optional LLM
+    Assistant settings" expander carrying the provider, Base URL, API key
+    and model fields. Every one of them wrote the same store, so no value
+    ever diverged — but a user who had filled the form in the sidebar and
+    was then shown the same three fields on Review Results reasonably
+    concluded the page wanted its own credentials. One settings screen, and
+    everywhere else a sentence naming it.
     """
-    with st.expander("Optional LLM Assistant settings", expanded=expanded):
-        st.caption(
-            "LLM assistant is optional. Without an LLM endpoint, the platform "
-            "still runs the deterministic BatteryML workflow."
-        )
-        # The form prints the status itself, from the one status vocabulary.
-        render_llm_settings_form(key_prefix=location_key)
+    if is_llm_configured():
+        return
+    render_configure_in_settings_notice()
+    st.caption(
+        "The deterministic BatteryML workflow runs without an assistant; "
+        "only the optional explanations need one."
+    )
+
+
+def describe_llm_exception(exc: BaseException) -> str:
+    """One user-facing sentence for a failed LLM call.
+
+    Routed through :func:`classify_llm_failure`, which is the platform's one
+    vocabulary for this: it separates "not configured" from a network or DNS
+    failure, a timeout, a 401/403, an unavailable model and a malformed
+    response, and it redacts anything key-shaped before the text is shown.
+    The previous ``f"LLM request failed: {exc}"`` did none of that — it put
+    the raw exception on the page, which for an HTTP error meant the
+    provider's response body verbatim.
+    """
+    finding = classify_llm_failure(exc, configured=is_llm_configured())
+    parts = [str(finding.get("short_title") or ""), str(finding.get("user_message") or "")]
+    action = str(finding.get("recommended_action") or "")
+    if action:
+        parts.append(action)
+    return " ".join(part for part in parts if part).strip() or "The LLM request failed."
 
 
 def set_llm_not_configured_message(output_key: str):
     st.session_state[output_key] = (
         "LLM assistant is not configured yet.\n\n"
-        "Please add Base URL, API key, and model in the Optional LLM Assistant settings below, then retry this action."
+        "Add the Base URL, API key and model in Settings (left sidebar), then "
+        "retry this action."
     )
 
 
@@ -1300,6 +1328,12 @@ def require_llm_or_show_message(output_key: str) -> bool:
 
 def _set_llm_output(output_key: str, text: str, save_path: Path | None = None) -> None:
     st.session_state[output_key] = text
+    # Which configuration wrote it, so the panel can say when the current
+    # one no longer matches. Never the API key: the fingerprint records
+    # only whether a key was set.
+    st.session_state[
+        f"{output_key}{SETTINGS_PROVENANCE_SUFFIX}"
+    ] = llm_settings_fingerprint()
     if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)
         save_path.write_text(text, encoding="utf-8")
@@ -1423,13 +1457,35 @@ def render_run_model_llm_output_panel(output_key: str, title: str, subtitle: str
     st.markdown("<div style='margin-bottom:1.9rem;'></div>", unsafe_allow_html=True)
 
 
+#: Session key recording which LLM configuration produced a stored output.
+#: Suffixed onto the output's own key so two panels cannot share one label.
+SETTINGS_PROVENANCE_SUFFIX = "_llm_settings"
+
+
 def render_llm_output_panel(output_key: str, title: str) -> None:
+    """Show a stored assistant output. Collapsed; sends nothing.
+
+    Collapsed because this is commentary on metrics and figures that are
+    already on the page, and an explanation that opens by itself pushes the
+    result it is explaining off the first screen. Opening it costs nothing:
+    the text is already in session state, so no call is made here — the only
+    thing that calls the assistant is the button that produced it.
+    """
     output = st.session_state.get(output_key)
     if not output:
         return
     st.markdown("---")
-    with st.expander(f"🤖 LLM Assistant Output · {title}", expanded=True):
+    with st.expander(f"🤖 LLM Assistant Output · {title}", expanded=False):
         st.caption("Suggestion only. This output does not automatically modify raw data, config files, predictions, or metrics.")
+        generated_with = st.session_state.get(f"{output_key}{SETTINGS_PROVENANCE_SUFFIX}")
+        if generated_with and generated_with != llm_settings_fingerprint():
+            # The provider or model changed after this text was written.
+            # Saying so is the whole of the claim; relabelling it with the
+            # model now configured would credit work it did not do.
+            st.caption(
+                "Generated with the LLM configuration in effect at the time; "
+                "the current configuration differs."
+            )
         st.markdown(output)
 
 
@@ -1547,9 +1603,7 @@ def render_run_model_page():
             st.write(f"**Config exists:** {'Yes' if config_path and Path(str(config_path)).exists() else 'Missing'}")
             st.write(f"**Workspace dir:**")
             st.code(str(workspace_dir), language="text")
-            if not is_llm_configured():
-                st.caption("Need LLM help? Configure assistant below.")
-                render_inline_llm_settings("run_model", expanded=False)
+            render_llm_availability_notice()
             c1, c2 = st.columns(2)
             with c1:
                 if st.button("Explain this config", key="run_model_explain_config", use_container_width=True):
@@ -1558,17 +1612,13 @@ def render_run_model_page():
                             with st.spinner("Calling LLM assistant..."):
                                 response = run_llm_prompt(
                                     f"Explain this BatteryML config: {config_path}. Return suggestion only.",
-                                    base_url=st.session_state["llm_base_url"],
-                                    api_key=st.session_state["llm_api_key"],
-                                    model=st.session_state["llm_model"],
+                                    **llm_credentials(),
                                     system_prompt="You are an assistant for a BatteryML web protocol platform. Provide suggestions only. Do not modify raw data, metrics, predictions, or config files.",
                                 )
-                            st.session_state["llm_status"] = "connected"
-                            st.session_state["llm_status_message"] = "LLM request completed."
+                            set_llm_connection_result(True, "LLM request completed.")
                         except Exception as exc:
-                            response = f"LLM request failed: {exc}"
-                            st.session_state["llm_status"] = "failed"
-                            st.session_state["llm_status_message"] = response
+                            response = describe_llm_exception(exc)
+                            set_llm_connection_result(False, response)
                         _set_llm_output(
                             "run_model_config_llm_output",
                             response,
@@ -1589,17 +1639,13 @@ def render_run_model_page():
                                         dataset_readiness={"ready": info["ready"], "raw_exists": info["raw_exists"], "processed_exists": info["processed_exists"]},
                                         available_configs=[f"{k[0]} | {k[1]} | {k[2]} -> {v}" for k, v in list(configs.items())],
                                     ),
-                                    base_url=st.session_state["llm_base_url"],
-                                    api_key=st.session_state["llm_api_key"],
-                                    model=st.session_state["llm_model"],
+                                    **llm_credentials(),
                                     system_prompt="You are an assistant for a BatteryML web protocol platform. Provide suggestions only. Do not modify raw data, metrics, predictions, or config files.",
                                 )
-                            st.session_state["llm_status"] = "connected"
-                            st.session_state["llm_status_message"] = "LLM request completed."
+                            set_llm_connection_result(True, "LLM request completed.")
                         except Exception as exc:
-                            response = f"LLM request failed: {exc}"
-                            st.session_state["llm_status"] = "failed"
-                            st.session_state["llm_status_message"] = response
+                            response = describe_llm_exception(exc)
+                            set_llm_connection_result(False, response)
                         _set_llm_output(
                             "run_model_config_llm_output",
                             response,
@@ -1794,7 +1840,11 @@ def _invalidate_stale_result_state(selected: SelectedResult) -> None:
     if previous == identity:
         return
     st.session_state[SELECTED_IDENTITY_KEY] = identity
-    for key in ("review_llm_output", EXPLANATION_IDENTITY_KEY):
+    for key in (
+        "review_llm_output",
+        EXPLANATION_IDENTITY_KEY,
+        f"review_llm_output{SETTINGS_PROVENANCE_SUFFIX}",
+    ):
         st.session_state.pop(key, None)
 
 
@@ -1920,22 +1970,21 @@ Logs available: {'Yes' if run_files.get("log_files") else 'No'}
             try:
                 response = run_llm_prompt(
                     prompt,
-                    base_url=st.session_state["llm_base_url"],
-                    api_key=st.session_state["llm_api_key"],
-                    model=st.session_state["llm_model"],
+                    **llm_credentials(),
                     system_prompt="You are an assistant for a BatteryML web protocol platform. Provide suggestions only. Do not modify raw data, metrics, predictions, or config files.",
                 )
-                st.session_state["llm_status"] = "connected"
-                st.session_state["llm_status_message"] = "LLM request completed."
+                set_llm_connection_result(True, "LLM request completed.")
             except Exception as exc:
-                response = f"LLM request failed: {exc}"
-                st.session_state["llm_status"] = "failed"
-                st.session_state["llm_status_message"] = response
+                response = describe_llm_exception(exc)
+                set_llm_connection_result(False, response)
             # Stored with the identity it was computed for. A slow reply for
             # run A that lands after the user moved to run B fails the
             # identity check and is dropped rather than shown under B.
             st.session_state["review_llm_output"] = response
             st.session_state[EXPLANATION_IDENTITY_KEY] = selected.identity_key()
+            st.session_state[
+                f"review_llm_output{SETTINGS_PROVENANCE_SUFFIX}"
+            ] = llm_settings_fingerprint()
 
     if explain_clicked:
         if not is_llm_configured():
@@ -1954,25 +2003,27 @@ Metrics:
             try:
                 response = run_llm_prompt(
                     prompt,
-                    base_url=st.session_state["llm_base_url"],
-                    api_key=st.session_state["llm_api_key"],
-                    model=st.session_state["llm_model"],
+                    **llm_credentials(),
                     system_prompt="You are an assistant for a BatteryML web protocol platform. Provide suggestions only. Do not modify raw data, metrics, predictions, or config files.",
                 )
-                st.session_state["llm_status"] = "connected"
-                st.session_state["llm_status_message"] = "LLM request completed."
+                set_llm_connection_result(True, "LLM request completed.")
             except Exception as exc:
-                response = f"LLM request failed: {exc}"
-                st.session_state["llm_status"] = "failed"
-                st.session_state["llm_status_message"] = response
+                response = describe_llm_exception(exc)
+                set_llm_connection_result(False, response)
             # Stored with the identity it was computed for. A slow reply for
             # run A that lands after the user moved to run B fails the
             # identity check and is dropped rather than shown under B.
             st.session_state["review_llm_output"] = response
             st.session_state[EXPLANATION_IDENTITY_KEY] = selected.identity_key()
+            st.session_state[
+                f"review_llm_output{SETTINGS_PROVENANCE_SUFFIX}"
+            ] = llm_settings_fingerprint()
 
     if st.session_state.get("review_show_llm_settings") or not is_llm_configured():
-        render_inline_llm_settings("review_results", expanded=st.session_state.get("review_show_llm_settings", False))
+        # A sentence, not a form. Pressing "Configure LLM" here used to open
+        # the full provider/URL/key/model block on this page, which is the
+        # "it asked me again" the user reported.
+        render_llm_availability_notice()
 
     # Shown only when it was produced for the result now on screen. Anything
     # else — a previous selection's answer, or a slow reply for a run the

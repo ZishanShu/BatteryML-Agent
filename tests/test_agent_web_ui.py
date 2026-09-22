@@ -257,6 +257,7 @@ class FakeStreamlit:
             "tabs": [],
             "toasts": [],
             "expanders": [],
+            "expander_states": [],
             "expander_writes": [],
             "multiselects": [],
             "headings": [],
@@ -397,6 +398,12 @@ class FakeStreamlit:
 
     def expander(self, label, **kwargs):
         self.rec["expanders"].append(str(label))
+        # Recorded separately from the label list, which other tests compare
+        # against plain strings. "Does this panel open by itself?" is a
+        # question about ``expanded``, and it had no answer here before.
+        self.rec["expander_states"].append(
+            (str(label), bool(kwargs.get("expanded", False)))
+        )
         return _ExpanderCtx(self)
 
     def spinner(self, label, **kwargs):
@@ -2474,19 +2481,34 @@ class TestExplainOpensConfigurationInsteadOfDeadEnding(unittest.TestCase):
         self.assertTrue(buttons)
         self.assertFalse(any(b["disabled"] for b in buttons))
 
-    def test_clicking_without_configuration_opens_the_form_and_calls_nothing(
+    def test_clicking_without_configuration_points_at_settings_and_calls_nothing(
         self,
     ) -> None:
+        """The click is never a dead end, and never a second settings screen.
+
+        It used to open the full provider / Base URL / API key / model form
+        in a dialog here. That form wrote the same store as the sidebar's,
+        so nothing ever diverged — but being asked for an API key on the
+        page you came to read a result on is what made the app feel like it
+        had forgotten, which is the complaint this replaces. One sentence
+        naming where the setting lives, and still no call.
+        """
         ui.is_llm_configured = lambda: False
         session = self._session()
-        _render(
+        fake = _render(
             session,
             clicked={ui.EXPLAIN_BUTTON_LABEL},
             radio_values={ui.COMPUTE_LABEL: "CPU"},
         )
         self.assertEqual(self.explain_calls, [])
-        self.assertTrue(session.get(ui_settings.FORM_OPEN_KEY))
-        self.assertEqual(session.get(ui_settings.PENDING_ACTION_KEY), "explain")
+        self.assertTrue(session.get(ui.NEEDS_CONFIGURATION_KEY))
+        # The click reruns, so the notice is drawn on the following run.
+        fake = _render(
+            session, radio_values={ui.COMPUTE_LABEL: "CPU"}
+        )
+        self.assertIn(
+            ui_settings.CONFIGURE_IN_SETTINGS_MESSAGE, fake.rec["captions"]
+        )
 
     def test_clicking_with_configuration_explains_directly(self) -> None:
         ui.is_llm_configured = lambda: True
@@ -2635,32 +2657,31 @@ class TestExplainOpensConfigurationInsteadOfDeadEnding(unittest.TestCase):
         self.assertNotIn("sk-secret", signature)
         self.assertIn("key", signature)
 
-    def test_connecting_from_the_explain_prompt_does_not_auto_explain(self) -> None:
-        """Explicit control: Connect enables Explain, it does not press it."""
+    def test_the_agent_page_renders_no_credential_fields(self) -> None:
+        """Whatever the state, this page never asks for the credentials.
+
+        Asserted against what was actually drawn rather than against the
+        source, because the form used to arrive here indirectly — the page
+        called a helper, which opened a dialog, which rendered it. A check
+        on the rendered widgets cannot be satisfied by moving the call.
+        """
         ui.is_llm_configured = lambda: False
-        real = ui_settings.test_llm_connection
-        ui_settings.test_llm_connection = lambda **kw: (True, "ok")
-        try:
-            session = self._session()
-            session[ui_settings.FORM_OPEN_KEY] = True
-            session[ui_settings.PENDING_ACTION_KEY] = "explain"
-            session.update(
-                {
-                    "dialog_llm_base_url": "u",
-                    "dialog_llm_api_key": "k",
-                    "dialog_llm_model": "m",
-                }
-            )
-            _render(
-                session,
-                clicked={ui_settings.CONNECT_LABEL},
-                radio_values={ui.COMPUTE_LABEL: "CPU"},
-            )
-        finally:
-            ui_settings.test_llm_connection = real
-        self.assertEqual(self.explain_calls, [], "Connect must not send the result")
-        # The prompt closed, so the page is back on the result workflow.
-        self.assertNotIn(ui_settings.FORM_OPEN_KEY, session)
+        session = self._session()
+        session[ui.NEEDS_CONFIGURATION_KEY] = True
+        fake = _render(
+            session,
+            clicked={ui.EXPLAIN_BUTTON_LABEL},
+            radio_values={ui.COMPUTE_LABEL: "CPU"},
+        )
+        labels = [
+            str(entry.get("label", ""))
+            for entry in fake.rec.get("text_inputs", [])
+        ]
+        for field in ui_settings.FIELD_LABELS.values():
+            self.assertNotIn(field, labels)
+        button_labels = [str(b["label"]) for b in fake.rec["buttons"]]
+        self.assertNotIn(ui_settings.SAVE_LABEL, button_labels)
+        self.assertNotIn(ui_settings.CONNECT_LABEL, button_labels)
 
     def test_one_configuration_source_backs_both_entry_points(self) -> None:
         source = Path(ui_settings.__file__).read_text(encoding="utf-8")

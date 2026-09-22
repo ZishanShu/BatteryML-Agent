@@ -275,10 +275,19 @@ class TestShortenedCopy(unittest.TestCase):
         self.assertIn("API keys stay in this session only", code)
 
     def test_the_security_behaviour_is_unchanged(self) -> None:
-        code = _code_without_prose(UI_DIR / "settings_panel.py")
-        self.assertIn("type='password'", code)
-        # The summary still reduces the key to a boolean.
-        self.assertIn("api_key_set", code)
+        """The masking and the boolean summary, wherever each now lives.
+
+        ``llm_settings_summary`` moved to ``ui/llm_state``, beside the values
+        it reduces, when that module became the one authoritative store. The
+        behaviour is what this asserts, so it follows the function rather
+        than pinning it to the file it used to sit in — but it still asserts
+        it somewhere, because "the summary reduces the key to a boolean" is
+        what keeps the key out of every caption built from it.
+        """
+        form = _code_without_prose(UI_DIR / "settings_panel.py")
+        self.assertIn("type='password'", form)
+        store = _code_without_prose(UI_DIR / "llm_state.py")
+        self.assertIn("api_key_set", store)
 
     def test_failure_messages_were_not_shortened_away(self) -> None:
         """Only helper copy was cut; actionable failures keep their detail."""

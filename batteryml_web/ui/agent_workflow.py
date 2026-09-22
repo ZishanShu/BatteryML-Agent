@@ -114,12 +114,7 @@ from ..core.project_context import (
     resolve_project,
 )
 from .formatting import metric_display
-from .settings_panel import (
-    clear_llm_configuration_request,
-    llm_configuration_requested,
-    render_llm_configuration_prompt,
-    request_llm_configuration,
-)
+from .settings_panel import render_configure_in_settings_notice
 from .errors import format_details, render_copy_control, render_error
 from .feedback import (
     EVENT_EXPLANATION_READY,
@@ -130,7 +125,7 @@ from .feedback import (
     notify_success,
     plan_signature,
 )
-from .llm_state import is_llm_configured
+from .llm_state import is_llm_configured, llm_credentials, llm_settings_fingerprint
 from .progress_utils import get_safe_runtime_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -192,6 +187,19 @@ USE_TEMPLATE_LABEL = "Use template"
 #: Session key holding the canonical request text. One key, written by
 #: typing and by accepting the suggestion alike (milestone section 6).
 REQUEST_STATE_KEY = "agent_original_request"
+
+#: The request text the workflow explanation would be about, recorded by
+#: Analyze so the Explain button has a subject. Holding it is not asking for
+#: it: no call is made until the button is pressed.
+GUIDANCE_REQUEST_KEY = "agent_guidance_request"
+
+#: The button that asks the assistant to narrate the resolved workflow.
+EXPLAIN_WORKFLOW_LABEL = "Explain this workflow"
+
+#: Set when the user pressed an Explain button with nothing configured, so
+#: the page can say where to configure one. It is a note to self, not a
+#: second settings screen.
+NEEDS_CONFIGURATION_KEY = "agent_llm_configuration_needed"
 
 #: The request text area's own widget key. Named because accepting the
 #: suggestion has to write it before the widget is instantiated.
@@ -923,14 +931,13 @@ def _run_failure_details(
 def _explain_result(result_context: dict[str, Any]) -> None:
     """Call the existing explanation path. Never called by opening a form."""
     try:
-        parsed = explain_run_result(
-            result_context,
-            base_url=st.session_state["llm_base_url"],
-            api_key=st.session_state["llm_api_key"],
-            model=st.session_state["llm_model"],
-        )
+        parsed = explain_run_result(result_context, **llm_credentials())
         st.session_state.pop("agent_explanation_failure", None)
         st.session_state["agent_explanation"] = explanation_text(parsed)
+        # Which configuration produced this text. Stored so a later provider
+        # or model change cannot leave an old answer labelled as the new
+        # model's work; the panel shows the label it was generated under.
+        st.session_state["agent_explanation_settings"] = llm_settings_fingerprint()
         st.session_state["agent_explanation_serial"] = (
             int(st.session_state.get("agent_explanation_serial", 0)) + 1
         )
@@ -1008,11 +1015,7 @@ def _resolve_intent(trimmed: str, catalog: dict[str, Any]) -> dict[str, Any]:
     """
     if is_llm_configured():
         return resolve_workflow_intent_with_llm(
-            trimmed,
-            base_url=st.session_state["llm_base_url"],
-            api_key=st.session_state["llm_api_key"],
-            model=st.session_state["llm_model"],
-            catalog=catalog,
+            trimmed, catalog=catalog, **llm_credentials()
         )
     return resolve_workflow_intent_with_llm(trimmed, catalog=catalog)
 
@@ -1032,6 +1035,13 @@ def _analyze_request(trimmed: str) -> None:
         "agent_result_context",
         "agent_explanation",
         "agent_explanation_failure",
+        "agent_explanation_settings",
+        # A new request is a new subject for the explanation too. Without
+        # this, an unresolvable request would leave the previous one's text
+        # behind the Explain button, which would then narrate a workflow the
+        # page is no longer showing.
+        GUIDANCE_REQUEST_KEY,
+        NEEDS_CONFIGURATION_KEY,
         RUN_SIGNATURE_KEY,
         RESULT_ERROR_KEY,
         # A new request is a new subject, so the control reads "Run" again
@@ -1089,18 +1099,36 @@ def _analyze_request(trimmed: str) -> None:
         signature=[trimmed, context.get("dataset"), context.get("task")],
     )
 
-    if not is_llm_configured():
-        return
+    # No LLM call here, deliberately. Analyze used to finish by asking the
+    # assistant to narrate what it had just resolved, so a configured user
+    # was billed for an explanation on every Analyze press whether or not
+    # they wanted one — and the explanation then opened by itself. Analysis
+    # is deterministic and complete without it; the request text is kept so
+    # the Explain button below has something to send.
+    st.session_state[GUIDANCE_REQUEST_KEY] = trimmed
+
+
+def _explain_workflow(request_text: str) -> None:
+    """Ask the assistant to narrate the resolved workflow. Button-only.
+
+    Uses the same shared client and the same store as every other LLM call
+    on the site; nothing here reads a form or builds a client of its own.
+    """
     try:
-        guidance = guide_workflow(
-            trimmed,
-            base_url=st.session_state["llm_base_url"],
-            api_key=st.session_state["llm_api_key"],
-            model=st.session_state["llm_model"],
-        )
+        guidance = guide_workflow(request_text, **llm_credentials())
+        st.session_state.pop("agent_explanation_failure", None)
         st.session_state["agent_explanation"] = str(guidance.get("guidance") or "")
-    except Exception as exc:
-        st.session_state["agent_explanation"] = f"LLM guidance failed: {exc}"
+        st.session_state["agent_explanation_settings"] = llm_settings_fingerprint()
+        st.session_state["agent_explanation_serial"] = (
+            int(st.session_state.get("agent_explanation_serial", 0)) + 1
+        )
+    except Exception as exc:  # noqa: BLE001 - reported, never escalated
+        # The deterministic resolution above stands: it came from the
+        # backend catalog and the readiness check, not from the assistant.
+        st.session_state["agent_explanation_failure"] = classify_llm_failure(
+            exc, configured=is_llm_configured()
+        )
+        st.session_state.pop("agent_explanation", None)
 
 
 def request_template() -> str:
@@ -1718,6 +1746,26 @@ def render_agent_workflow() -> None:
     _render_intent(st.session_state.get("agent_intent"))
     _render_context(context)
 
+    # The workflow narration Analyze used to produce on its own. It is a
+    # button now, for the reason the whole step exists: a page that renders
+    # must not spend an API call, and an explanation nobody asked for is a
+    # call nobody asked for.
+    guidance_request = st.session_state.get(GUIDANCE_REQUEST_KEY)
+    if guidance_request:
+        if st.button(
+            EXPLAIN_WORKFLOW_LABEL,
+            key="agent_explain_workflow",
+            use_container_width=True,
+        ):
+            if is_llm_configured():
+                _explain_workflow(str(guidance_request))
+                st.rerun()
+            else:
+                st.session_state[NEEDS_CONFIGURATION_KEY] = True
+                st.rerun()
+        if st.session_state.get(NEEDS_CONFIGURATION_KEY) and not is_llm_configured():
+            render_configure_in_settings_notice()
+
     presentation = build_model_presentation(
         resolution=st.session_state.get("agent_intent"),
         workflow_context=context,
@@ -2000,8 +2048,9 @@ def render_agent_workflow() -> None:
         # saved artifact and through the same reader the history view uses.
         _render_result_figures(result_context)
 
-        # Always clickable. When the assistant is not configured the click
-        # opens the configuration form instead of doing nothing.
+        # Always clickable, and the only thing on this page that can send a
+        # result to the assistant. When nothing is configured the click says
+        # where to configure one; it does not grow a form here.
         if st.button(
             EXPLAIN_BUTTON_LABEL,
             use_container_width=True,
@@ -2011,20 +2060,11 @@ def render_agent_workflow() -> None:
                 _explain_result(result_context)
                 st.rerun()
             else:
-                request_llm_configuration("explain")
+                st.session_state[NEEDS_CONFIGURATION_KEY] = True
                 st.rerun()
 
-        if llm_configuration_requested():
-            action = render_llm_configuration_prompt()
-            if action in ("save", "connect"):
-                # Settings are stored (and, for Connect, tested). Close the
-                # form and stay on the result: Explain is now usable, and the
-                # user presses it again if they want an explanation. Nothing
-                # is sent to the LLM on their behalf.
-                clear_llm_configuration_request()
-                st.rerun()
-            # "connect_failed" leaves the form open with its error showing,
-            # so the endpoint can be corrected without reopening anything.
+        if st.session_state.get(NEEDS_CONFIGURATION_KEY) and not is_llm_configured():
+            render_configure_in_settings_notice()
 
     explanation_failure = st.session_state.get("agent_explanation_failure")
     if isinstance(explanation_failure, dict) and isinstance(context, dict):
@@ -2050,6 +2090,20 @@ def render_agent_workflow() -> None:
                 event_key=EVENT_EXPLANATION_READY,
                 signature=explanation_serial,
             )
-        with st.expander("Agent explanation", expanded=True):
+        # Collapsed. An explanation is commentary on a result that is already
+        # fully rendered above it, so it opens when the reader asks for it
+        # rather than pushing the metrics off the first screen. Opening it
+        # sends nothing: the text is already in session state.
+        with st.expander("Agent explanation", expanded=False):
             st.caption("Explanation only — never a source of metrics or execution.")
+            settings_label = st.session_state.get("agent_explanation_settings")
+            if settings_label and settings_label != llm_settings_fingerprint():
+                # The configuration changed after this text was produced.
+                # Saying so is cheaper than re-running it, and far better
+                # than letting the current model's name imply authorship.
+                st.caption(
+                    "Generated with the LLM configuration in effect at the "
+                    "time; the current configuration differs. Press "
+                    f"'{EXPLAIN_BUTTON_LABEL}' again to regenerate."
+                )
             st.write(st.session_state["agent_explanation"])

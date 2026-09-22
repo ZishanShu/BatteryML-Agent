@@ -18,6 +18,7 @@ from __future__ import annotations
 import streamlit as st
 
 from ..core.project_context import resolve_project
+from .llm_state import llm_settings_summary
 from .settings_panel import render_sidebar_settings
 from .styles import render_layout_css
 
@@ -111,13 +112,15 @@ def current_project_label() -> str:
 
 
 def llm_status_badge() -> tuple[str, str]:
-    """(label, colour) for the sidebar LLM line, derived from session state."""
-    configured = (
-        bool(st.session_state.get("llm_base_url"))
-        and bool(st.session_state.get("llm_api_key"))
-        and bool(st.session_state.get("llm_model"))
-    )
-    status = st.session_state.get("llm_status", "not_configured")
+    """(label, colour) for the sidebar LLM line, from the one store.
+
+    It re-derived "configured" from the three keys by hand, which is a second
+    copy of :func:`is_llm_configured` that happened to agree. Reading the
+    store means it cannot stop agreeing.
+    """
+    summary = llm_settings_summary()
+    configured = bool(summary["configured"])
+    status = str(summary["status"])
     if not configured:
         return "Not connected", "#8a8f98"
     if status == "connected":
