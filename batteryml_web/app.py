@@ -30,7 +30,12 @@ from batteryml_web.core.custom_uploads import (
     validate_custom_upload_layout,
     validate_processed_output,
 )
-from batteryml_web.core.results_reader import find_result_files, load_metrics, load_metrics_from_logs, load_predictions
+# Only the file discovery is still used here, and only ever against the
+# selected run's own directory. load_metrics / load_predictions read "the
+# first match" out of whatever list they are handed, which is what made the
+# page show the oldest run in the project; Review Results now reads the
+# selected run's manifest and its one recorded artifact instead.
+from batteryml_web.core.results_reader import find_result_files
 from batteryml_web.ui.feedback import (
     EVENT_PREPROCESS_DONE,
     EVENT_PROJECT_CREATED,
@@ -43,6 +48,15 @@ from batteryml_web.ui.llm_state import describe_llm_status, ensure_llm_state_def
 from batteryml_web.core.project_context import resolve_project
 from batteryml_web.core.run_manager import get_run_manager
 from batteryml_web.core.run_manifest import find_run
+from batteryml_web.core.selected_result import (
+    SelectedResult,
+    cached_for,
+    resolve_selected_result,
+)
+from batteryml_web.agent.prediction_diagnostics import (
+    artifact_diagnostics,
+    diagnostics_rows,
+)
 from batteryml_web.ui.run_history import (
     render_file_browser,
     render_predictions_panel,
@@ -1697,24 +1711,108 @@ def render_run_model_page():
     render_bottom_step_navigation()
 
 
-def _selected_run_manifest():
-    """The run the user opened in Run History, or None.
+#: Session keys for the selected result. The identity key is stored *beside*
+#: every result-derived value, so a value computed for one run can never be
+#: displayed under another — see ``core/selected_result.py``.
+SELECTED_IDENTITY_KEY = "review_result_identity"
+EXPLANATION_IDENTITY_KEY = "review_llm_output_identity"
+ARTIFACT_CHOICE_KEY = "review_artifact_choice"
 
-    Returned to the Predictions and Files tabs so they describe *that run's*
-    artifacts rather than whatever the workspace glob happened to find. None
-    means nothing is selected — the tabs then fall back to the workspace and
-    say so, instead of silently showing a different run's files.
-    """
-    selected = st.session_state.get("run_history_selection")
-    if not selected:
-        return None
-    project = resolve_project(
+
+def _current_project():
+    """The project every part of Review Results is read against."""
+    return resolve_project(
         project_root=st.session_state.get("project_root"),
         project_name=st.session_state.get("project_name")
         or st.session_state.get("current_project"),
     )
+
+
+def _selected_run_manifest():
+    """The run the user opened in Run History, or None.
+
+    Looked up **inside the current project only**, so a selection left over
+    from a previous project resolves to None rather than reading that
+    project's directory. ``find_run`` searches ``project["root"]`` and
+    nothing above it.
+    """
+    selected = st.session_state.get("run_history_selection")
+    if not selected:
+        return None
+    project = _current_project()
     return find_run(
         project["root"], str(selected), live_run_ids=get_run_manager().live_run_ids()
+    )
+
+
+def _selected_result() -> SelectedResult:
+    """The one identity every section of Review Results derives from.
+
+    Built from the selected run's own manifest. Replaces the project-wide
+    ``find_result_files`` search that used to feed the Metrics, Summary and
+    Logs tabs and both LLM prompts: that search ``rglob``\\ed the whole
+    project, sorted by path, and took ``[0]`` — and because a run id starts
+    with a timestamp, ``[0]`` was the *oldest run in the project*. Selecting
+    a run changed none of those sections, which is why metrics and
+    predictions looked frozen and identical between runs.
+    """
+    project = _current_project()
+    manifest = _selected_run_manifest()
+    selected = resolve_selected_result(
+        project,
+        manifest,
+        chosen_artifact=st.session_state.get(ARTIFACT_CHOICE_KEY),
+        repo_root=REPO_ROOT,
+    )
+    _invalidate_stale_result_state(selected)
+    return selected
+
+
+def _invalidate_stale_result_state(selected: SelectedResult) -> None:
+    """Drop anything computed for a different result than this one.
+
+    Selecting run B must not leave run A's explanation on screen under B's
+    heading, and a slow explanation for A that lands after the user moved to
+    B must not be shown as B's. Both are handled the same way: every
+    result-derived value is stored with the identity it was computed for, and
+    anything that does not match the current identity is dropped here, before
+    the page draws.
+    """
+    identity = selected.identity_key()
+    previous = str(st.session_state.get(SELECTED_IDENTITY_KEY) or "")
+    if previous == identity:
+        return
+    st.session_state[SELECTED_IDENTITY_KEY] = identity
+    for key in ("review_llm_output", EXPLANATION_IDENTITY_KEY):
+        st.session_state.pop(key, None)
+
+
+def _selected_metrics_frame(selected: SelectedResult):
+    """The selected run's canonical metrics, as a frame, or None.
+
+    Read from that run's own manifest, which the run manager wrote from the
+    ``scores`` BatteryML itself saved. Nothing is recomputed here, and
+    nothing is read from another run: a selected run with no recorded
+    metrics returns None and the page says so for *that* run.
+    """
+    manifest = selected.manifest or {}
+    metrics = manifest.get("metrics")
+    if not isinstance(metrics, dict) or not metrics:
+        return None
+    return pd.DataFrame(
+        [{"Metric": name, "Value": value} for name, value in metrics.items()]
+    )
+
+
+def _render_selected_result_header(selected: SelectedResult) -> None:
+    """The compact identification block: which result is on screen.
+
+    Deliberately small — project, run id, model/dataset/task, run directory.
+    The exact artifact path and the artifact's own diagnostics live in the
+    details area below, not here.
+    """
+    st.dataframe(
+        selected.provenance_rows(), hide_index=True, use_container_width=True
     )
 
 
@@ -1754,18 +1852,23 @@ def render_review_results_page():
     )
 
     project_dir = _project_root() or Path("runs/native_matr_xgb_test")
-    session_workspace = Path(st.session_state.get("workspace_dir", "")) if st.session_state.get("workspace_dir") else None
-    fallback_workspace = Path("runs/native_matr_xgb_test")
-    searched_paths = [project_dir, project_dir / "workspace"]
-    if session_workspace:
-        searched_paths.append(session_workspace)
-    searched_paths.append(fallback_workspace)
-    files = find_result_files(project_dir, session_workspace or project_dir / "workspace")
-    metrics_df = load_metrics(files["metrics_files"])
-    if metrics_df is None or metrics_df.empty:
-        metrics_df = load_metrics_from_logs(files["log_files"])
-    preds_df = load_predictions(files["prediction_files"])
-    metrics_source = "metrics file" if files["metrics_files"] and metrics_df is not None else ("log file" if metrics_df is not None else "missing")
+
+    # Everything below describes exactly this result, or says it cannot.
+    # There is no project-wide artifact search here any more: the previous
+    # one returned every run's files sorted by path and the readers took
+    # [0], which is the oldest run in the project, whatever was selected.
+    selected = _selected_result()
+    metrics_df = _selected_metrics_frame(selected)
+    metrics_source = (
+        "run manifest" if metrics_df is not None and not metrics_df.empty else "missing"
+    )
+    # Scoped to the selected run's own directory. A run that wrote no logs
+    # says so rather than showing another run's.
+    run_files = (
+        find_result_files(Path(selected.run_dir), Path(selected.run_dir))
+        if selected.run_dir and Path(selected.run_dir).is_dir()
+        else {"log_files": [], "prediction_files": [], "metrics_files": []}
+    )
 
     btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
     with btn_col1:
@@ -1783,17 +1886,25 @@ def render_review_results_page():
             set_llm_not_configured_message("review_llm_output")
             st.session_state["review_show_llm_settings"] = True
         else:
+            # Built from the selected result's own identity and manifest.
+            # It used to be built from the project-wide metrics table and
+            # st.session_state["workspace_dir"] — the last *manually* run
+            # workspace — so the explanation regularly described a different
+            # experiment from the one on screen.
             prompt = f'''
 You are assisting with a BatteryML result review.
 Summarize the available metrics, predictions, logs, and result files.
 Summarize run status, explain model performance briefly, mention missing files if any, and do not invent missing results or modify metrics.
-Project: {_current_project_name()}
-Workspace: {st.session_state.get("workspace_dir", "Not available")}
+Project: {selected.project_name or _current_project_name()}
+Run ID: {selected.run_id or "Not available"}
+Run directory: {selected.run_dir or "Not available"}
+Dataset: {(selected.manifest or {}).get("dataset", "Not available")}
+Task: {(selected.manifest or {}).get("task", "Not available")}
+Model: {(selected.manifest or {}).get("model_display") or (selected.manifest or {}).get("model_key") or "Not available"}
 Metrics table:
 {metrics_df.to_string() if metrics_df is not None else "No metrics available"}
-Predictions available: {'Yes' if preds_df is not None and not preds_df.empty else 'No'}
-Logs available: {'Yes' if files.get("log_files") else 'No'}
-Reports available: {'Yes' if files.get("report_files") else 'No'}
+Predictions artifact: {selected.predictions_file or selected.reason}
+Logs available: {'Yes' if run_files.get("log_files") else 'No'}
 '''
             try:
                 response = run_llm_prompt(
@@ -1809,7 +1920,11 @@ Reports available: {'Yes' if files.get("report_files") else 'No'}
                 response = f"LLM request failed: {exc}"
                 st.session_state["llm_status"] = "failed"
                 st.session_state["llm_status_message"] = response
+            # Stored with the identity it was computed for. A slow reply for
+            # run A that lands after the user moved to run B fails the
+            # identity check and is dropped rather than shown under B.
             st.session_state["review_llm_output"] = response
+            st.session_state[EXPLANATION_IDENTITY_KEY] = selected.identity_key()
 
     if explain_clicked:
         if not is_llm_configured():
@@ -1820,6 +1935,8 @@ Reports available: {'Yes' if files.get("report_files") else 'No'}
 Explain the following BatteryML evaluation metrics in plain language.
 Focus on what RMSE, MAE, and MAPE mean for RUL prediction, what lower or higher values mean, and whether metrics are available or missing.
 Do not recalculate or alter the metric values.
+Run ID: {selected.run_id or "Not available"}
+Task: {(selected.manifest or {}).get("task", "Not available")}
 Metrics:
 {metrics_df.to_string() if metrics_df is not None else "No metrics available"}
 '''
@@ -1837,78 +1954,89 @@ Metrics:
                 response = f"LLM request failed: {exc}"
                 st.session_state["llm_status"] = "failed"
                 st.session_state["llm_status_message"] = response
+            # Stored with the identity it was computed for. A slow reply for
+            # run A that lands after the user moved to run B fails the
+            # identity check and is dropped rather than shown under B.
             st.session_state["review_llm_output"] = response
+            st.session_state[EXPLANATION_IDENTITY_KEY] = selected.identity_key()
 
     if st.session_state.get("review_show_llm_settings") or not is_llm_configured():
         render_inline_llm_settings("review_results", expanded=st.session_state.get("review_show_llm_settings", False))
 
-    render_llm_output_panel("review_llm_output", "Result interpretation")
+    # Shown only when it was produced for the result now on screen. Anything
+    # else — a previous selection's answer, or a slow reply for a run the
+    # user has since left — is withheld rather than relabelled.
+    if cached_for(
+        st.session_state, "review_llm_output", EXPLANATION_IDENTITY_KEY, selected
+    ) is not None:
+        render_llm_output_panel("review_llm_output", "Result interpretation")
 
     tabs = st.tabs(["Summary", "Metrics", "Predictions", "Logs", "Files"])
 
     with tabs[0]:
-        st.write(f"**Project:** {_current_project_name()}")
-        st.write(f"**Project dir:** {project_dir}")
-        st.write(f"**Workspace dir:** {session_workspace or (project_dir / 'workspace')}")
-        st.write("**Searched result locations:**")
-        for p in searched_paths:
-            st.code(str(p), language="text")
-        st.write(f"**Last run:** {st.session_state.get('last_run_status', 'N/A')}")
+        _render_selected_result_header(selected)
+        if not selected.available:
+            st.info(selected.reason)
+        st.write(f"**Status:** {(selected.manifest or {}).get('status', 'Not available')}")
         st.write(f"**Metrics found:** {'Yes' if metrics_df is not None and not metrics_df.empty else 'No'}")
-        st.write(f"**Predictions found:** {'Yes' if files['prediction_files'] else 'No'}")
-        st.write(f"**Logs found:** {'Yes' if files['log_files'] else 'No'}")
+        st.write(f"**Predictions artifact:** {'Yes' if selected.available else 'No'}")
+        st.write(f"**Logs found:** {'Yes' if run_files.get('log_files') else 'No'}")
         st.write(f"**Metrics source:** {metrics_source}")
 
     with tabs[1]:
         if metrics_df is not None and not metrics_df.empty:
             st.dataframe(metrics_df, use_container_width=True, hide_index=True)
-            st.caption(f"Metrics source: {metrics_source}")
-        else:
-            st.info("Not available")
-            st.write("**Searched paths:**")
-            for p in searched_paths:
-                st.code(str(p), language="text")
-            st.write("**Next action:** Run training or inspect logs for RMSE / MAE / MAPE output.")
-
-    with tabs[2]:
-        # A selected run's predictions, described through the shared reader.
-        # The old branch below only understood a CSV with guessable column
-        # names and called every .pkl "parser not implemented" — which is
-        # almost every artifact this platform writes.
-        selected_manifest = _selected_run_manifest()
-        if selected_manifest is not None:
-            render_predictions_panel(selected_manifest)
-        elif preds_df is not None and not preds_df.empty:
-            st.dataframe(preds_df, use_container_width=True, hide_index=True)
-            cols = {c.lower(): c for c in preds_df.columns}
-            y_true_col = next((cols[c] for c in cols if c in {"y_true", "true", "gt", "label", "ground_truth"}), None)
-            y_pred_col = next((cols[c] for c in cols if c in {"y_pred", "pred", "prediction", "predictions"}), None)
-            if y_true_col and y_pred_col:
-                plot_df = preds_df[[y_true_col, y_pred_col]].rename(columns={y_true_col: "GT", y_pred_col: "Pred"})
-                st.scatter_chart(plot_df)
-                st.caption("GT vs Pred")
-            else:
-                st.info("Prediction file found but parser not implemented for this format.")
-                for p in files["prediction_files"]:
-                    st.code(str(p), language="text")
-        elif files["prediction_files"]:
-            # No run selected in history, but artifacts exist on disk: preview
-            # the first one through the same reader rather than declaring it
-            # unparseable.
-            render_predictions_panel(
-                {"artifacts": {"prediction_files": [str(p) for p in files["prediction_files"]]},
-                 "run_id": "workspace"}
+            st.caption(
+                f"Canonical metrics recorded by run {selected.run_id or 'unknown'}. "
+                "Read from that run's manifest; nothing is recomputed here."
+            )
+        elif selected.run_id:
+            st.info(
+                f"Run {selected.run_id} recorded no metrics. Another run's "
+                "metrics are never shown in their place."
             )
         else:
-            st.info("No predictions artifact was found.")
-            st.write("**Searched paths:**")
-            for p in searched_paths:
-                st.code(str(p), language="text")
-            st.write("**Next action:** Run training and re-open Review Results.")
+            st.info(selected.reason)
+
+    with tabs[2]:
+        # Exactly the selected run's artifact, through the shared CPU-safe
+        # reader. There is no "no run selected, so preview whatever is on
+        # disk" branch any more: that branch previewed the project-wide glob
+        # and is how another run's predictions appeared under this heading.
+        if selected.candidates and len(selected.candidates) > 1:
+            st.selectbox(
+                "Prediction artifact",
+                list(selected.candidates),
+                key=ARTIFACT_CHOICE_KEY,
+            )
+        if selected.available:
+            render_predictions_panel(
+                {
+                    "artifacts": {"prediction_files": [selected.predictions_file]},
+                    "run_id": selected.run_id,
+                }
+            )
+            with st.expander("Artifact diagnostics", expanded=False):
+                st.caption(
+                    "What is stored in this exact file, at full precision and "
+                    "before any display formatting. Nothing here is a metric, "
+                    "and nothing is rounded, sorted or altered."
+                )
+                st.dataframe(
+                    diagnostics_rows(
+                        artifact_diagnostics(
+                            selected.predictions_file, run_id=selected.run_id
+                        )
+                    ),
+                    hide_index=True,
+                    use_container_width=True,
+                )
+        else:
+            st.info(selected.reason)
 
     with tabs[3]:
-        if files["log_files"]:
-            for log_file in files["log_files"]:
+        if run_files.get("log_files"):
+            for log_file in run_files["log_files"]:
                 st.markdown(f"**{log_file.name}**")
                 try:
                     text = log_file.read_text(encoding="utf-8", errors="ignore")
@@ -1917,39 +2045,37 @@ Metrics:
                 lines = text.splitlines()
                 st.code("\n".join(lines[-120:]) if lines else "", language="text")
         else:
-            st.info("Not available")
-        render_llm_output_panel("review_llm_output", "Result interpretation")
+            st.info(
+                f"Run {selected.run_id or 'unknown'} recorded no log files."
+                if selected.run_id
+                else selected.reason
+            )
+        # Gated on identity, exactly as above: this panel must never repeat
+        # an explanation belonging to a different result.
+        if cached_for(
+            st.session_state, "review_llm_output", EXPLANATION_IDENTITY_KEY, selected
+        ) is not None:
+            render_llm_output_panel("review_llm_output", "Result interpretation")
 
     with tabs[4]:
-        selected_manifest = _selected_run_manifest()
-        if selected_manifest is not None:
+        if selected.manifest:
             # Where it wrote, then the files grouped by what they are.
-            render_run_location(selected_manifest)
-            run_dir = str(
-                selected_manifest.get("run_dir")
-                or selected_manifest.get("workspace")
-                or ""
-            )
-            if run_dir:
-                render_file_browser(run_dir)
+            render_run_location(dict(selected.manifest))
+            if selected.run_dir:
+                render_file_browser(selected.run_dir)
+            if selected.predictions_file:
+                st.caption("Prediction artifact read for this result:")
+                st.code(selected.predictions_file, language="text")
         else:
-            workspace = str(session_workspace or (project_dir / "workspace"))
-            st.markdown("**Where results are being read from**")
+            st.info(selected.reason)
             st.dataframe(
                 [
                     {"": "Project", "Path": _current_project_name()},
                     {"": "Project directory", "Path": str(project_dir)},
-                    {"": "Workspace", "Path": workspace},
                 ],
                 hide_index=True,
                 use_container_width=True,
             )
-            st.caption(
-                "Select a run in Run History above to browse that run's own "
-                "files, grouped by artifact type."
-            )
-            render_file_browser(workspace)
-        render_llm_output_panel("review_llm_output", "Result interpretation")
 
     render_bottom_step_navigation()
 
