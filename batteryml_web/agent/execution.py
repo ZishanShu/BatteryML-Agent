@@ -51,6 +51,58 @@ def metrics_for_task(task: str | None) -> Tuple[str, ...]:
 WRAPPER = "batteryml_web/core/run_batteryml_cli.py"
 
 
+def build_run_command(
+    *,
+    config_path: str,
+    workspace: str,
+    task: str | None,
+    device: str,
+    seed: Any,
+    epochs: Optional[int] = None,
+    resume_from: Optional[str] = None,
+) -> List[str]:
+    """The argv for one BatteryML run. **The only place one is built.**
+
+    Both execution routes call this — the Agent Workflow through
+    :func:`build_execution_plan`, and the Run Model page directly — because
+    they drifted apart when each spelled the argv out for itself. The Run
+    Model page omitted ``--metric``, so the same config evaluated through
+    the two buttons reported different metrics: an SOH run scored MAE and
+    RMSE from the Agent and fell back to the CLI's ``RMSE,MAE,MAPE`` default
+    from Run Model. MAPE on a ratio of order 1 merely restates MAE, so the
+    two routes disagreed about what a result even was.
+
+    The argv follows the CLI contract in CLAUDE.md §5: ``run`` takes the
+    config as a *positional* argument, and ``--train --eval`` are mandatory —
+    without them BatteryML prints the workspace path and exits without
+    training anything.
+    """
+    command = [
+        sys.executable,
+        WRAPPER,
+        "run",
+        str(config_path),
+        "--workspace",
+        str(workspace),
+        "--train",
+        "--eval",
+        "--device",
+        str(device),
+        "--seed",
+        str(seed),
+        "--metric",
+        ",".join(metrics_for_task(task)),
+    ]
+    if epochs is not None:
+        command.extend(["--epochs", str(epochs)])
+    if resume_from:
+        # The CLI already accepts this flag and forwards it to
+        # Pipeline.train. Combined with --epochs as the *total* target,
+        # training continues from the checkpoint's epoch to that total.
+        command.extend(["--ckpt-to-resume", str(resume_from)])
+    return command
+
+
 def _registry_tables() -> Tuple[Dict[str, str], Dict[str, str], Any]:
     from ..core.config_registry import (
         MODEL_CLASS_KEYS,
@@ -321,29 +373,15 @@ def build_execution_plan(
     can_execute = bool(config_valid and runnable_data and model_status == "READY")
     if can_execute:
         ws = workspace or _default_workspace(dataset, model_key)
-        command: Optional[List[str]] = [
-            sys.executable,
-            WRAPPER,
-            "run",
-            config_path,
-            "--workspace",
-            ws,
-            "--train",
-            "--eval",
-            "--device",
-            device_value,
-            "--seed",
-            str(seed),
-            "--metric",
-            ",".join(metrics_for_task(resolved_task)),
-        ]
-        if epochs_value is not None:
-            command.extend(["--epochs", str(epochs_value)])
-        if resume_from:
-            # The CLI already accepts this flag and forwards it to
-            # Pipeline.train. Combined with --epochs as the *total* target,
-            # training continues from the checkpoint's epoch to that total.
-            command.extend(["--ckpt-to-resume", str(resume_from)])
+        command: Optional[List[str]] = build_run_command(
+            config_path=config_path,
+            workspace=ws,
+            task=resolved_task,
+            device=device_value,
+            seed=seed,
+            epochs=epochs_value,
+            resume_from=resume_from,
+        )
         reason = f"Model {model_key!r} is READY with a validated config; plan only, nothing executed."
     else:
         command = None

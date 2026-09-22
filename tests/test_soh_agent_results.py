@@ -140,13 +140,29 @@ class TestSOHMetrics(unittest.TestCase):
         self.assertEqual(metrics_for_task(TASK_RUL), DEFAULT_METRICS)
         self.assertIn("MAPE", metrics_for_task(TASK_RUL))
 
-    def test_the_plan_passes_the_task_metrics(self) -> None:
-        import batteryml_web.agent.execution as execution
-        import inspect
+    def test_the_command_carries_the_tasks_own_metrics(self) -> None:
+        """Asserted on the argv, not on the source that produces it.
 
-        source = inspect.getsource(execution.build_execution_plan)
-        self.assertIn("metrics_for_task(resolved_task)", source)
-        self.assertIn('"--metric"', source)
+        This used to grep ``build_execution_plan`` for the literal call, and
+        broke the moment the argv moved into the one shared builder both
+        execution routes now use — while the behaviour it cared about was
+        unchanged. What matters is what the command asks BatteryML to
+        compute.
+        """
+        from batteryml_web.agent.execution import build_run_command
+
+        soh = build_run_command(
+            config_path="configs/soh/ridge/matr.yaml",
+            workspace="runs/w", task=TASK_SOH, device="cpu", seed=0,
+        )
+        self.assertIn("--metric", soh)
+        self.assertEqual(soh[soh.index("--metric") + 1], "MAE,RMSE")
+
+        rul = build_run_command(
+            config_path="configs/baselines/nn_models/cnn/matr_1.yaml",
+            workspace="runs/w", task=TASK_RUL, device="cpu", seed=0,
+        )
+        self.assertEqual(rul[rul.index("--metric") + 1], "RMSE,MAE,MAPE")
 
 
 class TestSOHResultViews(unittest.TestCase):

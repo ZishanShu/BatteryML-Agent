@@ -124,3 +124,38 @@ BatLiNet against the live registries (the §11 regression check), the MATR
 external configs against the execution gate, PBT/BatteryMFormer status on the
 real tree plus synthetic READY trees, and the workflow context for MATR/RUL,
 trajectory, and RAW_ONLY datasets.
+
+## A config belongs to the data it loads
+
+A config's dataset is read from `train_test_split.cell_data_path`, the path
+`Task.build` actually loads. It is not read from the file's text.
+
+It used to be: `_infer_dataset` searched `f"{path} {path.name} {text}"` for
+each dataset name in turn, `MATR` first. Every CNN config names
+`VoltageCapacityMatrixFeatureExtractor`, and *Matrix* contains **matr**, so
+all eight CNN configs registered as MATR — including
+`configs/baselines/nn_models/cnn/hust.yaml`, which loads
+`data/processed/HUST`, and `snl.yaml`, which loads `data/processed/SNL`.
+
+Two observed consequences:
+
+* **MATR + CNN offered eight configs, five of which read another dataset's
+  directory.** A plan built from one of those is labelled MATR and runs
+  HUST; it is refused by the data-requiring validator, or dies on
+  `AssertionError: data/processed/HUST`. Whether a CNN run worked depended
+  on which config was selected, which is the "CNN sometimes cannot run"
+  report.
+* **HUST and SNL offered no CNN at all**, although each has a config written
+  for it.
+
+This is the same defect class as the `eol_soh` → SOH task mis-inference, and
+the same repair: read structure, never substrings.
+
+A config whose `cell_data_path` is a **list** spans several datasets
+(`mix`, `cruh`, `crush`). It is not any one dataset's config and is no longer
+offered under one — returning MATR for `mix.yaml` because MATR appears among
+its six directories is exactly the mislabelling this rule stops. Those files
+stay on disk and remain runnable from the CLI. The catalog went from 173
+registered entries to 112; every entry removed was one of these, previously
+mislabelled as MATR.
+

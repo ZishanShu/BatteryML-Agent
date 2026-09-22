@@ -14,6 +14,7 @@ import torch
 
 from batteryml_web.agent.llm_client import run_llm_prompt, save_llm_output
 from batteryml_web.agent.catalog import REQUEST_TEMPLATE_STRUCTURE
+from batteryml_web.agent.execution import build_run_command
 from batteryml_web.ui.agent_workflow import (
     USE_TEMPLATE_LABEL,
     accept_template as accept_request_template,
@@ -1619,7 +1620,17 @@ def render_run_model_page():
         st.write(f"**Dataset readiness:** {_current_dataset_status(ds)}")
         st.write(f"**Config path:** `{config_path if config_path else 'Not configured'}`")
         st.write(f"**Workspace dir:** `{workspace_dir}`")
-        command = [sys.executable, "batteryml_web/core/run_batteryml_cli.py", "run", str(config_path) if config_path else "<missing-config>", "--workspace", str(workspace_dir), "--train", "--eval", "--device", st.session_state.get("selected_device", "cpu"), "--seed", str(st.session_state.get("run_seed", 0))]
+        # Built by the one shared builder, so this route and the Agent
+        # Workflow cannot drift apart again. They had: this page spelled the
+        # argv out itself and omitted --metric, so the same config scored
+        # different metrics depending on which button was pressed.
+        command = build_run_command(
+            config_path=str(config_path) if config_path else "<missing-config>",
+            workspace=str(workspace_dir),
+            task=task_choice,
+            device=st.session_state.get("selected_device", "cpu"),
+            seed=st.session_state.get("run_seed", 0),
+        )
         st.code(" ".join(command), language="bash")
         c1, c2 = st.columns([1, 2])
         with c1:

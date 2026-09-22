@@ -859,22 +859,57 @@ def _render_execution_status(
             "is shown or copied."
         )
         render_copy_control(
-            _run_failure_details(result),
+            _run_failure_details(
+                result,
+                run_id=str(st.session_state.get(ACTIVE_RUN_KEY) or ""),
+                config_path=str(
+                    (st.session_state.get("agent_execution_plan") or {}).get(
+                        "config_path"
+                    )
+                    or ""
+                ),
+                status=str(st.session_state.get("last_run_status") or ""),
+            ),
             key="agent_run_failure_copy",
         )
 
 
-def _run_failure_details(result: dict[str, Any]) -> str:
-    """The failed run's technical block as one redacted, copyable text."""
+def _run_failure_details(
+    result: dict[str, Any],
+    *,
+    run_id: str = "",
+    config_path: str = "",
+    status: str = "",
+) -> str:
+    """The failed run's technical block as one redacted, copyable text.
+
+    Carries what someone diagnosing the failure has to ask for otherwise:
+    which run it was, which config it ran, where it ran, how it ended, and
+    the output. Pasted into an issue or a message, this is enough to place
+    the failure without a second round trip.
+    """
     command = result.get("command")
     sections = [
+        f"run id: {run_id or '(not recorded)'}",
+        f"final status: {status or '(not recorded)'}",
         f"returncode: {result.get('returncode', 'N/A')}",
+        f"config: {config_path or '(not recorded)'}",
+        f"workspace: {result.get('workspace') or '(not recorded)'}",
+        # The run's working directory is the repository root by contract —
+        # the CLI wrapper's relative path in the argv only resolves there.
+        f"cwd: {REPO_ROOT}",
         "",
         "command:",
         " ".join(str(part) for part in command) if command else "(not recorded)",
         "",
         "error:",
         str(result.get("error") or "(none)"),
+    ]
+    if result.get("stream_note"):
+        # Only present when the loop stopped waiting on pipes something
+        # outlived the run was still holding; it explains a short capture.
+        sections += ["", "output capture:", str(result["stream_note"])]
+    sections += [
         "",
         "stdout:",
         str(result.get("stdout") or "(empty)"),

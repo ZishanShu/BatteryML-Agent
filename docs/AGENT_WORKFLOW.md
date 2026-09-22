@@ -154,6 +154,46 @@ that waited for a progress event would never notice that it had finished.
 A second run of the same plan is an ordinary act: a new run id, a new
 directory, the earlier run untouched in Run History.
 
+## Terminal state never depends on the output pipes
+
+A run ends when the *process* ends. The streaming loop used to end only when
+both pipes reached EOF, with no timeout and no look at the child, and a pipe
+closes when the last holder of its write end closes it — which is not always
+the child. Anything it spawned that inherited stdout or stderr keeps the pipe
+open after the child is gone, and the loop then waited for an EOF that was
+never coming: the manifest stayed `RUNNING` for the life of the server
+process while the job had already finished. Reproduced with a child that
+spawns a sleeper and exits 0.
+
+The loop now also watches `proc.poll()`. Once the child has exited *and*
+nothing has arrived for `POST_EXIT_DRAIN_S` (5s), it stops waiting and the
+outcome is decided by the return code, which is already available. The drain
+is measured from the last byte received, not from the exit, so a large
+buffered tail still arriving keeps pushing the deadline out and is never
+truncated — and a healthy run, which EOFs within milliseconds, never spends
+the window at all. When the window is used, the result carries a
+`stream_note` saying the capture may be short; the run's own outcome is not
+in doubt.
+
+Progress parsing is presentation. A missing tqdm line, a malformed counter
+and a run that prints nothing at all each reach a terminal state exactly as
+a chatty one does.
+
+## One command builder, two routes
+
+`build_run_command` in `batteryml_web/agent/execution.py` is the only place a
+BatteryML argv is constructed. The Run Model page used to spell its own out
+and omitted `--metric`, so the same config scored `MAE,RMSE` through the
+Agent and fell back to the CLI default `RMSE,MAE,MAPE` through Run Model —
+the two routes disagreed about what a result was. They cannot drift again
+without changing the one function.
+
+The routes still differ in what they are *for*, and that is deliberate: the
+Agent Workflow runs through `RunManager` into a per-run directory with a
+manifest and a lifecycle; Run Model runs synchronously into the project
+workspace. The command they build for a given config, task, device and seed
+is identical.
+
 ## Failures
 
 A failed run is never retried. A CUDA out-of-memory failure is named as a

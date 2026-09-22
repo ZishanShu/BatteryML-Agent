@@ -104,14 +104,29 @@ class Task:
             test_index = SampleIndex.for_whole_cells(
                 [cell.cell_id for cell in test_cells])
 
-        # Omit samples that cannot be used: a NaN label, and — for a
-        # cycle-level task — a row whose features could not be computed,
-        # because a cycle with no readable voltage trace is not a sample. It
-        # is dropped rather than zero-filled or borrowed from a neighbour.
-        # The sample index is filtered by the same mask, so a row's identity
-        # still matches its feature and label.
-        train_mask = ~torch.isnan(train_labels) & _usable_rows(train_features)
-        test_mask = ~torch.isnan(test_labels) & _usable_rows(test_features)
+        # Omit samples that cannot be used: a NaN label always, and — for a
+        # cycle-level task **only** — a row whose features could not be
+        # computed, because a cycle with no readable voltage trace is not a
+        # sample. It is dropped rather than zero-filled or borrowed from a
+        # neighbour. The sample index is filtered by the same mask, so a
+        # row's identity still matches its feature and label.
+        #
+        # The feature filter is deliberately NOT applied to a whole-cell
+        # task. There, one row is one *cell*, and a cell's feature is a whole
+        # matrix — a CNN's VoltageCapacityMatrixFeatureExtractor row is
+        # 100x1000. A single NaN anywhere in those 100,000 values would
+        # delete the entire cell from the run, silently, although its label
+        # is perfectly good; with a NaN in every cell the training set comes
+        # out empty. That is a different scientific claim from dropping one
+        # unreadable cycle out of a cell's hundreds, and it is not what the
+        # whole-cell path did before cycle-level tasks existed (the mask was
+        # ~isnan(labels) alone). Restoring that keeps SOH's cycle-level
+        # infrastructure from changing legacy RUL behaviour.
+        train_mask = ~torch.isnan(train_labels)
+        test_mask = ~torch.isnan(test_labels)
+        if self.is_cycle_level:
+            train_mask = train_mask & _usable_rows(train_features)
+            test_mask = test_mask & _usable_rows(test_features)
         train_features = train_features[train_mask]
         test_features = test_features[test_mask]
         train_index = train_index.select(train_mask.tolist())

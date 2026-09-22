@@ -180,14 +180,60 @@ class ConfigRegistry:
             return None
         return ConfigEntry(dataset, task, model_key, model_display, split_preset, split_label, path, {"yaml": data})
 
+    #: Datasets a config's ``cell_data_path`` may name. Order is irrelevant
+    #: now that matching is structural; it was not when this searched the
+    #: whole YAML, where the first entry won whatever the config said.
+    _DATASETS = ("MATR", "HUST", "RWTH", "CALCE", "SNL", "UL_PUR", "HNEI")
+
     def _infer_dataset(self, hay: str, data: dict[str, Any]) -> str | None:
-        for ds in ("MATR", "HUST", "RWTH", "CALCE", "SNL", "UL_PUR"):
-            if ds.lower() in hay:
-                return ds
+        """The dataset this config trains on, from ``cell_data_path``.
+
+        Structure, not substrings — the same repair ``_infer_task`` needed,
+        for the same reason and with a worse symptom.
+
+        This used to search ``f"{path} {path.name} {text}"`` for each dataset
+        name in order, with ``MATR`` first. Every CNN config names
+        ``VoltageCapacityMatrixFeatureExtractor``, and *Matrix* contains
+        **matr** — so all eight CNN configs were registered as MATR,
+        including ``hust.yaml`` (``data/processed/HUST``) and ``snl.yaml``
+        (``data/processed/SNL``). Two consequences, both observed:
+
+        * CNN + MATR offered eight configs of which five read another
+          dataset's directory. A plan built from one of those says MATR and
+          runs HUST, so it is refused by the data-requiring validator, or —
+          if it starts — dies on ``AssertionError: data/processed/HUST``.
+          Whether a CNN run worked depended on which config was picked.
+        * ``HUST`` and ``SNL`` offered no CNN at all, although each has a
+          config written for it.
+
+        ``cell_data_path`` is what ``Task.build`` actually loads, so it
+        cannot disagree with the run the way a filename or a class name can.
+
+        A config whose ``cell_data_path`` is a **list** spans several
+        datasets (``mix``, ``cruh``, ``crush``). It is not any one dataset's
+        config and is not offered under one; it stays on disk and remains
+        runnable from the CLI. Returning ``MATR`` for ``mix.yaml`` because
+        MATR appears among its six directories is exactly the mislabelling
+        this function exists to stop.
+        """
         split = data.get("train_test_split", {}) if isinstance(data, dict) else {}
-        cdp = split.get("cell_data_path", "") if isinstance(split, dict) else ""
-        for ds in ("MATR", "HUST", "RWTH", "CALCE", "SNL", "UL_PUR"):
-            if ds.lower() in str(cdp).lower():
+        cdp = split.get("cell_data_path") if isinstance(split, dict) else None
+        if isinstance(cdp, (list, tuple)):
+            return None
+        if cdp:
+            # The last path segment, so "data/processed/MATR" resolves on
+            # "MATR" and never on a parent directory that happens to carry a
+            # dataset name.
+            leaf = str(cdp).rstrip("/").rsplit("/", 1)[-1].upper()
+            for ds in self._DATASETS:
+                if leaf == ds:
+                    return ds
+            return None
+        # No declared data path. Fall back to the *filename* alone — never
+        # the file's text, which is what produced the Matrix/MATR collision.
+        stem = Path(str(hay).strip().split()[0]).stem.upper() if hay else ""
+        for ds in self._DATASETS:
+            if stem == ds or stem.startswith(f"{ds}_"):
                 return ds
         return None
 

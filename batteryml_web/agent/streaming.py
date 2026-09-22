@@ -161,6 +161,15 @@ HEARTBEAT_MESSAGE = "Running."
 #: How long the event loop waits for output before emitting a heartbeat.
 _HEARTBEAT_INTERVAL_S = 0.2
 
+#: How long the loop keeps reading after the child has exited and gone quiet
+#: before it stops waiting for EOF. Generous on purpose: a healthy run EOFs
+#: within milliseconds of exiting, so this window is only ever spent in the
+#: pathological case where something the child spawned still holds the pipes.
+#: Measured from the last byte received, not from the exit, so a large
+#: buffered tail still arriving keeps pushing the deadline out and is never
+#: truncated.
+POST_EXIT_DRAIN_S = 5.0
+
 #: Segments longer than this are truncated in the *event* only; the stored
 #: stdout/stderr keep every byte.
 _EVENT_MESSAGE_CHARS = 500
@@ -597,10 +606,36 @@ def execute_plan_streaming(
 
     open_streams = len(threads)
     timed_out = False
+    abandoned_streams = False
+    #: When the child was first observed to have exited. The loop below ends
+    #: on EOF from both pipes, which is the normal and complete ending — but
+    #: it must not *depend* on it. A pipe is closed when the last holder of
+    #: the write end closes it, and the child is not always the last holder:
+    #: anything it spawned that inherited its stdout or stderr keeps the pipe
+    #: open after the child itself has exited. This loop would then wait for
+    #: an EOF that is not coming, with no timeout (RunManager passes none),
+    #: so the run stayed RUNNING for the lifetime of the server process and
+    #: the page polled a job that had already finished. Reproduced: a child
+    #: that spawns a sleeper and exits leaves both streams open indefinitely.
+    #: Last time anything at all arrived from either pipe. The drain window
+    #: is measured from *activity*, not from the exit, so a child that exits
+    #: while a large buffered tail is still being read is never truncated:
+    #: every segment that arrives pushes the deadline out again.
+    last_activity = time.monotonic()
     while open_streams > 0:
         if timeout is not None and (time.monotonic() - started_at) > timeout and not timed_out:
             timed_out = True
             proc.kill()
+        if (
+            proc.poll() is not None
+            and (time.monotonic() - last_activity) > POST_EXIT_DRAIN_S
+        ):
+            # The child is gone and its output has been quiet for the whole
+            # drain window; whatever still holds these pipes is not the run.
+            # Stop waiting and let the terminal status be decided by the
+            # return code, which is already available.
+            abandoned_streams = True
+            break
         try:
             kind, channel, payload = events.get(timeout=_HEARTBEAT_INTERVAL_S)
         except queue.Empty:
@@ -619,6 +654,7 @@ def execute_plan_streaming(
                 ),
             )
             continue
+        last_activity = time.monotonic()
         if kind == "eof":
             open_streams -= 1
             continue
@@ -659,8 +695,16 @@ def execute_plan_streaming(
                 _event("stage", state, f"{entered} (inferred from the CLI's call order)."),
             )
 
-    for thread in threads:
-        thread.join(timeout=5)
+    if not abandoned_streams:
+        # Only when EOF really arrived. If the loop gave up on the pipes, the
+        # pumps are blocked on a read nothing will end, and joining them —
+        # even with a timeout — would spend that timeout per thread for
+        # nothing. They are daemons, so they cost nothing to leave.
+        for thread in threads:
+            thread.join(timeout=5)
+    # The child has already exited in every path that reaches here (the loop
+    # ends on EOF, on the abandoned-streams break, or after a kill), so this
+    # reaps it rather than waiting on it.
     returncode = proc.wait()
     elapsed = time.monotonic() - started_at
 
@@ -670,6 +714,17 @@ def execute_plan_streaming(
     base["stderr"] = "".join(stderr_parts)
     base["elapsed_s"] = elapsed
     base["success"] = (returncode == 0) and not timed_out
+
+    if abandoned_streams:
+        # Said plainly, because the captured output may be short of whatever
+        # the other holder of the pipe wrote afterwards. The run's own
+        # outcome is not in doubt: the return code below is the child's.
+        base["stream_note"] = (
+            f"The run exited with code {returncode}, but something it "
+            f"started kept its output pipes open for more than "
+            f"{POST_EXIT_DRAIN_S:.0f}s. The run was recorded from its exit "
+            "code; any output written after that point is not captured."
+        )
 
     if timed_out:
         base["error"] = f"execution timed out after {timeout}s; nothing retried."

@@ -73,7 +73,16 @@ class TestRealConfigsAreClassifiedByStructure(unittest.TestCase):
         )
 
     def test_every_eol_soh_config_stays_rul(self) -> None:
-        """The exact decoy, over every config that carries it."""
+        """The exact decoy, over every config that carries it.
+
+        The floor is a non-vacuity guard, not a census. It was 30 when the
+        catalog still registered the multi-dataset configs (``mix``,
+        ``cruh``, ``crush``) — all of which it had mislabelled as MATR,
+        because ``VoltageCapacityMatrixFeatureExtractor`` contains "matr".
+        Those entries are no longer offered under a single dataset, so the
+        registered catalog is smaller and honest; the scan still covers
+        twenty-odd real RUL baselines, which is what it exists to check.
+        """
         checked = 0
         for entry in self.entries:
             text = Path(entry.config_path).read_text(encoding="utf-8")
@@ -87,7 +96,7 @@ class TestRealConfigsAreClassifiedByStructure(unittest.TestCase):
                 f"{entry.task!r}",
             )
         self.assertGreater(
-            checked, 30,
+            checked, 15,
             "expected the repository's RUL baselines to carry eol_soh; the "
             "scan found almost none, so it is not testing what it claims",
         )

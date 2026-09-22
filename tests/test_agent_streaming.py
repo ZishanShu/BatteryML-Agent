@@ -123,6 +123,17 @@ class _FakeProc:
     def wait(self):
         return self._returncode
 
+    def poll(self):
+        """The real Popen surface: a finished process reports its code.
+
+        The fake models a process that has *already exited*, so this returns
+        the code rather than None. The loop uses it to stop depending on EOF
+        alone — a child can exit while something it spawned still holds the
+        pipes — and a double without it would let that code path go
+        untested against the very shape it exists for.
+        """
+        return self._returncode
+
     def kill(self):
         self.killed = True
 
