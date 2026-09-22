@@ -39,6 +39,87 @@ assess_dataset("CALCE").to_dict()
 so nothing on disk is silently left out; `_`-prefixed internal directories are
 ignored.
 
+Readiness is **not cached**. It is recomputed from the filesystem on every
+call, so a dataset downloaded while the app is running shows its new status on
+the next page read — no restart. (The two `lru_cache`s in this package cover
+the YAML config catalog and the BatteryML model registries, neither of which
+depends on whether data is on disk.)
+
+### Recognised raw layouts
+
+A dataset's raw data is looked for in three places, best first. A layout
+counts only when its **signature** holds; a directory existing is never
+enough.
+
+| Layout | Path | Signature | Preprocessable by BatteryML |
+| --- | --- | --- | --- |
+| native | `data/raw/<NAME>/` | directory holding ≥1 regular file | only if BatteryML registers a preprocessor for `<NAME>` |
+| BatteryLife, extracted | `data/raw/BatteryLife/v11/<NAME>/` | directory holding ≥1 regular file | no |
+| BatteryLife, archive | `data/raw/BatteryLife/v11/<NAME>.zip` | `zipfile.is_zipfile` is true | no |
+
+The signatures are deliberately narrow in one direction and deliberately
+loose in the other:
+
+* An **empty** directory stays `MISSING` — that is the state a failed
+  download leaves behind, and calling it raw data would send someone to
+  preprocess nothing. A tree of empty subdirectories does not qualify either,
+  because the count is over regular files.
+* A file wearing the directory's name, and a `.zip` that is not a readable
+  archive, both stay `MISSING`. A truncated download says so in the reason,
+  which is a different finding from "nothing was ever downloaded".
+* An extracted directory is **not** matched against an expected file list.
+  `third_party/BatteryLife` is absent from this checkout, so the contents of
+  a v11 dataset cannot be proven here; requiring a guessed filename would
+  trade one misclassification for a stricter one. Non-empty is what can be
+  established, and it separates downloaded from not-downloaded.
+
+The set of preprocessable datasets is read from
+`batteryml.preprocess.SUPPORTED_SOURCES["DATASETS"]`, not listed in the web
+layer, so it cannot drift from what the CLI can actually preprocess.
+
+### Detected is not runnable
+
+`RAW_ONLY` says raw data was found. It does **not** say a run can start, and
+for a BatteryLife layout it does not even say preprocessing is possible:
+none of `ISU_ILCC`, `MICH`, `MICH_EXP`, `SDU`, `Stanford_2`, `Tongji`,
+`XJTU` has a BatteryML preprocessor. Those report `RAW_ONLY` with
+`preprocessing_supported: False`, and nothing offers a preprocess command
+for them — the Prepare Data panel says the source is not wired to the
+BatteryML preprocessing route instead.
+
+The same distinction applies to a native path: `data/raw/XJTU/` is the native
+shape, but there is no XJTU preprocessor, so it is detected and still not
+preprocessable. Dataset presence and route runnability are two questions and
+stay two fields.
+
+### Why downloaded data used to report MISSING
+
+The alternate-raw branch this replaced recognised **one** shape — a
+`.zip` at `data/raw/BatteryLife/v11/<NAME>.zip` — for a hardcoded **three**
+datasets (`MICH`, `MICH_EXP`, `Stanford_2`), and only when the caller passed
+no `raw_root`. So:
+
+* a dataset that had been downloaded **and extracted** — the normal end
+  state, and the state the external-model readiness path already requires of
+  its `root_path` — reported `MISSING`;
+* so did one whose archive had been deleted after extraction;
+* so did `ISU_ILCC`, `SDU`, `Tongji` and `XJTU` however much was on disk,
+  because they were not on the list;
+* and any caller naming its own raw directory skipped BatteryLife detection
+  altogether.
+
+To see what the platform sees on a machine, read-only:
+
+```bash
+python scripts/inspect_dataset_readiness.py            # every declared dataset
+python scripts/inspect_dataset_readiness.py MATR XJTU  # just these
+python scripts/inspect_dataset_readiness.py --json     # machine-readable
+```
+
+It prints each raw candidate path, whether its signature holds, the processed
+directory and the resulting status. It reads only — nothing is downloaded,
+extracted, copied, renamed or preprocessed.
+
 ## Model states
 
 | Status | Meaning |

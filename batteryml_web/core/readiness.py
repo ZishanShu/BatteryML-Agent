@@ -72,6 +72,152 @@ PLATFORM_DATASETS: tuple[str, ...] = (
     "XJTU",
 )
 
+#: Where the BatteryLife v11 distribution is unpacked, relative to the repo
+#: root. Already the platform's convention: the external-model readiness path
+#: below names these same archives, and the agent's RAW_ONLY notice quotes
+#: this path.
+BATTERYLIFE_RAW_PARTS: tuple[str, ...] = ("data", "raw", "BatteryLife", "v11")
+
+def _native_preprocessor_datasets() -> frozenset[str]:
+    """Datasets BatteryML has a registered preprocessor for.
+
+    Read from ``batteryml.preprocess.SUPPORTED_SOURCES`` rather than listed
+    here, so this cannot drift from what the CLI can actually preprocess.
+    Falls back to an empty set when batteryml cannot be imported — readiness
+    must keep working on a machine without torch (module docstring).
+    """
+    try:
+        from batteryml.preprocess import SUPPORTED_SOURCES
+    except Exception:  # noqa: BLE001 - readiness degrades, never fails
+        return frozenset()
+    return frozenset(str(name).upper() for name in SUPPORTED_SOURCES.get("DATASETS", ()))
+
+
+@dataclass(frozen=True)
+class RawLayout:
+    """One recognised on-disk shape for a dataset's raw data.
+
+    A layout is only *recognised* when its signature holds — the directory
+    existing is never enough. ``preprocessable`` says whether BatteryML's own
+    preprocessing route can consume this layout; a layout that is merely
+    detected reports RAW_ONLY and emits no preprocess command (CLAUDE.md §7
+    and the rule that downloaded is not runnable).
+    """
+
+    #: "native" (data/raw/<NAME>) or "batterylife" (the v11 distribution).
+    kind: str
+    #: The path the signature was found at, for the details panel.
+    path: Path
+    #: How many regular files prove it.
+    file_count: int
+    #: Whether BatteryML can preprocess *this* layout.
+    preprocessable: bool
+    #: One line naming what was found, for the reason string.
+    description: str
+
+
+def _archive_layout(path: Path, *, kind: str) -> RawLayout | None:
+    """A readable ZIP archive, or None.
+
+    The signature is ``zipfile.is_zipfile``, not the ``.zip`` suffix: a
+    truncated or half-downloaded file carries the name but not the data, and
+    must not be reported as present.
+    """
+    if not path.is_file() or not zipfile.is_zipfile(path):
+        return None
+    return RawLayout(
+        kind=kind,
+        path=path,
+        file_count=1,
+        preprocessable=False,
+        description=f"archive {path.name}",
+    )
+
+
+def _directory_layout(
+    path: Path, *, kind: str, preprocessable: bool
+) -> RawLayout | None:
+    """A directory holding at least one regular file, or None.
+
+    Deliberately *non-empty*, not merely present: an empty
+    ``data/raw/<NAME>`` is the state left behind by a failed or abandoned
+    download, and reporting it as raw data available would send a user to
+    preprocess nothing. The count is over regular files, so a tree of empty
+    subdirectories does not qualify either.
+
+    Deliberately **not** a content contract. ``third_party/BatteryLife`` is
+    absent from this checkout, so the file names inside an extracted v11
+    dataset cannot be proven here; requiring a guessed name would trade this
+    bug for a stricter one. Non-empty is what can be established, and it is
+    enough to tell "downloaded" from "not downloaded".
+    """
+    if not path.is_dir():
+        return None
+    count = _dir_file_count(path)
+    if count == 0:
+        return None
+    return RawLayout(
+        kind=kind,
+        path=path,
+        file_count=count,
+        preprocessable=preprocessable,
+        description=f"{count} file(s) in {_display_path(path)}",
+    )
+
+
+def _recognised_raw_layouts(
+    name: str,
+    *,
+    root: Path,
+    raw_root: str | Path | None = None,
+) -> list[RawLayout]:
+    """Every recognised raw layout for ``name``, best first.
+
+    Three shapes are recognised, and the order is the order of usefulness:
+
+    1. ``<raw_root>/<NAME>/`` — BatteryML's native raw directory. Only this
+       one is ever ``preprocessable``, and only for a dataset BatteryML has
+       a registered preprocessor for.
+    2. ``data/raw/BatteryLife/v11/<NAME>/`` — the v11 archive **extracted**,
+       which is the state the external-model readiness path already requires
+       (it calls ``_dir_has_file`` on ``root_path``).
+    3. ``data/raw/BatteryLife/v11/<NAME>.zip`` — the archive as downloaded.
+
+    Shape 2 is what this function was added for. The previous code
+    recognised only shape 3, and only for a hardcoded three of the seven
+    BatteryLife datasets this platform declares, so a dataset the user had
+    downloaded *and extracted* — the normal end state — reported MISSING,
+    as did one whose archive was simply not on that list.
+    """
+    layouts: list[RawLayout] = []
+
+    native_dir = (
+        Path(raw_root) / name if raw_root else root / "data" / "raw" / name
+    )
+    native = _directory_layout(
+        native_dir,
+        kind="native",
+        preprocessable=name.upper() in _native_preprocessor_datasets(),
+    )
+    if native is not None:
+        layouts.append(native)
+
+    # The BatteryLife distribution lives at a fixed repository path; it is
+    # not relative to a caller-supplied raw_root, and it is checked whether
+    # or not one was given. Gating it on "raw_root is None" is what made the
+    # detection vanish for any caller that named its own raw directory.
+    v11 = root.joinpath(*BATTERYLIFE_RAW_PARTS)
+    extracted = _directory_layout(
+        v11 / name, kind="batterylife", preprocessable=False
+    )
+    if extracted is not None:
+        layouts.append(extracted)
+    archive = _archive_layout(v11 / f"{name}.zip", kind="batterylife")
+    if archive is not None:
+        layouts.append(archive)
+    return layouts
+
+
 #: External (non-BatteryML-pipeline) models and the runner that owns them.
 #: ``task`` is fixed by the model's actual output semantics: PBT predicts a
 #: scalar lifetime; BatteryMFormer forecasts a future SOH/capacity trajectory
@@ -207,41 +353,26 @@ def assess_dataset(
         else root / "data" / "processed" / name
     )
 
-    raw_path = raw_dir
-    raw_count = _dir_file_count(raw_dir)
-    invalid_alt_archive: Path | None = None
-    uses_alternate_raw_source = False
+    # Every recognised raw shape for this dataset, best first: the native
+    # raw directory, the extracted BatteryLife v11 directory, then the v11
+    # archive. A layout counts only when its signature holds — an empty
+    # directory and a half-downloaded archive are both "not here".
+    layouts = _recognised_raw_layouts(name, root=root, raw_root=raw_root)
+    best = layouts[0] if layouts else None
 
-    # Known BatteryLife-v11 archives are legitimate alternate RAW sources.
-    # They are raw-only: they never make a BatteryML dataset READY, and they
-    # are not wired to the BatteryML preprocessing route, so no executable
-    # preprocessing command may be emitted for them.
-    if raw_root is None and raw_count == 0:
-        archive_names = {
-            "MICH": "MICH.zip",
-            "MICH_EXP": "MICH_EXP.zip",
-            "Stanford_2": "Stanford_2.zip",
-        }
+    raw_path = best.path if best is not None else raw_dir
+    raw_count = best.file_count if best is not None else 0
+    uses_alternate_raw_source = best is not None and best.kind != "native"
 
-        archive_name = archive_names.get(name)
-
-        if archive_name:
-            candidate = (
-                root
-                / "data"
-                / "raw"
-                / "BatteryLife"
-                / "v11"
-                / archive_name
-            )
-
-            if candidate.is_file():
-                if zipfile.is_zipfile(candidate):
-                    raw_path = candidate
-                    raw_count = 1
-                    uses_alternate_raw_source = True
-                else:
-                    invalid_alt_archive = candidate
+    # A file that carries the archive's name but is not a readable ZIP is
+    # worth saying out loud: it is the shape of an interrupted download, and
+    # it is not the same finding as "nothing was ever downloaded".
+    v11_archive = root.joinpath(*BATTERYLIFE_RAW_PARTS) / f"{name}.zip"
+    invalid_alt_archive: Path | None = (
+        v11_archive
+        if v11_archive.is_file() and not zipfile.is_zipfile(v11_archive)
+        else None
+    )
 
     processed_count = _dir_file_count(
         processed_dir,
@@ -326,9 +457,14 @@ def assess_dataset(
         ],
         raw_path=str(raw_path),
         processed_path=str(processed_dir),
+        # Only a raw layout BatteryML can actually preprocess earns this.
+        # A BatteryLife v11 dataset — extracted or archived — is detected but
+        # has no BatteryML preprocessor, so it stays False and no preprocess
+        # command is ever offered for it. Detected is not runnable.
         preprocessing_supported=(
             status is DatasetStatus.RAW_ONLY
-            and not uses_alternate_raw_source
+            and best is not None
+            and best.preprocessable
         ),
     )
 
