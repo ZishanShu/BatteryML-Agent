@@ -29,6 +29,11 @@ A cancelled run is not a finished run: its output and any artifacts already
 written are kept and labelled partial, its manifest goes to ``CANCELLED``,
 and no result context is built from it. Metrics from a killed training run
 would be meaningless, so none are offered.
+
+**One ordering holds this together**: ``snapshot()["finished"]`` becomes
+true only after the manifest is already terminal, so the in-memory view and
+the durable record can never be caught disagreeing. See :meth:`_finalize`
+and ``docs/RUN_LIFECYCLE.md``.
 """
 
 from __future__ import annotations
@@ -42,6 +47,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional
 
+from ..agent.executor import _empty_artifacts
 from ..agent.streaming import execute_plan_streaming
 from . import run_manifest as rm
 
@@ -64,6 +70,31 @@ KILL_WAIT_S = 5.0
 LIVE_LOG = "run.log"
 
 CANCELLED_MESSAGE = "Cancelled by user"
+
+
+def _failure_result(plan: Dict[str, Any], exc: BaseException) -> Dict[str, Any]:
+    """The result shape for a run whose executor never returned one.
+
+    Same keys :func:`execute_plan_streaming` returns, so every consumer —
+    the manifest writer, the result builder, the page — reads it without a
+    special case. ``success`` is False and ``returncode`` is None, because
+    no process outcome was observed: the failure is the executor's, and
+    claiming an exit code would invent one.
+    """
+    return {
+        "started": False,
+        "completed": False,
+        "success": False,
+        "returncode": None,
+        "command": [str(part) for part in (plan.get("command") or [])],
+        "workspace": plan.get("command_workspace"),
+        "stdout": "",
+        "stderr": "",
+        "error": f"The run failed before it could report a result "
+        f"({type(exc).__name__}: {exc}).",
+        "artifacts": _empty_artifacts(),
+        "dry_run": False,
+    }
 
 
 class RunHandle:
@@ -162,16 +193,69 @@ class RunManager:
         env: Optional[Dict[str, str]],
         on_finished: Optional[Callable[[str, Dict[str, Any]], None]],
     ) -> None:
+        # Every path out of this method, exception or not, reaches exactly
+        # one ``_finalize``. The setup is inside the guard too: ``mkdir`` on
+        # an unwritable parent raises as readily as the executor does, and it
+        # runs *before* the status leaves PLANNED, so leaving it outside
+        # stranded the run one state earlier with the same result — a dead
+        # thread that ``live_run_ids`` still calls live.
+        #
+        # ``result`` is bound first so the ``finally`` can never raise
+        # NameError over the exception it is finalizing.
+        started_monotonic = time.monotonic()
+        result: Dict[str, Any] = _failure_result(
+            handle.plan, RuntimeError("The run ended without reporting a result.")
+        )
+        try:
+            result = self._run_to_completion(handle, repo_root, env)
+        except BaseException as exc:  # noqa: BLE001 - see below
+            # The executor raising is the one way a run could stay RUNNING
+            # *forever*. This call was not guarded: an exception killed the
+            # worker thread with ``handle.status`` still RUNNING, and because
+            # ``live_run_ids`` reads the status rather than the thread, the
+            # manager went on reporting the run as live. The page polled a
+            # job whose worker was dead, and orphan recovery never applied
+            # because the manager insisted it was alive. Reproduced by making
+            # the executor raise: RUNNING in memory and on disk, worker
+            # thread dead, still listed live, with no time bound at all.
+            #
+            # ``BaseException`` deliberately, and not re-raised: this is a
+            # daemon worker thread, so a ``KeyboardInterrupt`` or
+            # ``SystemExit`` delivered here has nowhere to propagate except
+            # out of the thread — which is precisely the silent death that
+            # stranded the run. The run is recorded FAILED, carrying the
+            # exception text, which is what actually happened to it.
+            result = _failure_result(handle.plan, exc)
+        finally:
+            self._finalize(
+                handle,
+                result,
+                elapsed=time.monotonic() - started_monotonic,
+                on_finished=on_finished,
+            )
+
+    def _run_to_completion(
+        self,
+        handle: RunHandle,
+        repo_root: Path,
+        env: Optional[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        """Mark the run RUNNING and drive it to the executor's result.
+
+        Raises whatever the setup or the executor raises; :meth:`_execute`
+        owns the guard, so there is exactly one place that decides what an
+        unexpected failure means.
+        """
         handle.run_dir.mkdir(parents=True, exist_ok=True)
         live_log = handle.run_dir / LIVE_LOG
         with handle._lock:
             handle.status = rm.STATUS_RUNNING
             handle.started_monotonic = time.monotonic()
-        started_at = rm.utc_now_iso()
-        started_monotonic = time.monotonic()
         try:
             rm.update_manifest(
-                handle.run_dir, {"started_at": started_at}, status=rm.STATUS_RUNNING
+                handle.run_dir,
+                {"started_at": rm.utc_now_iso()},
+                status=rm.STATUS_RUNNING,
             )
         except (FileNotFoundError, ValueError):
             # The manifest is the caller's responsibility; a missing or
@@ -216,15 +300,53 @@ class RunManager:
                 self._signal_process(process, signal.SIGTERM)
             return process
 
-        result = execute_plan_streaming(
+        return execute_plan_streaming(
             handle.plan,
             on_event=on_event,
             repo_root=repo_root,
             env=env,
             popen=launcher,
         )
-        elapsed = time.monotonic() - started_monotonic
 
+    def _finalize(
+        self,
+        handle: RunHandle,
+        result: Dict[str, Any],
+        *,
+        elapsed: float,
+        on_finished: Optional[Callable[[str, Dict[str, Any]], None]],
+    ) -> None:
+        """Settle one run: durable record first, then the in-memory flag.
+
+        **The ordering here is the contract.** ``snapshot()["finished"]`` is
+        what every consumer reacts to, so it must not become true until the
+        run is genuinely settled — and the manifest is the durable half of
+        that. The previous order published the in-memory terminal status
+        first and wrote the manifest afterwards, which left a window where
+        the two sources of truth disagreed. Measured: the manifest was still
+        RUNNING at the instant ``finished`` first became true in 20 of 20
+        repetitions, typically for ~2ms but once for 446ms on an idle
+        machine.
+
+        That window is not academic, because of what the page does inside
+        it. ``_finish_active_run`` reacts to ``finished`` by calling
+        ``forget()`` — which drops the handle, so the run leaves
+        ``live_run_ids()`` — and then reruns the script, and Run History
+        renders ``list_runs(..., live_run_ids=...)``. A manifest still
+        saying RUNNING that is no longer live is exactly what
+        ``reconcile_status`` treats as an abandoned job, so a run that had
+        just exited 0 was reported as INTERRUPTED — "not known to have
+        finished". Reproduced through the real ``forget``/``list_runs``
+        path: 15 of 15.
+
+        Writing the manifest first closes it. ``finished`` now implies the
+        durable record is already terminal, so whatever a consumer does next
+        — poll, forget, re-read, restart — it sees one settled state.
+
+        The in-memory publication is in a ``finally``: a failed manifest
+        write must not be able to strand the run at RUNNING, which would
+        trade a millisecond window for the permanent one this also fixes.
+        """
         cancelled = handle.cancel_requested
         if cancelled:
             status = rm.STATUS_CANCELLED
@@ -233,37 +355,40 @@ class RunManager:
         else:
             status = rm.STATUS_FAILED
 
-        self._write_logs(handle.run_dir, result)
-        with handle._lock:
-            handle.status = status
-            handle.result = result
-
-        changes: Dict[str, Any] = {
-            "finished_at": rm.utc_now_iso(),
-            "elapsed_seconds": round(elapsed, 3),
-            "return_code": result.get("returncode"),
-            "artifacts": result.get("artifacts") or {},
-            "command": [str(part) for part in (result.get("command") or [])],
-        }
-        if cancelled:
-            changes["failure"] = {
-                "category": "cancelled_by_user",
-                "message": CANCELLED_MESSAGE,
-            }
-            # Explicitly: no metrics. A run stopped part-way has not measured
-            # anything, and its artifacts are partial.
-            changes["metrics"] = {}
-            changes["partial_artifacts"] = True
-        elif not result.get("success"):
-            changes["failure"] = {
-                "category": "execution_failed",
-                "message": str(result.get("error") or "")
-                or f"The run exited with code {result.get('returncode')}.",
-            }
         try:
-            rm.update_manifest(handle.run_dir, changes, status=status)
-        except (FileNotFoundError, ValueError):
-            pass
+            self._write_logs(handle.run_dir, result)
+            changes: Dict[str, Any] = {
+                "finished_at": rm.utc_now_iso(),
+                "elapsed_seconds": round(elapsed, 3),
+                "return_code": result.get("returncode"),
+                "artifacts": result.get("artifacts") or {},
+                "command": [str(part) for part in (result.get("command") or [])],
+            }
+            if cancelled:
+                changes["failure"] = {
+                    "category": "cancelled_by_user",
+                    "message": CANCELLED_MESSAGE,
+                }
+                # Explicitly: no metrics. A run stopped part-way has not
+                # measured anything, and its artifacts are partial.
+                changes["metrics"] = {}
+                changes["partial_artifacts"] = True
+            elif not result.get("success"):
+                changes["failure"] = {
+                    "category": "execution_failed",
+                    "message": str(result.get("error") or "")
+                    or f"The run exited with code {result.get('returncode')}.",
+                }
+            try:
+                rm.update_manifest(handle.run_dir, changes, status=status)
+            except (FileNotFoundError, ValueError):
+                # No manifest, or one already terminal. Neither can strand a
+                # run: there is nothing on disk left claiming RUNNING.
+                pass
+        finally:
+            with handle._lock:
+                handle.status = status
+                handle.result = result
 
         if on_finished is not None:
             try:
@@ -372,19 +497,23 @@ class RunManager:
     def forget(self, run_id: str) -> None:
         """Drop a finished run from memory. Its manifest stays on disk.
 
-        Terminal status, not thread liveness, is the condition. The worker
-        publishes the terminal status and the result together and only then
-        writes the manifest and calls back, so a caller that reacts to the
-        terminal snapshot arrives while the thread is still finishing those
-        last steps. Gating on ``is_alive()`` made this a silent no-op in
-        exactly that window — the window every page uses — so handles
-        accumulated for the lifetime of the process and ``forget`` could not
-        be relied on to reap anything.
+        Terminal status, not thread liveness, is the condition. A caller
+        that reacts to the terminal snapshot arrives while the worker thread
+        is still returning, so gating on ``is_alive()`` made this a silent
+        no-op in exactly that window — the window every page uses — and
+        handles accumulated for the lifetime of the process.
+
+        **Calling this is safe the moment a snapshot says finished**, which
+        is the point of the ordering in :meth:`_finalize`: the manifest is
+        already terminal by then, so dropping the handle cannot leave the
+        run looking abandoned. It could before. ``forget`` here, followed by
+        Run History reading ``list_runs(..., live_run_ids=...)``, is what
+        turned a run that had just exited 0 into a reported INTERRUPTED.
 
         Dropping the handle does not touch the worker: it holds its own
-        reference and finishes writing the manifest regardless. What is
-        dropped is only this manager's ability to hand out a snapshot of a
-        run that has already ended, which is what the manifest is for.
+        reference. What is dropped is only this manager's ability to hand
+        out a snapshot of a run that has already ended, which is what the
+        manifest is for.
         """
         with self._lock:
             handle = self._runs.get(str(run_id))

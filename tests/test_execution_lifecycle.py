@@ -57,6 +57,7 @@ from batteryml_web.agent import streaming as sm  # noqa: E402
 from batteryml_web.agent.execution import build_run_command  # noqa: E402
 from batteryml_web.core import run_manifest as rm  # noqa: E402
 from batteryml_web.core.run_identity import new_run_id  # noqa: E402
+from batteryml_web.core import run_manager as run_manager_module  # noqa: E402
 from batteryml_web.core.run_manager import RunManager  # noqa: E402
 
 WRAPPER = "batteryml_web/core/run_batteryml_cli.py"
@@ -313,6 +314,235 @@ class TestManagerReachesTerminalStatus(unittest.TestCase):
         self.assertEqual(manifest["status"], rm.STATUS_CANCELLED)
         # A stopped run measured nothing.
         self.assertEqual(manifest.get("metrics"), {})
+
+
+class TestTerminalStateIsPublishedDurablyFirst(unittest.TestCase):
+    """``finished`` means settled — on disk as well as in memory.
+
+    The flake these tests replace was the mild symptom of a real ordering
+    defect. ``_execute`` published the in-memory terminal status and *then*
+    wrote the terminal manifest, so for a window the two disagreed. Measured
+    before the fix with a tight poll: the manifest was still RUNNING at the
+    instant ``finished`` first became true in **20 of 20** repetitions,
+    usually for about 2ms but once for 446ms on an idle machine. The test
+    that caught it slept 20ms between polls, which is why it failed
+    intermittently rather than always — 3 of 25 runs in isolation, more
+    under load.
+
+    The window mattered because of what the page does inside it.
+    ``_finish_active_run`` reacts to ``finished`` by calling ``forget()`` —
+    dropping the run from ``live_run_ids()`` — and then reruns, and Run
+    History renders ``list_runs(..., live_run_ids=...)``. A manifest still
+    saying RUNNING that is no longer live is precisely what
+    ``reconcile_status`` calls an abandoned job, so a run that had just
+    exited 0 was shown as INTERRUPTED, "not known to have finished". Through
+    the real ``forget``/``list_runs`` path that reproduced **15 of 15**.
+
+    So the contract is now an ordering: the manifest is written first, and
+    ``finished`` becomes true only afterwards.
+    """
+
+    #: §7-8 asks for 20+ repetitions with no intermittent RUNNING, and this
+    #: is the test that answers it. Each repetition spawns a real child, so
+    #: it costs about two seconds; that is the price of the guarantee and it
+    #: is not reduced.
+    REPETITIONS = 20
+
+    #: The mislabel below reproduced 15 times out of 15 before the fix — it
+    #: was deterministic, not intermittent — so a handful of repetitions
+    #: demonstrates it and the other test carries the anti-flake load.
+    LABEL_REPETITIONS = 5
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="durable-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.manager = RunManager()
+
+    def _prepare(self, child_source: str, *, index: int = 0) -> dict:
+        """Everything a run needs on disk, without starting it.
+
+        Separate from :meth:`_start` so a test can make the filesystem fail
+        *after* the fixture tree exists and before the worker touches it.
+        """
+        root = self.tmp / f"rep{index}"
+        config = _fake_repo(root, child_source)
+        run_id = new_run_id(dataset="MATR", model="cnn", seed=0)
+        workspace = f"runs/agent_matr_cnn/{run_id}"
+        run_dir = root / workspace
+        plan = _plan(config, workspace)
+        rm.write_manifest(
+            run_dir,
+            rm.build_manifest(
+                run_id=run_id, project="alpha", workspace=workspace,
+                dataset="MATR", task="RUL prediction", model_key="cnn",
+                config_path=str(config), seed=0, device="cpu",
+                command=plan["command"],
+            ),
+        )
+        return {
+            "run_id": run_id,
+            "run_dir": run_dir,
+            "plan": plan,
+            "repo_root": root,
+            "project_root": root / "runs" / "agent_matr_cnn",
+        }
+
+    def _start(self, child_source: str, *, index: int = 0) -> tuple[str, Path, Path]:
+        prepared = self._prepare(child_source, index=index)
+        self.manager.start(
+            run_id=prepared["run_id"],
+            run_dir=prepared["run_dir"],
+            plan=prepared["plan"],
+            repo_root=prepared["repo_root"],
+        )
+        return prepared["run_id"], prepared["run_dir"], prepared["project_root"]
+
+    def _spin_to_finished(self, run_id: str) -> dict:
+        """Poll with no delay, so a millisecond window is not slept through.
+
+        The 20ms sleeping poll the older tests use is what made this defect
+        intermittent instead of visible: it slept through the typical 2ms
+        window and only noticed the occasional long one.
+
+        ``sleep(0)`` yields the GIL without waiting. A bare busy-spin would
+        hold it in 5ms slices and starve the very worker thread whose
+        ordering is under test — making the test slower and less faithful
+        rather than stricter.
+        """
+        deadline = time.monotonic() + TIMEOUT_S
+        snapshot = self.manager.snapshot(run_id) or {}
+        while not snapshot.get("finished"):
+            if time.monotonic() > deadline:
+                self.fail(
+                    f"run {run_id} never left {snapshot.get('status')!r}"
+                )
+            time.sleep(0)
+            snapshot = self.manager.snapshot(run_id) or {}
+        return snapshot
+
+    def _manifest_status(self, run_dir: Path) -> str:
+        return json.loads(
+            (run_dir / rm.MANIFEST_NAME).read_text(encoding="utf-8")
+        )["status"]
+
+    def test_finished_implies_the_manifest_is_already_terminal(self) -> None:
+        """§7-8: repeated, with no sleep to hide the window."""
+        lagged = []
+        for index in range(self.REPETITIONS):
+            run_id, run_dir, _ = self._start(
+                "import sys\nprint('ok')\nsys.exit(0)", index=index
+            )
+            snapshot = self._spin_to_finished(run_id)
+            status = self._manifest_status(run_dir)
+            self.assertEqual(snapshot["status"], rm.STATUS_COMPLETED)
+            if status not in rm.TERMINAL_STATUSES:
+                lagged.append((index, status))
+        self.assertEqual(
+            lagged, [],
+            "the manifest was still non-terminal when `finished` became "
+            f"true, in {len(lagged)} of {self.REPETITIONS} repetitions",
+        )
+
+    def test_a_completed_run_is_never_reported_interrupted(self) -> None:
+        """The user-visible defect, through the page's own sequence.
+
+        Not a simulation of the UI: the same ``forget`` and the same
+        ``list_runs(..., live_run_ids=...)`` the Agent page calls, in the
+        order it calls them.
+        """
+        for index in range(self.LABEL_REPETITIONS):
+            run_id, run_dir, project_root = self._start(
+                "import sys\nprint('ok')\nsys.exit(0)", index=index
+            )
+            snapshot = self._spin_to_finished(run_id)
+            self.assertEqual(snapshot["status"], rm.STATUS_COMPLETED)
+
+            self.manager.forget(run_id)
+            entries = rm.list_runs(
+                project_root, live_run_ids=self.manager.live_run_ids()
+            )
+            shown = next(
+                (e for e in entries if str(e.get("run_id")) == run_id), {}
+            )
+            self.assertEqual(
+                shown.get("status"), rm.STATUS_COMPLETED,
+                f"repetition {index}: a run that exited 0 was reported as "
+                f"{shown.get('status')} "
+                f"(reconciled_from={shown.get('reconciled_from')})",
+            )
+
+    def test_a_finished_run_is_no_longer_reported_live(self) -> None:
+        """Non-vacuity for the test above: ``live_run_ids`` really does drop it.
+
+        Without this, ``list_runs`` could be returning COMPLETED merely
+        because the run was still considered live, which would make the
+        reconciliation path untested rather than correct.
+        """
+        run_id, _run_dir, _project = self._start("import sys\nsys.exit(0)")
+        self._spin_to_finished(run_id)
+        self.assertNotIn(run_id, self.manager.live_run_ids())
+
+    def test_an_exception_in_the_executor_still_reaches_a_terminal_state(
+        self,
+    ) -> None:
+        """The unbounded half of the defect.
+
+        ``execute_plan_streaming`` was called unguarded. Anything it raised
+        killed the worker thread with the status still RUNNING — and
+        ``live_run_ids`` reads the status, not the thread, so the manager
+        went on calling the run live, the page polled a job whose worker was
+        dead, and orphan recovery never applied because the manager insisted
+        it was alive. Reproduced before the fix: RUNNING in memory and on
+        disk, thread dead, still listed live, with no time bound at all.
+        """
+        real = run_manager_module.execute_plan_streaming
+
+        def _raise(*_args, **_kwargs):
+            raise RuntimeError("boom inside the executor")
+
+        run_manager_module.execute_plan_streaming = _raise
+        try:
+            run_id, run_dir, _project = self._start("import sys\nsys.exit(0)")
+            snapshot = self._spin_to_finished(run_id)
+        finally:
+            run_manager_module.execute_plan_streaming = real
+
+        self.assertEqual(snapshot["status"], rm.STATUS_FAILED)
+        self.assertEqual(self._manifest_status(run_dir), rm.STATUS_FAILED)
+        self.assertNotIn(run_id, self.manager.live_run_ids())
+        # No exit code is claimed: no process outcome was ever observed.
+        self.assertIsNone(snapshot.get("returncode"))
+
+    def test_a_setup_failure_still_reaches_a_terminal_state(self) -> None:
+        """The same shape one step earlier, before the status leaves PLANNED.
+
+        ``run_dir.mkdir`` raises as readily as the executor does — an
+        unwritable parent is enough — and it ran outside the guard, so the
+        run was stranded at PLANNED with a dead worker.
+        """
+        prepared = self._prepare("import sys\nsys.exit(0)")
+        run_id = prepared["run_id"]
+        real = Path.mkdir
+
+        def _deny(self_path, *args, **kwargs):
+            raise PermissionError(f"refused: {self_path}")
+
+        # Patched only now: the fixture tree above needed a working mkdir,
+        # and what is under test is the worker's own call.
+        Path.mkdir = _deny
+        try:
+            self.manager.start(
+                run_id=run_id,
+                run_dir=prepared["run_dir"],
+                plan=prepared["plan"],
+                repo_root=prepared["repo_root"],
+            )
+            snapshot = self._spin_to_finished(run_id)
+        finally:
+            Path.mkdir = real
+
+        self.assertEqual(snapshot["status"], rm.STATUS_FAILED)
+        self.assertNotIn(run_id, self.manager.live_run_ids())
 
 
 class TestOrphanedRunningManifest(unittest.TestCase):
