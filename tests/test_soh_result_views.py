@@ -263,13 +263,23 @@ class TestSchemaIsHandledEverywhereItIsProduced(unittest.TestCase):
             REPO_ROOT / "batteryml_web" / "ui" / "agent_workflow.py",
             REPO_ROOT / "batteryml_web" / "agent" / "artifact_preview.py",
         ]
+        # The RUL family may be named directly or through the tuple that
+        # contains it. Both are the same guarantee, and this proves it
+        # rather than assuming it: a site that dispatches on SCALAR_SCHEMAS
+        # is handling RUL_SCHEMA.
+        self.assertIn(rv.RUL_SCHEMA, rv.SCALAR_SCHEMAS)
+        rul_family = ("RUL_SCHEMA", "SCALAR_SCHEMAS")
+
         for path in sites:
             text = path.read_text(encoding="utf-8")
             with self.subTest(module=path.name):
-                # Every module that branches on RUL_SCHEMA must also know
-                # what an SOH artifact is, or an SOH run silently falls
-                # through to "cannot be visualized".
-                self.assertIn("RUL_SCHEMA", text)
+                # Every module that branches on the RUL family must also
+                # know what an SOH artifact is, or an SOH run silently
+                # falls through to "cannot be visualized".
+                self.assertTrue(
+                    any(name in text for name in rul_family),
+                    f"{path.name} names neither {' nor '.join(rul_family)}",
+                )
                 self.assertIn("SOH_SCHEMA", text)
 
     def test_the_artifact_preview_recognises_an_soh_payload(self) -> None:

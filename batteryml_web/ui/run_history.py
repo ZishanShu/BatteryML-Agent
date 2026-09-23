@@ -404,7 +404,6 @@ def _render_scientific_views(manifest: Dict[str, Any]) -> None:
     """
     from ..agent.result_views import (
         RUL_CYCLEWISE_SCHEMA,
-        RUL_SCHEMA,
         SCALAR_SCHEMAS,
         SOH_SCHEMA,
         TRAJECTORY_SCHEMA,
@@ -429,10 +428,14 @@ def _render_scientific_views(manifest: Dict[str, Any]) -> None:
 
     if views["schema"] in SCALAR_SCHEMAS:
         render_rul_figures(views["rul"])
-        # The cycle curve is drawn only for the schema that genuinely carries
-        # per-cell, per-cycle estimates; for a per-cell lifetime result the
-        # view refuses itself and the renderer says so quietly.
-        if views["schema"] in (RUL_SCHEMA, RUL_CYCLEWISE_SCHEMA):
+        # Only the cycle-wise schema. A scalar per-cell RUL result used to
+        # reach this too: the view refused itself, but the renderer still
+        # drew a disclosure headed "Cycle-wise RUL curve" to say so, and a
+        # reader scanning headings saw a cycle-wise curve announced on a run
+        # that has one lifetime estimate per cell. Saying nothing is the
+        # honest answer — there is no such view to offer and nothing for the
+        # reader to act on.
+        if views["schema"] == RUL_CYCLEWISE_SCHEMA:
             render_rul_cycle_figure(views["rul_cycles"])
         render_prediction_table(views["rul"])
     elif views["schema"] == SOH_SCHEMA:
@@ -959,7 +962,6 @@ def render_predictions_panel(manifest: Dict[str, Any]) -> None:
     )
     from ..agent.result_views import (
         RUL_CYCLEWISE_SCHEMA,
-        RUL_SCHEMA,
         SCALAR_SCHEMAS,
         SOH_SCHEMA,
         TRAJECTORY_SCHEMA,
@@ -991,7 +993,9 @@ def render_predictions_panel(manifest: Dict[str, Any]) -> None:
         )
         if preview["schema"] in SCALAR_SCHEMAS and preview["rul"]:
             render_rul_figures(preview["rul"])
-            if preview["schema"] in (RUL_SCHEMA, RUL_CYCLEWISE_SCHEMA):
+            # As above: the heading belongs only to an artifact that has the
+            # curve.
+            if preview["schema"] == RUL_CYCLEWISE_SCHEMA:
                 render_rul_cycle_figure(preview.get("rul_cycles") or {})
             render_prediction_table(preview["rul"])
         elif preview["schema"] == SOH_SCHEMA and preview.get("soh"):

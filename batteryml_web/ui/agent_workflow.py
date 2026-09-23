@@ -1655,7 +1655,6 @@ def _render_result_figures(result_context: dict[str, Any] | None) -> None:
         return
     from ..agent.result_views import (
         RUL_CYCLEWISE_SCHEMA,
-        RUL_SCHEMA,
         SCALAR_SCHEMAS,
         SOH_SCHEMA,
         TRAJECTORY_SCHEMA,
@@ -1680,9 +1679,11 @@ def _render_result_figures(result_context: dict[str, Any] | None) -> None:
         return
     if views["schema"] in SCALAR_SCHEMAS:
         render_rul_figures(views["rul"])
-        # Only for a RUL-family artifact, and drawn only when that artifact
-        # genuinely holds per-cell, per-cycle remaining-life estimates.
-        if views["schema"] in (RUL_SCHEMA, RUL_CYCLEWISE_SCHEMA):
+        # Only when the artifact genuinely holds per-cell, per-cycle
+        # remaining-life estimates. A scalar per-cell result gets no
+        # cycle-wise heading at all, rather than a disclosure explaining the
+        # absence of a view it was never going to have.
+        if views["schema"] == RUL_CYCLEWISE_SCHEMA:
             render_rul_cycle_figure(views["rul_cycles"])
         render_prediction_table(views["rul"])
     elif views["schema"] == SOH_SCHEMA:
