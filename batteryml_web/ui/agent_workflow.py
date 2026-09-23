@@ -125,6 +125,10 @@ from .feedback import (
     notify_success,
     plan_signature,
 )
+from ..agent.result_analysis import (
+    build_analysis_context,
+    render_analysis_markdown,
+)
 from .llm_state import is_llm_configured, llm_credentials, llm_settings_fingerprint
 from .progress_utils import get_safe_runtime_env
 
@@ -929,11 +933,30 @@ def _run_failure_details(
 
 
 def _explain_result(result_context: dict[str, Any]) -> None:
-    """Call the existing explanation path. Never called by opening a form."""
+    """Call the existing explanation path. Never called by opening a form.
+
+    The run's own manifest and its own prediction artifact are assembled
+    into the deterministic analysis context first, so the assistant reasons
+    from diagnostics and a gated benchmark reference rather than restating
+    the configuration back. The artifact is the one this run wrote; nothing
+    here searches for another.
+    """
+    run_context = st.session_state.get("agent_run_context")
+    manifest = run_context.get("manifest") if isinstance(run_context, dict) else None
+    analysis = build_analysis_context(
+        result_context,
+        manifest=manifest if isinstance(manifest, dict) else None,
+        artifact_path=result_context.get("predictions_file"),
+        run_id=str((manifest or {}).get("run_id") or ""),
+        run_dir=str(result_context.get("workspace") or ""),
+    )
     try:
-        parsed = explain_run_result(result_context, **llm_credentials())
+        parsed = explain_run_result(
+            result_context, analysis_context=analysis, **llm_credentials()
+        )
         st.session_state.pop("agent_explanation_failure", None)
-        st.session_state["agent_explanation"] = explanation_text(parsed)
+        st.session_state["agent_explanation"] = render_analysis_markdown(parsed)
+        st.session_state["agent_benchmark"] = analysis.get("benchmark")
         # Which configuration produced this text. Stored so a later provider
         # or model change cannot leave an old answer labelled as the new
         # model's work; the panel shows the label it was generated under.

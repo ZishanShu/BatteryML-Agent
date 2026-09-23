@@ -13,6 +13,12 @@ import streamlit as st
 import torch
 
 from batteryml_web.agent.failure_taxonomy import classify_llm_failure
+from batteryml_web.agent.result_agent import explain_run_result
+from batteryml_web.agent.result_analysis import (
+    build_analysis_context,
+    render_analysis_markdown,
+    result_context_from_analysis,
+)
 from batteryml_web.agent.llm_client import run_llm_prompt, save_llm_output
 from batteryml_web.agent.catalog import REQUEST_TEMPLATE_STRUCTURE
 from batteryml_web.agent.execution import build_run_command
@@ -58,6 +64,7 @@ from batteryml_web.ui.llm_state import (
 )
 from batteryml_web.core.project_context import resolve_project
 from batteryml_web.core.run_manager import get_run_manager
+from batteryml_web.core import run_manifest as rm
 from batteryml_web.core.run_manifest import find_run
 from batteryml_web.core.selected_result import (
     SelectedResult,
@@ -1865,6 +1872,80 @@ def _selected_metrics_frame(selected: SelectedResult):
     )
 
 
+def _selected_analysis_context(selected: SelectedResult) -> dict[str, Any]:
+    """The deterministic analysis facts for the currently selected result.
+
+    Built from this run's own manifest and its own selected artifact — the
+    same identity the rest of the page describes. Nothing here searches the
+    project for a "latest" artifact, which is the substitution STEP 1
+    removed.
+    """
+    manifest = dict(selected.manifest or {})
+    metrics = manifest.get("metrics")
+    result_context = {
+        "dataset": manifest.get("dataset"),
+        "task": manifest.get("task"),
+        "model": manifest.get("model_key"),
+        "config_path": manifest.get("config_path"),
+        "workspace": selected.run_dir,
+        "run_status": manifest.get("status"),
+        "success": str(manifest.get("status") or "") == rm.STATUS_COMPLETED,
+        "metrics": dict(metrics) if isinstance(metrics, dict) else {},
+        "warnings": [],
+    }
+    return build_analysis_context(
+        result_context,
+        manifest=manifest,
+        artifact_path=selected.predictions_file,
+        run_id=selected.run_id,
+        run_dir=selected.run_dir,
+        project_name=selected.project_name,
+        identity_key=selected.identity_key(),
+    )
+
+
+def render_benchmark_panel(analysis: dict[str, Any]) -> None:
+    """The compact published reference, beside the run's own number.
+
+    Deterministic: the registry decides what is shown and whether a
+    difference may be computed. The assistant never supplies a published
+    value, and this panel is drawn whether or not an explanation was ever
+    requested.
+
+    Deliberately four lines, not the 14x8 table. The full table is a
+    reference, not something to re-read on every result page; it lives in
+    the details expander below.
+    """
+    block = analysis.get("benchmark") or {}
+    record = block.get("record")
+    if record is None:
+        st.caption(f"Published BatteryML reference: none. {block.get('explanation', '')}")
+        return
+
+    st.markdown("**Published BatteryML reference**")
+    left, right = st.columns(2)
+    with left:
+        st.write(f"Model: {record['model_key']}")
+        st.write(f"Dataset: {record['dataset_subset']}")
+        st.write(f"Metric: {record['metric']} ({record['unit']})")
+    with right:
+        seeds = f" over {record['seeds']} seeds" if record["seeds"] > 1 else ""
+        st.write(f"Reference: {record['display']} {record['unit']}{seeds}")
+        run_value = block.get("run_value")
+        st.write(
+            f"Current run: {run_value!r} {record['unit']}"
+            if run_value is not None
+            else "Current run: no comparable metric saved"
+        )
+        if block.get("comparable"):
+            difference = block.get("difference")
+            st.write(f"Difference: {difference:+.1f} {record['unit']}")
+        else:
+            st.write("Comparison: not directly comparable")
+    st.caption(block.get("explanation", ""))
+    st.caption(f"Source: {record['source']}")
+
+
 def _render_selected_result_header(selected: SelectedResult) -> None:
     """The compact identification block: which result is on screen.
 
@@ -1931,6 +2012,14 @@ def render_review_results_page():
         else {"log_files": [], "prediction_files": [], "metrics_files": []}
     )
 
+    # Deterministic, and drawn whether or not anyone asks for an
+    # explanation: the published reference and whether it may be compared
+    # are backend facts, not the assistant's to decide. Reading the artifact
+    # for diagnostics happens once here and the same object is handed to the
+    # prompt, so the page and the model never see different evidence.
+    selected_analysis = _selected_analysis_context(selected)
+    render_benchmark_panel(selected_analysis)
+
     btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
     with btn_col1:
         summarize_clicked = st.button("Summarize results", key="review_summarize_results", use_container_width=True)
@@ -1991,21 +2080,18 @@ Logs available: {'Yes' if run_files.get("log_files") else 'No'}
             set_llm_not_configured_message("review_llm_output")
             st.session_state["review_show_llm_settings"] = True
         else:
-            prompt = f'''
-Explain the following BatteryML evaluation metrics in plain language.
-Focus on what RMSE, MAE, and MAPE mean for RUL prediction, what lower or higher values mean, and whether metrics are available or missing.
-Do not recalculate or alter the metric values.
-Run ID: {selected.run_id or "Not available"}
-Task: {(selected.manifest or {}).get("task", "Not available")}
-Metrics:
-{metrics_df.to_string() if metrics_df is not None else "No metrics available"}
-'''
+            # The analysis path: deterministic facts first, then the prompt
+            # that asks for interpretation. It replaces an f-string that
+            # sent the metrics table and asked for "plain language",
+            # which is what made the answer a restatement.
+            analysis = selected_analysis
             try:
-                response = run_llm_prompt(
-                    prompt,
+                parsed = explain_run_result(
+                    result_context_from_analysis(analysis),
+                    analysis_context=analysis,
                     **llm_credentials(),
-                    system_prompt="You are an assistant for a BatteryML web protocol platform. Provide suggestions only. Do not modify raw data, metrics, predictions, or config files.",
                 )
+                response = render_analysis_markdown(parsed)
                 set_llm_connection_result(True, "LLM request completed.")
             except Exception as exc:
                 response = describe_llm_exception(exc)
