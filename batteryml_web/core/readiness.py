@@ -501,6 +501,7 @@ def assess_registry_model(
     task: str | None = None,
     repo_root: str | Path | None = None,
     registry: ConfigRegistry | None = None,
+    split_hint: str | None = None,
 ) -> ModelReadiness:
     """Readiness of one config-backed model from the live registries.
 
@@ -598,7 +599,42 @@ def assess_registry_model(
     valid = [(entry, report) for entry, report in validations if report.get("valid")]
 
     if valid and registered:
-        best_entry, best_report = valid[0]
+        from .config_registry import select_config_for_hint
+
+        selection = select_config_for_hint(
+            [entry for entry, _ in valid], split_hint
+        )
+        chosen = selection["entry"]
+        by_path = {entry.config_path.as_posix(): report for entry, report in valid}
+        if chosen is not None:
+            best_entry, best_report = chosen, by_path[chosen.config_path.as_posix()]
+            return ModelReadiness(
+                model=model_key,
+                model_display=display,
+                task=tasks[0] if tasks else TASK_RUL,
+                registered=True,
+                ready=True,
+                status=ModelStatus.READY,
+                missing=(),
+                reason=(
+                    f"Registered in MODELS ({', '.join(registered_names)}); config "
+                    f"{_display_path(best_entry.config_path)} passes the execution gate "
+                    f"with its declared data present ({', '.join(best_report.get('dataset_paths', [])) or 'n/a'})."
+                ),
+                recommended_action="Select this model's config and run it through the validated workflow.",
+                config_paths=tuple(entry.config_path.as_posix() for entry, _ in valid),
+                details={
+                    "validated_config": best_entry.config_path.as_posix(),
+                    "config_selection": selection["status"],
+                    "config_choices": [
+                        e.config_path.as_posix() for e in selection["choices"]
+                    ],
+                },
+            )
+        # Several distinct protocols (or an invalid explicit request): READY
+        # as a model, but with no validated config — the user must choose.
+        # Silently taking the first list item here is what once resolved
+        # "matr_1" to clo.yaml.
         return ModelReadiness(
             model=model_key,
             model_display=display,
@@ -607,14 +643,16 @@ def assess_registry_model(
             ready=True,
             status=ModelStatus.READY,
             missing=(),
-            reason=(
-                f"Registered in MODELS ({', '.join(registered_names)}); config "
-                f"{_display_path(best_entry.config_path)} passes the execution gate "
-                f"with its declared data present ({', '.join(best_report.get('dataset_paths', [])) or 'n/a'})."
-            ),
-            recommended_action="Select this model's config and run it through the validated workflow.",
+            reason=selection["message"],
+            recommended_action=selection["message"],
             config_paths=tuple(entry.config_path.as_posix() for entry, _ in valid),
-            details={"validated_config": best_entry.config_path.as_posix()},
+            details={
+                "validated_config": None,
+                "config_selection": selection["status"],
+                "config_choices": [
+                    e.config_path.as_posix() for e in selection["choices"]
+                ],
+            },
         )
 
     # Not ready: pick the config with the fewest errors and report honestly.
@@ -1054,6 +1092,7 @@ def get_workflow_context(
     task: str | None = None,
     *,
     repo_root: str | Path | None = None,
+    split_hint: str | None = None,
 ) -> dict[str, Any]:
     """The structured state the LLM agent must consult instead of guessing.
 
@@ -1099,7 +1138,7 @@ def get_workflow_context(
         # UNREGISTERED rows.
         model_keys = sorted({entry.model_key for entry in config_reg.entries})
         reports.extend(
-            assess_registry_model(key, dataset=dataset_name, task=normalized_task, repo_root=root, registry=config_reg)
+            assess_registry_model(key, dataset=dataset_name, task=normalized_task, repo_root=root, registry=config_reg, split_hint=split_hint)
             for key in model_keys
         )
     reports.extend(

@@ -77,6 +77,7 @@ def build_agent_workflow_context(
     task: str | None = None,
     *,
     repo_root: str | Path | None = None,
+    split_hint: str | None = None,
 ) -> Dict[str, Any]:
     """Compact deterministic workflow readiness for the LLM agent.
 
@@ -98,7 +99,7 @@ def build_agent_workflow_context(
     """
     from ..core.readiness import ModelStatus, get_workflow_context
 
-    context = get_workflow_context(dataset, task, repo_root=repo_root)
+    context = get_workflow_context(dataset, task, repo_root=repo_root, split_hint=split_hint)
     data = context.get("dataset", {})
 
     runnable: List[Dict[str, Any]] = []
@@ -113,6 +114,9 @@ def build_agent_workflow_context(
                 "model_display": item.get("model_display"),
                 "status": item.get("status"),
                 "validated_config": validated_config,
+                "config_selection": details.get("config_selection") or "chosen",
+                "config_choices": list(details.get("config_choices") or []),
+                "config_message": item.get("recommended_action"),
             }
         )
     runnable.sort(key=lambda entry: str(entry.get("model_display") or entry.get("model")))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -133,6 +134,12 @@ class ConfigEntry:
     split_label: str
     config_path: Path
     metadata: dict[str, Any] = field(default_factory=dict)
+    #: Canonical split identity (``matr_primary``, ``matr_secondary``,
+    #: ``matr_clo``, ...), derived from the splitter class the config
+    #: declares — not from the filename. Two configs with different
+    #: ``split_key`` values are different evaluation protocols, even when
+    #: they share dataset, task and model.
+    split_key: str = ""
 
     @property
     def config_exists(self) -> bool:
@@ -178,7 +185,8 @@ class ConfigRegistry:
         split_label = self._split_label(split_preset)
         if not (dataset and task and model_key and split_preset):
             return None
-        return ConfigEntry(dataset, task, model_key, model_display, split_preset, split_label, path, {"yaml": data})
+        split_key = self._infer_split_key(data, path)
+        return ConfigEntry(dataset, task, model_key, model_display, split_preset, split_label, path, {"yaml": data}, split_key)
 
     #: Datasets a config's ``cell_data_path`` may name. Order is irrelevant
     #: now that matching is structural; it was not when this searched the
@@ -355,6 +363,25 @@ class ConfigRegistry:
             "official_matr_split_2": "Official BatteryML split 2",
         }.get(preset, preset.replace("_", " ").title())
 
+    #: Splitter class name (lowercased, from the config's
+    #: ``train_test_split.name``) -> canonical split identity. The splitter
+    #: *is* the evaluation protocol, so it — never the filename — decides
+    #: which protocol a config runs. Unknown splitters fall back to the
+    #: config stem, which keeps every non-MATR config selectable exactly as
+    #: before.
+    _SPLIT_KEY_BY_SPLITTER = {
+        "matrprimarytesttraintestsplitter": "matr_primary",
+        "matrsecondarytesttraintestsplitter": "matr_secondary",
+        "matrclotesttraintestsplitter": "matr_clo",
+    }
+
+    def _infer_split_key(self, data: dict[str, Any], path: Path) -> str:
+        split = data.get("train_test_split", {}) if isinstance(data, dict) else {}
+        name = str(split.get("name", "") or "").strip().lower() if isinstance(split, dict) else ""
+        if name in self._SPLIT_KEY_BY_SPLITTER:
+            return self._SPLIT_KEY_BY_SPLITTER[name]
+        return path.stem.lower()
+
     def get_entries(self, dataset: str | None = None, task: str | None = None) -> list[ConfigEntry]:
         entries = self.entries
         if dataset:
@@ -393,3 +420,134 @@ class ConfigRegistry:
 @lru_cache(maxsize=1)
 def get_config_registry(repo_root: str | None = None) -> ConfigRegistry:
     return ConfigRegistry(Path(repo_root) if repo_root else None).build()
+
+
+#: Explicit user phrasings -> canonical split identity. Centralized here so
+#: the intent layer, the planner and the UI resolve "primary test split"
+#: identically. Only exact, verified aliases are listed — never fuzzy
+#: substrings against YAML text.
+SPLIT_ALIASES: dict[str, str] = {
+    "matr_1": "matr_primary",
+    "matr1": "matr_primary",
+    "matr 1": "matr_primary",
+    "primary": "matr_primary",
+    "primary test": "matr_primary",
+    "primary test split": "matr_primary",
+    "matr primary test split": "matr_primary",
+    "matr_2": "matr_secondary",
+    "matr2": "matr_secondary",
+    "matr 2": "matr_secondary",
+    "secondary": "matr_secondary",
+    "secondary test": "matr_secondary",
+    "secondary test split": "matr_secondary",
+    "matr secondary test split": "matr_secondary",
+    "clo": "matr_clo",
+    "clo split": "matr_clo",
+    "matr clo": "matr_clo",
+}
+
+_SPLIT_HINT_PATTERNS = sorted(SPLIT_ALIASES, key=len, reverse=True)
+
+_EXPLICIT_CONFIG_RE = re.compile(r"\b([a-z0-9_]+)\.yaml\b")
+_MATR_N_RE = re.compile(r"\bmatr[_.\- ]?(\d+)\b")
+
+
+def resolve_split_hint(text: str) -> str | None:
+    """Canonical split identity explicitly named in ``text``, if any.
+
+    Matches only the verified aliases in :data:`SPLIT_ALIASES` (longest
+    first, word-boundaried). Returns None when the request names no split —
+    a generic request must stay generic so the caller can ask the user to
+    choose instead of guessing.
+    """
+    lowered = f" {str(text or '').lower()} "
+    for phrase in _SPLIT_HINT_PATTERNS:
+        if f" {phrase} " in lowered or re.search(r"\b" + re.escape(phrase) + r"\b", lowered):
+            return SPLIT_ALIASES[phrase]
+    return None
+
+
+def hint_mentions_config_or_split(text: str) -> bool:
+    """Whether ``text`` reaches for a specific config/split at all.
+
+    Used to tell "the user named something that matches nothing" (a
+    deterministic error) apart from "the user named nothing" (ambiguity).
+    Signals are structural — a ``.yaml`` filename, a ``matr_N`` token, or
+    the words split/config/protocol — never dataset or model names.
+    """
+    lowered = str(text or "").lower()
+    if _EXPLICIT_CONFIG_RE.search(lowered):
+        return True
+    if _MATR_N_RE.search(lowered):
+        return True
+    return any(
+        word in lowered
+        for word in ("split", "config", "protocol", "primary", "secondary", "clo")
+    )
+
+
+def select_config_for_hint(
+    entries: list[ConfigEntry], hint_text: str | None
+) -> dict[str, Any]:
+    """Deterministically choose among one model's validated configs.
+
+    Returns ``{"status", "entry", "choices", "message"}`` where status is
+    one of:
+
+    ``chosen``
+        Exactly one protocol exists, or the request explicitly named the
+        protocol that was chosen. ``entry`` is the winner.
+    ``ambiguous``
+        Several protocols exist and the request named none. ``entry`` is
+        None and ``choices`` lists every candidate — the caller must ask
+        the user, never silently take the first list item.
+    ``invalid``
+        The request reached for a config/split that matches nothing.
+        ``entry`` is None and no fallback is applied.
+    ``empty``
+        No candidates at all.
+    """
+    choices = sorted(entries, key=lambda e: e.config_path.as_posix())
+    if not choices:
+        return {"status": "empty", "entry": None, "choices": [], "message": "No configs registered."}
+    distinct = sorted({e.split_key for e in choices})
+    if hint_text:
+        hint = resolve_split_hint(hint_text)
+        if hint is not None:
+            matched = [e for e in choices if e.split_key == hint]
+            if matched:
+                return {
+                    "status": "chosen",
+                    "entry": matched[0],
+                    "choices": choices,
+                    "message": f"Explicit split request resolved to {matched[0].config_path.name}.",
+                }
+        if hint_mentions_config_or_split(hint_text):
+            names = ", ".join(e.config_path.name for e in choices)
+            return {
+                "status": "invalid",
+                "entry": None,
+                "choices": choices,
+                "message": (
+                    f"The requested config/split matches none of the registered configs ({names}). "
+                    "Select one of the listed configs instead."
+                ),
+            }
+    if len(distinct) == 1:
+        only = [e for e in choices if e.split_key == distinct[0]]
+        return {
+            "status": "chosen",
+            "entry": only[0],
+            "choices": choices,
+            "message": f"Single registered protocol ({only[0].config_path.name}).",
+        }
+    names = ", ".join(e.config_path.name for e in choices)
+    return {
+        "status": "ambiguous",
+        "entry": None,
+        "choices": choices,
+        "message": (
+            "Several distinct evaluation protocols are registered "
+            f"({names}). No default is assumed; select one explicitly."
+        ),
+    }

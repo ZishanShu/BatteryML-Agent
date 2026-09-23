@@ -148,7 +148,9 @@ def guide_workflow(
             "guidance": intent["message"],
         }
 
-    workflow_context = build_agent_workflow_context(dataset, task, repo_root=repo_root)
+    workflow_context = build_agent_workflow_context(
+        dataset, task, repo_root=repo_root, split_hint=user_request
+    )
     prompt = build_workflow_guidance_prompt(user_request, workflow_context)
     prompt_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -205,7 +207,9 @@ def workflow_guidance_preview(
             ],
             "guidance": None,
         }
-    workflow_context = build_agent_workflow_context(dataset, task, repo_root=repo_root)
+    workflow_context = build_agent_workflow_context(
+        dataset, task, repo_root=repo_root, split_hint=user_request
+    )
     prompt = build_workflow_guidance_prompt(user_request, workflow_context)
     return {
         "dataset": dataset,

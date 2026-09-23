@@ -1100,7 +1100,7 @@ def _analyze_request(trimmed: str) -> None:
         return
 
     context = build_agent_workflow_context(
-        str(resolution["dataset"]), str(resolution["task"])
+        str(resolution["dataset"]), str(resolution["task"]), split_hint=trimmed
     )
     _store_json_state("agent_workflow_context", context)
 
@@ -1909,6 +1909,49 @@ def render_agent_workflow() -> None:
         if device_value is not None:
             device = str(device_value)
             st.session_state["agent_device"] = device
+            # Several distinct evaluation protocols may be registered for one
+            # model (MATR+CNN: clo / matr_1 / matr_2). The backend never
+            # picks one silently; when the request named none, the user
+            # chooses here from validated configs only. An explicit request
+            # ("matr_1", "primary test split") arrives pre-resolved and the
+            # control opens on that config.
+            runnable_entry = next(
+                (
+                    item
+                    for item in (context.get("runnable_models") or [])
+                    if str(item.get("model")) == str(selected_key)
+                ),
+                None,
+            )
+            entry_choices = list(((runnable_entry or {}).get("config_choices") or []))
+            entry_resolved = str(((runnable_entry or {}).get("validated_config") or ""))
+            explicit_config: str | None = None
+            if len(entry_choices) > 1 and not entry_resolved:
+                config_options = [NO_SELECTION] + entry_choices
+                chosen_config = st.selectbox(
+                    "Config — evaluation protocol (validated only)",
+                    config_options,
+                    index=0,
+                    format_func=lambda path: (
+                        "— select a config —"
+                        if path == NO_SELECTION
+                        else Path(path).name
+                    ),
+                    key=f"agent_config_choice_{selected_key}",
+                )
+                if not chosen_config or chosen_config == NO_SELECTION:
+                    st.session_state.pop("agent_selected_config", None)
+                    st.info(
+                        "Several evaluation protocols can run for this model. "
+                        "Select one of the validated configs above to build an "
+                        "execution plan — none is chosen for you."
+                    )
+                else:
+                    explicit_config = str(chosen_config)
+                    st.session_state["agent_selected_config"] = explicit_config
+            elif entry_resolved:
+                explicit_config = None
+                st.session_state["agent_selected_config"] = entry_resolved
             # The run this page is about to create. Reserved (not created):
             # minting happens once a runnable plan exists so the id can be
             # shown before Run, and the directory and manifest appear only
@@ -1939,6 +1982,10 @@ def render_agent_workflow() -> None:
                     smoke=smoke,
                 ),
                 epochs=smoke_epochs_value(smoke),
+                # The user's explicit protocol choice, if they made one; the
+                # planner validates it against the runnable candidates and
+                # refuses anything outside them.
+                config_path=explicit_config,
             )
             _store_json_state("agent_execution_plan", plan)
             run_context = build_run_context(

@@ -249,6 +249,8 @@ def build_execution_plan(
     workflow_context: Optional[Dict[str, Any]] = None,
     epochs: int | None = None,
     resume_from: str | None = None,
+    split_hint: str | None = None,
+    config_path: str | None = None,
 ) -> Dict[str, Any]:
     """Build a validated, non-executing run plan for one model.
 
@@ -301,7 +303,9 @@ def build_execution_plan(
     context = (
         workflow_context
         if workflow_context is not None
-        else build_agent_workflow_context(dataset, task, repo_root=repo_root)
+        else build_agent_workflow_context(
+            dataset, task, repo_root=repo_root, split_hint=split_hint
+        )
     )
     dataset_status = str(context.get("dataset_status") or "UNKNOWN")
     resolved_task = str(context.get("task") or task)
@@ -349,7 +353,39 @@ def build_execution_plan(
         }
 
     validated = entry.get("validated_config")
+    choices = [str(c) for c in (entry.get("config_choices") or []) if c]
+    selection = str(entry.get("config_selection") or "chosen")
+    if validated and str(validated) not in choices:
+        choices = [str(validated)] + choices
+    if config_path is not None:
+        # Explicit user selection (e.g. the workflow config dropdown). It is
+        # authoritative only inside the runnable candidate set — anything
+        # else is refused, never silently replaced.
+        if str(config_path) not in choices:
+            return {
+                "dataset": dataset,
+                "task": resolved_task,
+                "model": model_key,
+                "model_display": entry.get("model_display"),
+                "model_status": model_status,
+                "dataset_status": dataset_status,
+                "config_path": None,
+                "config_valid": False,
+                "can_execute": False,
+                "validation_errors": [],
+                "command": None,
+                "config_choices": choices,
+                "reason": (
+                    f"Selected config {config_path!r} is not one of the validated "
+                    f"configs for model {model_key!r} "
+                    f"({', '.join(choices) or 'none'}); execution is refused."
+                ),
+            }
+        validated = str(config_path)
     if not validated:
+        # Ambiguous protocols or an invalid explicit request: the model is
+        # READY but no config may be picked silently. The UI offers
+        # ``config_choices``; the run stays disabled until one is chosen.
         return {
             "dataset": dataset,
             "task": resolved_task,
@@ -360,9 +396,11 @@ def build_execution_plan(
             "config_path": None,
             "config_valid": False,
             "can_execute": False,
-            "validation_errors": ["Runnable entry carries no validated_config."],
+            "validation_errors": [],
             "command": None,
-            "reason": f"Model {model_key!r} is READY but supplies no validated config.",
+            "config_choices": choices,
+            "config_selection": selection,
+            "reason": str(entry.get("config_message") or "Select a config explicitly."),
         }
 
     config_path = str(validated)
@@ -408,6 +446,8 @@ def build_execution_plan(
         "command": command,
         "epochs": epochs_value,
         "reason": reason,
+        "config_choices": choices,
+        "config_selection": selection,
     }
 
 
@@ -451,7 +491,9 @@ def plan_for_request(
             "command": None,
             "reason": intent["message"],
         }
-    context = build_agent_workflow_context(dataset, task, repo_root=repo_root)
+    context = build_agent_workflow_context(
+        dataset, task, repo_root=repo_root, split_hint=user_request
+    )
     mentioned = resolve_model_mention(user_request, context)
     if mentioned is None:
         runnable = [str(e.get("model")) for e in context.get("runnable_models", [])]
@@ -483,6 +525,7 @@ def plan_for_request(
         workspace=workspace,
         workflow_context=context,
         epochs=epochs,
+        split_hint=user_request,
     )
     plan["reason"] = f"Request resolved to dataset={dataset}, task={task}. " + str(plan.get("reason"))
     return plan

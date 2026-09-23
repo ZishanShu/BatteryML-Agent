@@ -222,10 +222,20 @@ def resolve_workflow_intent(text: str) -> Dict[str, Any]:
         )
     else:
         message = f"Resolved dataset={dataset}, task={task}."
+    from ..core.config_registry import hint_mentions_config_or_split, resolve_split_hint
+
+    requested_split = resolve_split_hint(text)
+    mentions_config = hint_mentions_config_or_split(text)
     return {
         "dataset": dataset,
         "task": task,
         "needs_dataset_clarification": needs_dataset,
         "needs_task_clarification": needs_task,
         "message": message,
+        #: Canonical split identity explicitly named in the request
+        #: (``matr_primary`` / ``matr_secondary`` / ``matr_clo``), or None
+        #: for a generic request. ``mentions_config_or_split`` distinguishes
+        #: "named something that matches nothing" from "named nothing".
+        "requested_split": requested_split,
+        "mentions_config_or_split": mentions_config,
     }
