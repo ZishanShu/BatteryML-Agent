@@ -85,6 +85,19 @@ from batteryml_web.ui.run_history import (
 from batteryml_web.ui.settings_panel import render_configure_in_settings_notice
 from batteryml_web.ui.progress_utils import get_safe_runtime_env, run_command_with_progress
 from batteryml_web.ui.scroll import render_scroll_to_top
+from batteryml_web.ui.surfaces import (
+    command_viewport,
+    log_viewport,
+    render_info_card,
+    render_surface_css,
+)
+from batteryml_web.ui.tab_navigation import (
+    DATASET_OVERVIEW_TAB,
+    PREPARE_TABS,
+    VIEW_OVERVIEW_LABEL,
+    render_prepare_tabs,
+    request_tab,
+)
 from batteryml_web.ui.errors import error_boundary, render_copy_control
 from batteryml_web.ui.workflow_sidebar import NAV_STEPS, get_current_step_index, render_sidebar_workflow, set_current_step
 from batteryml_web.core.readiness import assess_dataset
@@ -940,11 +953,10 @@ def render_prepare_data_page():
     # disagree about which dataset was being prepared. The dataset is chosen
     # once and the flow runs top to bottom: dataset → readiness → preprocess
     # → log → inspection. No step was dropped in the merge.
-    tabs = st.tabs([
-        "Dataset Overview",
-        "Preprocess & Inspect",
-        "Custom Dataset / Schema Mapping",
-    ])
+    # Built through the helper so a jump from the preprocess tab can open
+    # the overview tab. The labels live in one place, so a button and the
+    # tab it opens cannot drift apart.
+    tabs = render_prepare_tabs(PREPARE_TABS)
 
     datasets = _ui_dataset_options()
 
@@ -1127,16 +1139,16 @@ def render_prepare_data_page():
                 for idx, p in enumerate(feature_files[:10]):
                     with cards[idx % 2]:
                         stat = p.stat()
-                        st.markdown(
-                            f"""
-                            <div style="border:1px solid rgba(255,255,255,0.12); border-radius:14px; padding:12px; min-height:110px;">
-                                <div style="font-weight:700; word-break:break-all;">{p.name}</div>
-                                <div style="font-size:0.85rem; opacity:0.85; margin-top:6px;">Type: {p.suffix or 'unknown'}</div>
-                                <div style="font-size:0.85rem; opacity:0.85;">Size: {stat.st_size} bytes</div>
-                                <div style="font-size:0.75rem; opacity:0.75; word-break:break-all; margin-top:6px;">Path: {p}</div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
+                        # Escaped by the helper: these are file names read
+                        # off disk, and one containing "<" would otherwise
+                        # reshape the page.
+                        render_info_card(
+                            p.name,
+                            [
+                                f"Type: {p.suffix or 'unknown'}",
+                                f"Size: {stat.st_size} bytes",
+                                f"Path: {p}",
+                            ],
                         )
                 st.write("**Feature / cache / artifact files:**")
                 st.code("\n".join(str(p) for p in feature_files[:30]), language="text")
@@ -1146,6 +1158,23 @@ def render_prepare_data_page():
                 st.info("Feature information is not available yet. Run model or inspect BatteryML cache outputs.")
             if st.button("Go to Run Model", use_container_width=True, key="prep_go_run_model"):
                 set_current_step("run_model")
+
+        # Outside the dataset branch on purpose. The natural question at the
+        # end of this tab is "did that change the dataset's readiness?", and
+        # the answer is on the overview tab — which is just as true when
+        # preprocessing is unavailable, when the source is RAW_ONLY, and
+        # when no dataset is registered at all. That last case previously
+        # left the tab with nothing to do but re-read "No datasets
+        # available". It navigates only: no preprocessing is started, and
+        # nothing about readiness is read or written here.
+        st.markdown("---")
+        if st.button(
+            VIEW_OVERVIEW_LABEL,
+            use_container_width=True,
+            key="prep_view_dataset_overview",
+        ):
+            request_tab(DATASET_OVERVIEW_TAB)
+            st.rerun()
 
     with tabs[2]:
         st.caption("Upload raw cycling files exported from supported battery cyclers. Training and validation/test files must be uploaded separately. The platform will call BatteryML preprocessing before any training workflow is enabled.")
@@ -1567,7 +1596,19 @@ def render_run_model_page():
             with cols[idx % 2]:
                 status = "Ready" if info["ready"] else "Need preprocess" if info["raw_exists"] else "Missing raw"
                 color = "#1f7a3f" if info["ready"] else "#b26a00" if info["raw_exists"] else "#b42318"
-                st.markdown(f"<div style='border:1px solid {color}; border-radius:14px; padding:12px; margin-bottom:10px;'><b>{ds}</b><br>Raw files count: {info['raw_files']}<br>Processed files count: {info['processed_files']}<br><b>{status}</b></div>", unsafe_allow_html=True)
+                # A card, not a control. It used to carry a 1px solid
+                # border and a 14px radius directly above the "Select"
+                # button's 1px solid border and 8px radius, which is why
+                # the two read alike. The readiness colour is unchanged.
+                render_info_card(
+                    ds,
+                    [
+                        f"Raw files count: {info['raw_files']}",
+                        f"Processed files count: {info['processed_files']}",
+                    ],
+                    status=status,
+                    status_color=color,
+                )
                 if st.button(f"Select {ds}", key=f"run_select_{ds}", use_container_width=True):
                     st.session_state["selected_dataset"] = ds
                     st.rerun()
@@ -1684,7 +1725,12 @@ def render_run_model_page():
             device=st.session_state.get("selected_device", "cpu"),
             seed=st.session_state.get("run_seed", 0),
         )
-        st.code(" ".join(command), language="bash")
+        # Bounded above, not fixed: st.code scrolls horizontally rather
+        # than wrapping, so this command measured 54px at 1500px and the cap
+        # is a no-op there. It exists so the block cannot grow into a wall
+        # if a command or a viewport ever makes it wrap. The full command is
+        # untouched and Streamlit's copy control still copies all of it.
+        command_viewport().code(" ".join(command), language="bash")
         c1, c2 = st.columns([1, 2])
         with c1:
             if st.button("Explain this command", key="run_model_explain_command", use_container_width=True):
@@ -1737,7 +1783,11 @@ def render_run_model_page():
         st.write(f"**Return code:** {st.session_state.get('last_run_code', 'N/A')}")
         st.write(f"**Log path:** {log_path if log_path else 'Not available yet'}")
         log_tail = _safe_read_log_tail(log_path) if log_path else ""
-        st.code(log_tail or "Not available yet", language="text")
+        # The element that actually grew without bound: 200 lines of log
+        # measured 4510px. Capped to a scrolling viewport; nothing is
+        # truncated, and this stays the Logs tab — the command preview and
+        # the progress display are separate surfaces and remain so.
+        log_viewport().code(log_tail or "Not available yet", language="text")
         if st.session_state.get("last_run_code") in [139, -11] or "segmentation fault" in log_tail.lower():
             st.error("Native dependency crash / segmentation fault detected. Possible causes: xgboost, libomp, numpy, sklearn, torch, or cache incompatibility.")
         error_summary = "No error detected." if st.session_state.get("last_run_status") == "success" else (log_tail[-500:] if log_tail else "No logs available.")
@@ -2232,6 +2282,10 @@ Logs available: {'Yes' if run_files.get("log_files") else 'No'}
 # used to be defined here and shadowed the import, so the grouped navigation
 # in that module was dead code.
 render_sidebar_workflow()
+# Injected once per script run, beside the sidebar's own stylesheet. It is
+# its own module rather than an addition to ui/styles.py, which owns the
+# sidebar's tuned spacing and is deliberately left alone.
+render_surface_css()
 
 current_step = st.session_state.get("current_step", "home")
 

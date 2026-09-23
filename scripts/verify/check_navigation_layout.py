@@ -126,6 +126,23 @@ def _strip_docstrings(node: ast.AST) -> str:
 
 
 def _tab_labels(page: ast.FunctionDef) -> list[str] | None:
+    """The Prepare Data tab labels, wherever the page keeps them.
+
+    They were a literal list inside ``st.tabs([...])`` and are now
+    ``ui/tab_navigation.PREPARE_TABS``, so that a navigation action can name
+    the tab it opens without a second copy of the names drifting from the
+    first. Both spellings are read; UX-09's requirement is the labels, not
+    where they are declared.
+    """
+    from batteryml_web.ui.tab_navigation import PREPARE_TABS
+
+    for node in ast.walk(page):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "render_prepare_tabs"
+        ):
+            return list(PREPARE_TABS)
     for node in ast.walk(page):
         if (
             isinstance(node, ast.Call)

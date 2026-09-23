@@ -286,11 +286,34 @@ class TestPrepareDataIsOneFlow(unittest.TestCase):
         self.code = _code_of(page)
 
     def _tab_labels(self) -> list[str]:
+        """The Prepare Data tab labels, wherever the page now keeps them.
+
+        They used to be a literal list inside ``st.tabs([...])``. They moved
+        to ``ui/tab_navigation.PREPARE_TABS`` when the strip gained the
+        ability to open a chosen tab, because a jump has to name the tab it
+        opens and a second copy of the names would be a second thing to keep
+        in step. The contract this asserts — three tabs, these names, no
+        Preprocessing/Feature Inspection split — is unchanged; only where it
+        is written moved, so this follows it rather than pinning the page to
+        one spelling.
+        """
+        from batteryml_web.ui.tab_navigation import PREPARE_TABS
+
+        for node in ast.walk(self.page):
+            if not (
+                isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "render_prepare_tabs"
+            ):
+                continue
+            return list(PREPARE_TABS)
+
         for node in ast.walk(self.page):
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "tabs"
+                and node.args
+                and isinstance(node.args[0], ast.List)
             ):
                 return [
                     element.value
