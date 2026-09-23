@@ -71,10 +71,6 @@ from batteryml_web.core.selected_result import (
     cached_for,
     resolve_selected_result,
 )
-from batteryml_web.agent.prediction_diagnostics import (
-    artifact_diagnostics,
-    diagnostics_rows,
-)
 from batteryml_web.ui.run_history import (
     render_file_browser,
     render_predictions_panel,
@@ -2000,8 +1996,7 @@ def _render_selected_result_header(selected: SelectedResult) -> None:
     """The compact identification block: which result is on screen.
 
     Deliberately small — project, run id, model/dataset/task, run directory.
-    The exact artifact path and the artifact's own diagnostics live in the
-    details area below, not here.
+    The exact artifact path lives in the details area below, not here.
     """
     st.dataframe(
         selected.provenance_rows(), hide_index=True, use_container_width=True
@@ -2214,21 +2209,14 @@ Logs available: {'Yes' if run_files.get("log_files") else 'No'}
                     "run_id": selected.run_id,
                 }
             )
-            with st.expander("Artifact diagnostics", expanded=False):
-                st.caption(
-                    "What is stored in this exact file, at full precision and "
-                    "before any display formatting. Nothing here is a metric, "
-                    "and nothing is rounded, sorted or altered."
-                )
-                st.dataframe(
-                    diagnostics_rows(
-                        artifact_diagnostics(
-                            selected.predictions_file, run_id=selected.run_id
-                        )
-                    ),
-                    hide_index=True,
-                    use_container_width=True,
-                )
+            # The "Artifact diagnostics" disclosure that stood here was a
+            # developer view: counts, finite/non-finite, distinct, constant,
+            # min/max at full precision. It answered a question a reader of
+            # a result does not ask, so the normal Results UI no longer
+            # offers it. The module behind it
+            # (batteryml_web.agent.prediction_diagnostics) is untouched and
+            # still feeds the deterministic context that LLM Result Analysis
+            # reads; see batteryml_web/agent/result_analysis.py.
         else:
             st.info(selected.reason)
 
