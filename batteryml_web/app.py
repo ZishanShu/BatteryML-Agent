@@ -82,6 +82,8 @@ from batteryml_web.ui.settings_panel import render_configure_in_settings_notice
 from batteryml_web.ui.progress_utils import get_safe_runtime_env, run_command_with_progress
 from batteryml_web.ui.scroll import render_scroll_to_top
 from batteryml_web.ui.surfaces import (
+    NAV_ROLE,
+    PRIMARY_ROLE,
     command_viewport,
     log_viewport,
     render_info_card,
@@ -201,7 +203,10 @@ st.markdown(
     --app-muted: rgba(128, 128, 128, 0.95);
     --app-card-bg: rgba(128, 128, 128, 0.055);
     --app-card-bg-strong: rgba(128, 128, 128, 0.095);
-    --app-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+    /* No shadow variable any more. Elevation is an interaction cue — it
+       says "this floats above the page and can be pressed" — and the only
+       two users of the old `--app-shadow` were read-outs: the readiness
+       tile and the pipeline tile. Information sits *in* the page. */
 }
 
 .llm-output-wrap {
@@ -209,13 +214,18 @@ st.markdown(
     margin-bottom: 1.6rem;
 }
 
+/* The assistant's answer is a read-out too, and the loudest one on the
+   page it appears on. Same geometry as every other information surface:
+   4px, hairline, left rule, no shadow, not a control. */
 .llm-output-card {
     width: 100%;
-    border-radius: 18px;
-    border: 1px solid var(--app-border);
+    border-radius: 4px;
+    border: 1px solid var(--app-border-soft);
+    border-left: 3px solid var(--app-border);
     padding: 1.15rem 1.25rem;
     background: var(--app-card-bg);
     box-sizing: border-box;
+    cursor: default;
 }
 
 .llm-output-header {
@@ -300,36 +310,59 @@ st.markdown(
     margin-bottom: 1.25rem;
 }
 
+/* The readiness tiles and the pipeline tiles are read-outs, and both used
+   to be drawn as large rounded boxes — 18px and 20px radius, a 1.5px
+   saturated border all the way round, and a drop shadow lifting them off
+   the page. That is the visual vocabulary of something you press. Measured
+   beside a button (1px border, 8px radius, no shadow) they were in fact
+   *louder* than the controls they sat above, which is why a reader could
+   not tell the readiness summary from "Select MATR".
+
+   They now follow the same rule as `.bml-info-card` in ui/surfaces.py: a
+   4px radius against a control's 8px, a neutral hairline, no shadow, and
+   `cursor: default`. The readiness colour is not thrown away — it moves to
+   a 3px rule on the left edge, the way a printed table marks a block —
+   so the state is still legible at a glance, and the status word below
+   keeps the same colour in bold for anyone who cannot see it. No button in
+   this app has an asymmetric left edge, so the shape alone now says
+   "read-out". */
 .dataset-card {
-    padding: 1.25rem 1.35rem;
-    border-radius: 18px;
-    border: 1.5px solid rgba(80, 160, 100, 0.85);
-    min-height: 280px;
+    padding: 1rem 1.1rem;
+    border-radius: 4px;
+    border: 1px solid var(--app-border-soft);
+    border-left: 3px solid var(--app-border);
     margin-bottom: 1rem;
     box-sizing: border-box;
     background: var(--app-card-bg);
-    box-shadow: var(--app-shadow);
+    cursor: default;
 }
 
 .dataset-card.ready {
-    border-color: rgba(55, 140, 80, 0.95);
+    border-left-color: rgba(55, 140, 80, 0.95);
 }
 
 .dataset-card.warning {
-    border-color: rgba(190, 130, 40, 0.95);
+    border-left-color: rgba(190, 130, 40, 0.95);
 }
 
 .dataset-card.missing {
-    border-color: rgba(190, 70, 70, 0.95);
+    border-left-color: rgba(190, 70, 70, 0.95);
 }
 
+/* 320px fixed, for a tile holding an icon and three short lines, spent a
+   third of the Prepare Data screen on five boxes of mostly air. The height
+   stays fixed — five tiles in a row must still line up, and letting them
+   size to content would stagger them — but at the height the content
+   actually needs. Measured from the parts: 2rem icon + 3.2rem title +
+   4.6rem description + the status line + 2.4rem of padding ≈ 226px. */
 .pipeline-card {
-    height: 320px;
-    min-height: 320px;
-    max-height: 320px;
-    border-radius: 20px;
-    border: 1.5px solid rgba(55, 140, 80, 0.95);
-    padding: 1.2rem 1rem;
+    height: 230px;
+    min-height: 230px;
+    max-height: 230px;
+    border-radius: 4px;
+    border: 1px solid var(--app-border-soft);
+    border-left: 3px solid var(--app-border);
+    padding: 1rem 0.9rem;
     box-sizing: border-box;
     display: flex;
     flex-direction: column;
@@ -337,7 +370,7 @@ st.markdown(
     align-items: center;
     text-align: center;
     background: var(--app-card-bg);
-    box-shadow: var(--app-shadow);
+    cursor: default;
 }
 
 .pipeline-icon {
@@ -451,10 +484,10 @@ def render_bottom_step_navigation():
     idx = get_current_step_index()
     prev_col, next_col = st.columns(2)
     with prev_col:
-        if st.button("← Prev", disabled=(idx == 0), use_container_width=True, key="bottom_prev_step"):
+        if st.button("← Prev", type=NAV_ROLE, disabled=(idx == 0), use_container_width=True, key="bottom_prev_step"):
             set_current_step(NAV_STEPS[idx - 1]["key"])
     with next_col:
-        if st.button("Next →", disabled=(idx == len(NAV_STEPS) - 1), use_container_width=True, key="bottom_next_step"):
+        if st.button("Next →", type=NAV_ROLE, disabled=(idx == len(NAV_STEPS) - 1), use_container_width=True, key="bottom_next_step"):
             set_current_step(NAV_STEPS[idx + 1]["key"])
 
 
@@ -521,7 +554,7 @@ def render_home_agent_entry() -> None:
         if st.button(USE_TEMPLATE_LABEL, key="home_use_template_button"):
             st.session_state["home_use_template"] = True
             st.rerun()
-    if st.button("Analyze with Agent", use_container_width=True, key="home_agent_analyze"):
+    if st.button("Analyze with Agent", type=PRIMARY_ROLE, use_container_width=True, key="home_agent_analyze"):
         trimmed = str(request or "").strip()
         if not trimmed:
             st.warning(
@@ -600,7 +633,7 @@ def render_home_page():
         project_folder = Path(base_dir) / (project_name.strip() or "my_battery_project")
         st.caption("Project folder")
         st.code(str(project_folder), language="text")
-        if st.button("Create New Project", use_container_width=True, key="home_create_project"):
+        if st.button("Create New Project", type=PRIMARY_ROLE, use_container_width=True, key="home_create_project"):
             created = _ensure_project(project_name, base_dir)
             # The filesystem semantics are unchanged; only the confirmation is
             # new. Stored rather than printed because the rerun below would
@@ -621,7 +654,7 @@ def render_home_page():
             folder = DEFAULT_BASE_DIR / selected
             st.caption("Project folder")
             st.code(str(folder), language="text")
-            if st.button("Load Project", use_container_width=True, key="home_load_project"):
+            if st.button("Load Project", type=PRIMARY_ROLE, use_container_width=True, key="home_load_project"):
                 st.session_state["project_root"] = str(folder)
                 st.session_state["project_name"] = selected
                 st.session_state["current_project"] = selected
@@ -647,7 +680,7 @@ def render_home_page():
             st.info("No existing project found yet.")
             st.caption("Project folder")
             st.code("runs/web_projects/<project_name>", language="text")
-            st.button("Load Project", disabled=True, use_container_width=True, key="home_load_disabled")
+            st.button("Load Project", type=PRIMARY_ROLE, disabled=True, use_container_width=True, key="home_load_disabled")
 
     # The rule belongs to the notice, not to the page: with an assistant
     # configured the notice draws nothing, and an unconditional rule here
@@ -688,7 +721,7 @@ def render_home_page():
         st.error("Raw dataset missing: data/raw/MATR")
     if not processed_path.exists():
         st.error("Processed dataset missing: data/processed/MATR. Please go to Prepare Data and run preprocessing first.")
-        if st.button("Go Prepare Data", use_container_width=True, key="home_go_prepare_data"):
+        if st.button("Go Prepare Data", type=NAV_ROLE, use_container_width=True, key="home_go_prepare_data"):
             set_current_step("prepare_data")
     if not config_path.exists():
         st.error("Config file missing: configs/baselines/sklearn/xgb/matr_1.yaml")
@@ -707,7 +740,7 @@ def render_home_page():
                 int(st.session_state.get("quickstart_loaded_serial", 0)) + 1
             )
     with q2:
-        if st.button("Run MATR Demo", use_container_width=True, key="home_run_matr_demo", disabled=not preflight_ok):
+        if st.button("Run MATR Demo", type=PRIMARY_ROLE, use_container_width=True, key="home_run_matr_demo", disabled=not preflight_ok):
             workspace_root = project_root or Path("runs/web_projects/default")
             workspace_dir = workspace_root / "workspace"
             log_path = workspace_root / "logs" / "matr_demo.log"
@@ -766,7 +799,7 @@ def render_home_page():
     render_home_agent_entry()
 
     st.markdown("---")
-    if st.button("Start workflow →", use_container_width=True, key="home_start_workflow"):
+    if st.button("Start workflow →", type=NAV_ROLE, use_container_width=True, key="home_start_workflow"):
         set_current_step("prepare_data")
 
 
@@ -1005,7 +1038,7 @@ def render_prepare_data_page():
                 status_text = "Ready" if active else "Pending"
                 st.markdown(
                     f"""
-                    <div class="pipeline-card" style="border-color: {color};">
+                    <div class="pipeline-card" style="border-left-color: {color};">
                         <div class="pipeline-icon">{icon}</div>
                         <div class="pipeline-title">{title}</div>
                         <div class="pipeline-desc">{desc}</div>
@@ -1040,7 +1073,7 @@ def render_prepare_data_page():
             if not info["raw_exists"]:
                 st.error("Raw data missing")
                 st.button(
-                    "Run preprocessing",
+                    "Run preprocessing", type=PRIMARY_ROLE,
                     disabled=True,
                     use_container_width=True,
                     key="prep_run_disabled",
@@ -1059,7 +1092,7 @@ def render_prepare_data_page():
                     "preprocessing is not enabled for this source yet."
                 )
                 st.button(
-                    "Run preprocessing",
+                    "Run preprocessing", type=PRIMARY_ROLE,
                     disabled=True,
                     use_container_width=True,
                     key="prep_run_unsupported",
@@ -1087,7 +1120,7 @@ def render_prepare_data_page():
                 )
 
                 if st.button(
-                    btn_label,
+                    btn_label, type=PRIMARY_ROLE,
                     use_container_width=True,
                     key="prep_run",
                 ):
@@ -1152,7 +1185,7 @@ def render_prepare_data_page():
                 st.info("Feature information is not available yet. Run model or inspect BatteryML cache outputs.")
             else:
                 st.info("Feature information is not available yet. Run model or inspect BatteryML cache outputs.")
-            if st.button("Go to Run Model", use_container_width=True, key="prep_go_run_model"):
+            if st.button("Go to Run Model", type=NAV_ROLE, use_container_width=True, key="prep_go_run_model"):
                 set_current_step("run_model")
 
         # Outside the dataset branch on purpose. The natural question at the
@@ -1165,7 +1198,7 @@ def render_prepare_data_page():
         # nothing about readiness is read or written here.
         st.markdown("---")
         if st.button(
-            VIEW_OVERVIEW_LABEL,
+            VIEW_OVERVIEW_LABEL, type=NAV_ROLE,
             use_container_width=True,
             key="prep_view_dataset_overview",
         ):
@@ -1188,7 +1221,7 @@ def render_prepare_data_page():
         train_uploaded = st.file_uploader("Upload training raw files", accept_multiple_files=True, key="custom_train_upload")
         valid_uploaded = st.file_uploader("Upload validation/test raw files", accept_multiple_files=True, key="custom_valid_upload")
         optional_config = st.file_uploader("Optional cycler config file", accept_multiple_files=False, key="custom_config_upload")
-        if st.button("Save uploads", use_container_width=True, key="custom_save_uploads"):
+        if st.button("Save uploads", type=PRIMARY_ROLE, use_container_width=True, key="custom_save_uploads"):
             if not source_format:
                 st.error("Please select a BatteryML-supported cycler format.")
             else:
@@ -1553,14 +1586,14 @@ def _render_run_model_without_datasets() -> None:
     prepare_col, home_col = st.columns(2)
     with prepare_col:
         if st.button(
-            "Go to Prepare Data",
+            "Go to Prepare Data", type=NAV_ROLE,
             use_container_width=True,
             key="run_empty_go_prepare_data",
         ):
             set_current_step("prepare_data")
     with home_col:
         if st.button(
-            "Go to Home",
+            "Go to Home", type=NAV_ROLE,
             use_container_width=True,
             key="run_empty_go_home",
         ):
@@ -1608,7 +1641,7 @@ def render_run_model_page():
                 if st.button(f"Select {ds}", key=f"run_select_{ds}", use_container_width=True):
                     st.session_state["selected_dataset"] = ds
                     st.rerun()
-        if st.button("Go Prepare Data", use_container_width=True, key="run_go_prepare_data"):
+        if st.button("Go Prepare Data", type=NAV_ROLE, use_container_width=True, key="run_go_prepare_data"):
             set_current_step("prepare_data")
 
     with tabs[0]:
@@ -1751,7 +1784,7 @@ def render_run_model_page():
         # side by side; only what the run draws moves out from under them.
         run_progress_host = st.container()
         with c2:
-            if st.button("Run BatteryML", disabled=not can_run, use_container_width=True, key="run_batteryml_btn"):
+            if st.button("Run BatteryML", type=PRIMARY_ROLE, disabled=not can_run, use_container_width=True, key="run_batteryml_btn"):
                 log_path = (_project_root() or Path("runs/web_projects/default")) / "logs" / "run_model.log"
                 result = run_command_with_progress(command=command, cwd=REPO_ROOT, log_path=log_path, steps=[(5, "Initialize"), (10, "Check dataset"), (20, "Load config"), (30, "Start BatteryML run"), (70, "Training/evaluation running"), (90, "Collect outputs"), (100, "Done")], container=run_progress_host)
                 st.session_state["last_run_status"] = "success" if result["success"] else "failed"
@@ -1767,7 +1800,7 @@ def render_run_model_page():
                         event_key=EVENT_RUN_COMPLETED,
                         signature=["run_model", str(workspace_dir), result["return_code"]],
                     )
-                    if st.button("Review Results →", use_container_width=True, key="run_go_results_after_run"):
+                    if st.button("Review Results →", type=NAV_ROLE, use_container_width=True, key="run_go_results_after_run"):
                         set_current_step("review_results")
         render_run_model_llm_output_panel("run_model_command_llm_output", "Command guidance", "Command guidance", "Command assistant")
         st.markdown("#### Output workspace")

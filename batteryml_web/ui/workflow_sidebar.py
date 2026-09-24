@@ -21,6 +21,7 @@ from ..core.project_context import resolve_project
 from .llm_state import llm_settings_summary
 from .settings_panel import render_sidebar_settings
 from .styles import render_layout_css
+from .surfaces import NAV_ROLE
 
 #: Ordered for Prev/Next. ``group`` decides where a step is drawn:
 #: ``home`` at the top, ``agent`` in its own block, ``workflow`` in the
@@ -162,7 +163,7 @@ def _nav_button(step: dict, current_step: str) -> None:
         if description:
             st.caption(description)
     else:
-        if st.button(label, key=f"sidebar_go_{step['key']}", use_container_width=True):
+        if st.button(label, type=NAV_ROLE, key=f"sidebar_go_{step['key']}", use_container_width=True):
             set_current_step(step["key"])
 
 
@@ -224,10 +225,10 @@ def render_sidebar_workflow():
         with st.container(key="sb_pager"):
             prev_col, next_col = st.columns(2)
             with prev_col:
-                if st.button("← Prev", disabled=(idx == 0), use_container_width=True, key="sidebar_prev_step"):
+                if st.button("← Prev", type=NAV_ROLE, disabled=(idx == 0), use_container_width=True, key="sidebar_prev_step"):
                     set_current_step(NAV_STEPS[idx - 1]["key"])
             with next_col:
-                if st.button("Next →", disabled=(idx == len(NAV_STEPS) - 1), use_container_width=True, key="sidebar_next_step"):
+                if st.button("Next →", type=NAV_ROLE, disabled=(idx == len(NAV_STEPS) - 1), use_container_width=True, key="sidebar_next_step"):
                     set_current_step(NAV_STEPS[idx + 1]["key"])
 
         with st.container(key="sb_foot"):

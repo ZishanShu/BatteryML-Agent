@@ -33,6 +33,7 @@ import streamlit as st
 from ..agent.failure_taxonomy import classify_llm_failure
 from ..agent.llm_client import test_llm_connection
 from .feedback import notify_success
+from .surfaces import PRIMARY_ROLE
 from .llm_state import (
     CUSTOM_PROVIDER,
     LLM_STATUS_NOT_CONFIGURED,
@@ -273,7 +274,20 @@ def render_llm_settings_form(
 
     columns = st.columns(2)
     action: Optional[str] = None
-    if columns[0].button(SAVE_LABEL, key=f"{key_prefix}_save", use_container_width=True):
+    # Save is this panel's primary action: it is the one that commits
+    # state. Connect stays secondary — it verifies what Save stored, and a
+    # panel with two filled buttons side by side ranks neither of them.
+    #
+    # The role is passed as `type=` rather than through
+    # `surfaces.primary_action`, because the helpers wrap `st.button` and
+    # this call goes through a column receiver. Same native parameter,
+    # same rendered `data-testid`, so the stylesheet treats it identically.
+    if columns[0].button(
+        SAVE_LABEL,
+        key=f"{key_prefix}_save",
+        type=PRIMARY_ROLE,
+        use_container_width=True,
+    ):
         # Stores only. Whether these credentials work is a separate question,
         # asked by Connect, so saving can never block on a network call.
         set_llm_settings(base_url, api_key, model, provider=provider)

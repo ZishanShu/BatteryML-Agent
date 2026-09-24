@@ -450,11 +450,42 @@ class TestNoSidebarRegression(unittest.TestCase):
             f"ui/styles.py was modified:\n{result.stdout}",
         )
 
-    def test_the_surface_stylesheet_does_not_reach_the_sidebar(self) -> None:
-        """Nothing here may re-tune the sidebar's spacing by accident."""
-        self.assertNotIn("stSidebar", surfaces.SURFACE_CSS)
+    def test_the_surface_stylesheet_does_not_retune_the_sidebar(self) -> None:
+        """Nothing here may re-tune the sidebar's spacing by accident.
+
+        This used to forbid the string ``stSidebar`` outright. That was a
+        proxy for the real rule and it had stopped matching it in both
+        directions:
+
+        * too weak — the role rules key off ``stBaseButton-*``, which
+          applies to the sidebar's own navigation buttons without the word
+          ``stSidebar`` appearing anywhere. A sheet could restyle the whole
+          sidebar and still pass.
+        * too strong — it rejected a sidebar-scoped rule that sets only
+          ``justify-content``/``text-align`` to left-align a navigation
+          label, which cannot move a single pixel of the tuned rhythm.
+
+        So the assertion now names the thing it protects: no rule in this
+        sheet, sidebar-scoped or not, may set a spacing property inside the
+        sidebar. The header band, block gap, brand margin and gutters stay
+        the exclusive business of ``ui/styles.py``.
+        """
         for tuned in ("stSidebarHeader", "stVerticalBlock", "gap:"):
             self.assertNotIn(tuned, surfaces.SURFACE_CSS)
+
+        css = re.sub(r"/\*.*?\*/", "", surfaces.SURFACE_CSS, flags=re.S)
+        for block in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+            selector, body = block.group(1), block.group(2)
+            if "stSidebar" not in selector:
+                continue
+            for prop in ("padding", "margin", "height", "gap", "line-height"):
+                with self.subTest(selector=selector.strip()[-60:], prop=prop):
+                    self.assertNotRegex(
+                        body,
+                        rf"(^|[;\s]){prop}\s*:",
+                        f"a sidebar-scoped rule sets {prop}; spacing belongs "
+                        "to ui/styles.py",
+                    )
 
 
 if __name__ == "__main__":  # pragma: no cover

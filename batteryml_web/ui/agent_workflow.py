@@ -131,6 +131,7 @@ from ..agent.result_analysis import (
 )
 from .llm_state import is_llm_configured, llm_credentials, llm_settings_fingerprint
 from .progress_utils import get_safe_runtime_env
+from .surfaces import PRIMARY_ROLE
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -1752,7 +1753,7 @@ def render_agent_workflow() -> None:
             # it does: no analysis, no LLM call, no plan, no execution.
             st.session_state[USE_TEMPLATE_KEY] = True
             st.rerun()
-    if st.button("Analyze", key="agent_analyze", use_container_width=True):
+    if st.button("Analyze", type=PRIMARY_ROLE, key="agent_analyze", use_container_width=True):
         if not str(request or "").strip():
             st.error("Enter a workflow request before analyzing.")
         else:
@@ -2053,6 +2054,7 @@ def render_agent_workflow() -> None:
             # again" once this page has executed something, so a second run
             # is visibly offered rather than looking like the first.
             RUN_AGAIN_BUTTON_LABEL if _has_executed(st.session_state) else RUN_BUTTON_LABEL,
+            type=PRIMARY_ROLE,
             disabled=not run_is_enabled(plan),
             use_container_width=True,
             key="agent_run",

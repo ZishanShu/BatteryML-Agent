@@ -39,6 +39,7 @@ import streamlit as st
 
 from ..agent.failure_taxonomy import redact
 from .feedback import toast
+from .surfaces import NAV_ROLE
 
 #: Shown as the headline for any caught error. Deliberately plain: the user
 #: needs to know the app failed, not which module did.
@@ -126,7 +127,7 @@ def render_copy_control(
     if not text:
         return False
     revealed_key = f"{key}__revealed"
-    pressed = st.button(label, key=key, use_container_width=False)
+    pressed = st.button(label, type=NAV_ROLE, key=key, use_container_width=False)
     if pressed:
         st.session_state[revealed_key] = True
     if not st.session_state.get(revealed_key):
