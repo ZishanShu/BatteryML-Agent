@@ -1,3 +1,16 @@
+<div align="center">
+
+### 🔋 Looking to deploy BatteryML-Agent (the web platform)?
+
+**Step-by-step setup guide → [English](./README_AGENT.md) · [简体中文](./README_AGENT.zh-CN.md)**
+
+Written for battery researchers. No ML background, no GPU required.
+*The page below is the upstream BatteryML paper documentation.*
+
+</div>
+
+---
+
 <div align="center">  
   <img src="./image/Logo_RGB.png" width="300"> 
 </div>  
