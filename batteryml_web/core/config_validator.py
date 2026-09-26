@@ -56,6 +56,34 @@ TASK_BY_ANNOTATOR = {
 PROCESSED_GLOB = "*.pkl"
 
 
+def _extension_key(model_name: str) -> str:
+    """The extension module name behind a registered predictor class name.
+
+    Reuses ``config_registry.MODEL_CLASS_KEYS`` — the table the rest of the
+    platform already uses for this mapping — rather than keeping a second
+    copy that could drift from it. An unknown class name yields "", which
+    matches no extension.
+    """
+    from .config_registry import MODEL_CLASS_KEYS
+
+    return MODEL_CLASS_KEYS.get(str(model_name).strip().lower(), "")
+
+
+def _unavailable_external_models() -> Dict[str, str]:
+    """Extensions skipped because their vendored source is absent, if any.
+
+    Never raises: this only enriches an error message, so a failure to
+    import the models package must not replace a useful validation error
+    with an unrelated traceback.
+    """
+    try:
+        from ..models import unavailable_extension_models
+
+        return dict(unavailable_extension_models())
+    except Exception:  # noqa: BLE001 - message enrichment only, see docstring
+        return {}
+
+
 @lru_cache(maxsize=1)
 def _load_registries() -> tuple[Dict[str, frozenset], str | None]:
     """Registered names per registry, or the reason they cannot be read.
@@ -271,15 +299,33 @@ def validate_config(
     if registry_error is not None:
         errors.append(registry_error)
     else:
+        unavailable = _unavailable_external_models()
         for section_name, registry_attr in SECTION_REGISTRY.items():
             registered = registries.get(registry_attr, frozenset())
             for name in _section_names(config.get(section_name)):
-                if name not in registered:
+                if name in registered:
+                    continue
+                # "Not registered" is true but misleading for a model whose
+                # wrapper is present and correct and whose *vendored source*
+                # was never cloned: it sends the reader to fix a config or
+                # write an implementation, when the actual action is to
+                # vendor a third-party repository. Name the real cause.
+                source = unavailable.get(_extension_key(name))
+                if source is not None:
                     errors.append(
-                        f"`{section_name}.name` = {name!r} is not registered in "
-                        f"{registry_attr}. Registered: "
-                        f"{', '.join(sorted(registered)) or '(none)'}."
+                        f"`{section_name}.name` = {name!r} is unavailable in this "
+                        f"checkout: it wraps a third-party source that is not "
+                        f"vendored here ({source} is missing, and third_party/ is "
+                        f"gitignored). The config and the wrapper are both fine. "
+                        f"Vendor that repository to enable this model, or use one "
+                        f"of the models that need no external source."
                     )
+                    continue
+                errors.append(
+                    f"`{section_name}.name` = {name!r} is not registered in "
+                    f"{registry_attr}. Registered: "
+                    f"{', '.join(sorted(registered)) or '(none)'}."
+                )
 
     # --- data readiness ---------------------------------------------------
     dataset_paths = _declared_paths(config)

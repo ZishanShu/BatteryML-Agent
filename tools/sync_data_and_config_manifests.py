@@ -5,7 +5,18 @@ import re
 import shutil
 import subprocess
 
-ROOT = Path("/root/share/szs/BatteryML").resolve()
+# This checkout, not a fixed machine. The path here used to be the absolute
+# location of one developer's server, so on anyone else's clone the two
+# manifests below were written outside the repository — and the web UI, which
+# reads data/metadata/dataset_manifest.json and nothing else to learn what
+# datasets exist, showed "No datasets are available yet" no matter how much
+# data had been preprocessed.
+#
+# parents[1] because this file is tools/<name>.py, so its parent is tools/
+# and its grandparent is the repository root. BATTERYML_ROOT overrides it for
+# the case this tool was presumably written for: metadata for a checkout other
+# than the one holding the script.
+ROOT = Path(os.environ.get("BATTERYML_ROOT", Path(__file__).resolve().parents[1])).resolve()
 RAW = ROOT / "data" / "raw"
 V12 = RAW / "BatteryLife" / "v12"
 META = ROOT / "data" / "metadata"

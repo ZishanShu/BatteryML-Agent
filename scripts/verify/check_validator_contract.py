@@ -41,6 +41,36 @@ CHECK_NAME = "validator_contract"
 NON_RUN_DIRS = ("cyclers",)
 
 
+def _extension_key_of(path) -> str:
+    """The extension module a config's ``model.name`` belongs to, or "".
+
+    Parses the YAML directly rather than trusting the validator's error
+    text: matching on a message string would break the moment the wording
+    changed, and the wording is exactly what this check is improving.
+    """
+    try:
+        import yaml
+
+        from batteryml_web.core.config_registry import MODEL_CLASS_KEYS
+
+        loaded = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+        model = loaded.get("model")
+        name = model.get("name") if isinstance(model, dict) else None
+        return MODEL_CLASS_KEYS.get(str(name or "").strip().lower(), "")
+    except Exception:  # noqa: BLE001 - classification only, never fail here
+        return ""
+
+
+def _unavailable_external_models() -> dict[str, str]:
+    """Extensions skipped because their vendored third-party source is absent."""
+    try:
+        from batteryml_web.models import unavailable_extension_models
+
+        return dict(unavailable_extension_models())
+    except Exception:  # noqa: BLE001 - classification only
+        return {}
+
+
 def check(output_dir: Path | None = None) -> CheckResult:
     """Run the real validator over every config and report what it refuses."""
     root = repo_root()
@@ -95,7 +125,10 @@ def check(output_dir: Path | None = None) -> CheckResult:
 
     accepted: list[str] = []
     refused: list[dict[str, Any]] = []
+    gated_on_external: list[dict[str, Any]] = []
     with_warnings: list[dict[str, Any]] = []
+
+    unavailable = _unavailable_external_models()
 
     for path in paths:
         report = validator.load_and_validate_config_file(path, require_data=False)
@@ -103,7 +136,21 @@ def check(output_dir: Path | None = None) -> CheckResult:
         if report.get("valid"):
             accepted.append(relative)
         else:
-            refused.append({"config": relative, "errors": list(report.get("errors", []))})
+            # Two different things look identical here, and only one is a
+            # contract violation. This check exists to catch the gate
+            # *drifting* from the registries — refusing something the
+            # pipeline could actually build. A model whose vendored
+            # third-party source was never cloned cannot be built by anyone,
+            # so refusing it is the gate working correctly, not drift.
+            # Separated rather than ignored: it is still counted and still
+            # named in the summary.
+            source = unavailable.get(_extension_key_of(path))
+            entry = {"config": relative, "errors": list(report.get("errors", []))}
+            if source is not None:
+                entry["requires"] = source
+                gated_on_external.append(entry)
+            else:
+                refused.append(entry)
         warnings = list(report.get("warnings", []))
         if warnings:
             with_warnings.append({"config": relative, "warnings": warnings})
@@ -118,6 +165,7 @@ def check(output_dir: Path | None = None) -> CheckResult:
         "run_config_count": len(paths),
         "accepted_count": len(accepted),
         "refused": refused,
+        "gated_on_external_source": gated_on_external,
         "warnings": with_warnings,
         "accepted": accepted,
     }
@@ -128,6 +176,7 @@ def check(output_dir: Path | None = None) -> CheckResult:
         "accepted_count": len(accepted),
         "refused_count": len(refused),
         "refused": refused,
+        "gated_on_external_source": gated_on_external,
         "warning_count": len(with_warnings),
         "registered_counts": payload["registered_counts"],
     }
@@ -150,9 +199,18 @@ def check(output_dir: Path | None = None) -> CheckResult:
         CHECK_ID,
         CHECK_NAME,
         PASS,
-        f"The execution gate accepts all {len(paths)} run config(s) "
+        f"The execution gate accepts all {len(paths) - len(gated_on_external)} "
+        f"buildable run config(s) of {len(paths)} "
         f"[{len(registries.get('MODELS', ()))} models registered]. "
-        f"{len(with_warnings)} carry warnings, which do not block a run.",
+        f"{len(with_warnings)} carry warnings, which do not block a run. "
+        + (
+            f"{len(gated_on_external)} config(s) are correctly refused because a "
+            f"third-party source is not vendored here "
+            f"({', '.join(sorted({entry['requires'] for entry in gated_on_external}))}); "
+            f"see evidence.gated_on_external_source."
+            if gated_on_external
+            else "No config is gated on an unvendored third-party source."
+        ),
         evidence,
         artifacts,
     )

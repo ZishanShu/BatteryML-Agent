@@ -66,7 +66,29 @@ EXTENSION_MODULES: tuple[str, ...] = (
     "batlinet",
 )
 
+#: Extension modules that wrap a repository vendored under ``third_party/``,
+#: mapped to the one file whose absence proves the source was never vendored.
+#:
+#: These directories are gitignored, so a fresh clone does not carry them.
+#: Before this table existed, ``cptransformer`` raised ``FileNotFoundError``
+#: at import time, :func:`register_extension_models` turned that into an
+#: ``ExtensionRegistrationError``, and ``run_batteryml_cli.py`` turned *that*
+#: into ``SystemExit(2)`` — so one absent optional wrapper stopped the entire
+#: command line, XGBoost and every other model with it. A fresh clone could
+#: not run at all.
+#:
+#: Declared here rather than discovered by catching an exception, for the
+#: same reason :data:`EXTENSION_MODULES` is a list rather than a glob: what
+#: the platform treats as optional should be readable in one place, and the
+#: check must not need the heavy module (torch, sklearn) to be importable.
+#: A module that is present but broken still fails loudly — only a *declared*
+#: and *demonstrably absent* external source is skipped.
+EXTERNAL_SOURCES: dict[str, str] = {
+    "cptransformer": "third_party/BatteryLife/models/CPTransformer.py",
+}
+
 _PACKAGE_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _PACKAGE_DIR.parents[1]
 
 
 class ExtensionRegistrationError(RuntimeError):
@@ -75,6 +97,32 @@ class ExtensionRegistrationError(RuntimeError):
     Raised instead of letting the pipeline fail later with an unrelated
     ``KeyError`` from the registry lookup.
     """
+
+
+def unavailable_extension_models(
+    repo_root: str | Path | None = None,
+) -> dict[str, str]:
+    """Declared extensions whose vendored third-party source is absent.
+
+    Pure and cheap: it reads :data:`EXTERNAL_SOURCES` and looks at the
+    filesystem. Nothing is imported, so this answers "is CPTransformer
+    available here?" in an environment where torch is not installed.
+
+    Args:
+        repo_root: repository root to resolve the declared paths against.
+            Defaults to this checkout. A parameter rather than a global so
+            the behaviour is checkable without moving files around.
+
+    Returns:
+        ``{model_name: repo-relative path that is missing}``, empty when
+        every declared external source is present.
+    """
+    root = Path(repo_root) if repo_root else _REPO_ROOT
+    return {
+        name: relative
+        for name, relative in EXTERNAL_SOURCES.items()
+        if name in EXTENSION_MODULES and not (root / relative).is_file()
+    }
 
 
 def extension_module_files() -> list[Path]:
@@ -134,8 +182,17 @@ def register_extension_models() -> list[str]:
             f"helper rather than a model."
         )
 
+    # Checked before importing anything: an extension whose vendored source
+    # was never cloned is *absent*, not *broken*, and skipping it is what
+    # keeps every other model runnable on a fresh checkout. This is the only
+    # tolerated skip — it needs a declaration in EXTERNAL_SOURCES and a file
+    # that is provably not on disk. Any other import failure still raises.
+    unavailable = unavailable_extension_models()
+
     imported: list[str] = []
     for module_name in EXTENSION_MODULES:
+        if module_name in unavailable:
+            continue
         qualified = f"{__name__}.{module_name}"
         try:
             importlib.import_module(qualified)

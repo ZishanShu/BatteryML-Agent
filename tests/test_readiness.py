@@ -59,13 +59,49 @@ def _registry_status_reason() -> str | None:
         return f"{type(exc).__name__}: {exc}"
 
 
-REGISTRY_SKIP_REASON = _registry_status_reason()
-REGISTRIES_AVAILABLE = REGISTRY_SKIP_REASON is None
+def _demo_data_reason() -> str | None:
+    """Why the MATR demo cannot be exercised here, or None when it can.
+
+    The tests behind this gate assert that a model is READY and that its
+    plan is executable. Both require the processed demo dataset: without
+    it every readiness report is ``NEEDS_DATA`` and every plan is blocked,
+    so the assertions fail for a reason that has nothing to do with what
+    they are testing.
+
+    This used to be covered by accident. ``register_extension_models()``
+    aborted on any checkout without ``third_party/BatteryLife``, so the
+    registry gate below was closed and these tests skipped — in an
+    environment that also happened to have no data. Registration no longer
+    aborts for one un-vendored optional model, which is the point of that
+    fix, so the data requirement has to be stated in its own right.
+    """
+    processed = REPO_ROOT / "data" / "processed" / "MATR"
+    if not processed.is_dir():
+        return (
+            f"{processed.relative_to(REPO_ROOT).as_posix()} does not exist. "
+            "These tests assert a runnable MATR demo; preprocess it first "
+            "(see README.md §7)."
+        )
+    if not any(processed.glob("*.pkl")):
+        return (
+            f"{processed.relative_to(REPO_ROOT).as_posix()} holds no *.pkl "
+            "cell file, so no model can be READY here."
+        )
+    return None
+
+
+#: Why the MATR demo environment is unusable here, or None when it is usable.
+#:
+#: Two independent requirements, reported separately because they have
+#: different fixes: the registries must be readable, and the processed demo
+#: data must be on disk.
+DEMO_ENVIRONMENT_SKIP_REASON = _registry_status_reason() or _demo_data_reason()
+DEMO_ENVIRONMENT_AVAILABLE = DEMO_ENVIRONMENT_SKIP_REASON is None
 
 #: What ``skipUnless`` prints, naming the actual blocker.
-REGISTRY_SKIP_MESSAGE = (
-    "the BatteryML registries cannot be read here: "
-    f"{(REGISTRY_SKIP_REASON or '')[:300]}"
+DEMO_ENVIRONMENT_SKIP_MESSAGE = (
+    "the MATR demo cannot be exercised here: "
+    f"{(DEMO_ENVIRONMENT_SKIP_REASON or '')[:300]}"
 )
 
 
@@ -165,7 +201,7 @@ class TestDatasetReadiness(unittest.TestCase):
 class TestRegistryModelReadiness(unittest.TestCase):
     """CPTransformer and BatLiNet must stay READY and registered (regression)."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_cptransformer_ready(self) -> None:
         report = assess_registry_model("cptransformer", dataset="MATR", task="RUL prediction")
 
@@ -175,7 +211,7 @@ class TestRegistryModelReadiness(unittest.TestCase):
         self.assertEqual(report.missing, ())
         self.assertTrue(any("configs/external/cptransformer" in p for p in report.config_paths))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_batlinet_ready(self) -> None:
         report = assess_registry_model("batlinet", dataset="MATR", task="RUL prediction")
 
@@ -184,7 +220,7 @@ class TestRegistryModelReadiness(unittest.TestCase):
         self.assertIs(report.status, ModelStatus.READY)
         self.assertEqual(report.missing, ())
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_required_classes_registered(self) -> None:
         from batteryml_web.core.config_validator import registry_status
 
@@ -195,7 +231,7 @@ class TestRegistryModelReadiness(unittest.TestCase):
         self.assertIn("BatteryLifeCycleCurveFeatureExtractor", registries["FEATURE_EXTRACTORS"])
         self.assertIn("BatLiNetFeatureExtractor", registries["FEATURE_EXTRACTORS"])
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_matr_external_configs_pass_validator(self) -> None:
         from batteryml_web.core.config_validator import load_and_validate_config_file
 
@@ -209,7 +245,7 @@ class TestRegistryModelReadiness(unittest.TestCase):
                 f"{config} rejected by the execution gate: {report['errors']}",
             )
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_model_without_configs_is_unregistered(self) -> None:
         report = assess_registry_model("definitely_not_a_model_key")
 
@@ -218,7 +254,7 @@ class TestRegistryModelReadiness(unittest.TestCase):
         self.assertIs(report.status, ModelStatus.UNREGISTERED)
         self.assertTrue(report.missing)
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_assess_model_resolves_aliases(self) -> None:
         for name, expected in (("XGBoost", "xgb"), ("CPTransformerRULPredictor", "cptransformer")):
             report = assess_model(name, dataset="MATR")
@@ -373,7 +409,7 @@ class TestExternalModelReadiness(unittest.TestCase):
 class TestWorkflowContext(unittest.TestCase):
     """The agent-facing context for the primary worked case and the trajectory task."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_matr_rul_context(self) -> None:
         context = get_workflow_context("MATR", "RUL prediction")
 
@@ -390,7 +426,7 @@ class TestWorkflowContext(unittest.TestCase):
         self.assertNotIn("BatteryMFormer", available_keys)
         self.assertTrue(context["recommended_next_steps"])
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_trajectory_task_reports_batterymformer_blocked(self) -> None:
         context = get_workflow_context("MATR", "Degradation trajectory forecasting")
 
@@ -402,7 +438,7 @@ class TestWorkflowContext(unittest.TestCase):
         steps = " ".join(context["recommended_next_steps"])
         self.assertIn("trajectory", steps.lower())
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_raw_only_dataset_requests_preprocessing_first(self) -> None:
         context = get_workflow_context("CALCE", "RUL prediction")
 
@@ -410,14 +446,14 @@ class TestWorkflowContext(unittest.TestCase):
         steps = " ".join(context["recommended_next_steps"])
         self.assertIn("preprocess", steps.lower())
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_default_dataset_is_matr_and_task_prefixes_are_folded(self) -> None:
         context = get_workflow_context()
         self.assertEqual(context["dataset"]["dataset"], "MATR")
         self.assertEqual(get_workflow_context("MATR", "RUL")["task"], "RUL prediction")
         self.assertEqual(get_workflow_context("MATR", "soh")["task"], "SOH estimation")
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_missing_dataset_reports_missing_state(self) -> None:
         context = get_workflow_context("__READINESS_TEST_MISSING_DATASET__", "RUL prediction")
 
@@ -433,7 +469,7 @@ class TestWorkflowContext(unittest.TestCase):
 class TestFullModelList(unittest.TestCase):
     """list_model_readiness must never present a blocked model as runnable."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_every_model_has_consistent_status_and_action(self) -> None:
         reports = list_model_readiness()
 

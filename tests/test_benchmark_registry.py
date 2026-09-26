@@ -1,7 +1,7 @@
 """The published benchmark values, and what they may be compared with.
 
 The registry is a transcription, so the first test here re-parses the table
-out of ``README.md`` and compares it cell by cell. That is the check that
+out of ``README_BATTERYML.md`` and compares it cell by cell. That is the check that
 matters: a hand-copied table is only as good as its last proofread, and this
 one is proofread on every test run.
 
@@ -25,14 +25,14 @@ from batteryml_web.core import benchmarks as bm  # noqa: E402
 
 
 def _readme_table() -> dict:
-    """The benchmark table as README.md currently prints it.
+    """The benchmark table as README_BATTERYML.md currently prints it.
 
     Labels keep their internal spaces (``Dummy regressor`` is two words);
     values lose all whitespace, because the README writes ``168±9`` and
     ``168 ± 9`` interchangeably and the spacing is not the fact.
     """
     rows = {}
-    for line in (REPO_ROOT / "README.md").read_text(encoding="utf-8").splitlines():
+    for line in (REPO_ROOT / "README_BATTERYML.md").read_text(encoding="utf-8").splitlines():
         if not line.strip().startswith("|"):
             continue
         raw = line.strip().strip("|").split("|")
@@ -53,7 +53,7 @@ class TestTheRegistryMatchesTheReadme(unittest.TestCase):
 
     def test_every_cell_matches_the_readme(self) -> None:
         readme = _readme_table()
-        self.assertTrue(readme, "no benchmark table found in README.md")
+        self.assertTrue(readme, "no benchmark table found in README_BATTERYML.md")
         for model_key, row_label in bm.ROW_BY_MODEL_KEY.items():
             with self.subTest(model=model_key):
                 self.assertIn(

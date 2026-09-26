@@ -33,8 +33,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tests.test_readiness import (  # noqa: E402
-    REGISTRIES_AVAILABLE,
-    REGISTRY_SKIP_MESSAGE,
+    DEMO_ENVIRONMENT_AVAILABLE,
+    DEMO_ENVIRONMENT_SKIP_MESSAGE,
 )
 from batteryml_web.agent.results import SMOKE_RUN_WARNING  # noqa: E402
 from batteryml_web.agent.run_policy import SMOKE_NOTICE  # noqa: E402
@@ -2807,26 +2807,26 @@ class TestNoFrontendDuplication(unittest.TestCase):
 class TestBackendPlanContractsUsedByTheUI(unittest.TestCase):
     """Registry-backed checks that the UI gate (can_execute) is correct."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_ready_models_produce_executable_plans(self) -> None:
         plan = self._plan("MATR", "RUL prediction", "cptransformer")
         self.assertTrue(ui.run_is_enabled(plan), plan.get("reason"))
         self.assertEqual(plan["model"], "cptransformer")
         self.assertTrue(plan["config_path"].endswith("configs/external/cptransformer/matr_1.yaml"))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_blocked_pbt_plan_disabled(self) -> None:
         plan = self._plan("MATR", "RUL prediction", "PBT")
         self.assertFalse(ui.run_is_enabled(plan))
         self.assertTrue(plan["command"] in (None, []))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_trajectory_batterymformer_never_rul_executable(self) -> None:
         plan = self._plan("MATR", "Degradation trajectory forecasting", "BatteryMFormer")
         self.assertFalse(ui.run_is_enabled(plan))
         self.assertTrue(plan["command"] in (None, []))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_mich_raw_only_plan_disabled_and_without_command(self) -> None:
         plan = self._plan("MICH", "RUL prediction", "cptransformer")
         self.assertEqual(plan["dataset_status"], "RAW_ONLY")
@@ -2834,7 +2834,7 @@ class TestBackendPlanContractsUsedByTheUI(unittest.TestCase):
         self.assertIsNone(plan["command"])
         self.assertNotIn("data/raw/MICH", str(plan))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_smoke_plan_command_carries_only_epochs_override(self) -> None:
         plan = self._plan("MATR", "RUL prediction", "cptransformer", epochs=1)
         self.assertTrue(ui.run_is_enabled(plan))

@@ -1,7 +1,7 @@
 """Published BatteryML RUL benchmark values, and when a run may be compared.
 
 **Provenance.** The table below is transcribed from this repository's own
-``README.md``, section *"Benchmark result of RUL(Remain Useful Life) task"*.
+``README_BATTERYML.md``, section *"Benchmark result of RUL(Remain Useful Life) task"*.
 It is not reproduced from anyone's memory of the paper, and
 ``tests/test_benchmark_registry.py`` re-parses that README on every run and
 fails if a single cell here drifts from it.
@@ -46,7 +46,7 @@ from typing import Dict, Optional, Tuple
 
 #: Where every value here comes from. Quoted in the UI beside the number.
 BENCHMARK_SOURCE = (
-    "BatteryML README.md, “Benchmark result of RUL(Remain Useful Life) "
+    "BatteryML README_BATTERYML.md, “Benchmark result of RUL(Remain Useful Life) "
     "task” (Zhang et al., ICLR 2024)"
 )
 
@@ -169,7 +169,7 @@ ROW_BY_MODEL_KEY: Dict[str, str] = {
     "transformer": "Transformer",
 }
 
-#: The table, transcribed from README.md in its own notation. Parsed below.
+#: The table, transcribed from README_BATTERYML.md in its own notation. Parsed below.
 #: Kept as the printed strings rather than as pre-split numbers so that the
 #: drift test can compare it against the README without re-deriving anything.
 _TABLE: Dict[str, Tuple[str, ...]] = {

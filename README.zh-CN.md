@@ -5,7 +5,7 @@
 **写给电池研究者的逐步部署教程。**
 不需要机器学习背景，不需要 GPU。
 
-[English](./README_AGENT.md) · **简体中文**
+[English](./README.md) · **简体中文**
 
 </div>
 
@@ -25,7 +25,7 @@ BatteryML-Agent 是建立在
 | **路线 B — 快速开始** | 点击网页界面，或运行一条命令行。完全确定性。 | **不需要。** 可离线运行。 |
 | **路线 A — LLM 辅助** | 一个可选助手，解释配置、报错与结果。 | 需要，但完全可选。 |
 
-**本指南只讲路线 B。** 助手放在最后（§10）作为附加内容。
+**本指南只讲路线 B。** 助手放在最后（§9）作为附加内容。
 即使你永远不配置它，也不会有任何功能失效——每个页面都能手动操作。
 
 > **助手永远不会产生任何数字。** 它不训练、不预测、不计算指标。
@@ -39,15 +39,14 @@ BatteryML-Agent 是建立在
 2. [获取代码](#2-获取代码)
 3. [创建 Python 环境](#3-创建-python-环境)
 4. [安装依赖](#4-安装依赖)
-5. [两处一次性修复](#5-两处一次性修复重要)
-6. [健康检查](#6-健康检查)
-7. [下载电池数据](#7-下载电池数据)
-8. [预处理数据](#8-预处理数据)
-9. [运行你的第一次预测](#9-运行你的第一次预测)
-10. [可选：LLM 助手](#10-可选llm-助手)
-11. [结果在哪里](#11-结果在哪里)
-12. [常见问题排查](#12-常见问题排查)
-13. [本指南的验证情况](#13-本指南的验证情况)
+5. [健康检查](#5-健康检查)
+6. [下载电池数据](#6-下载电池数据)
+7. [预处理数据](#7-预处理数据)
+8. [运行你的第一次预测](#8-运行你的第一次预测)
+9. [可选：LLM 助手](#9-可选llm-助手)
+10. [结果在哪里](#10-结果在哪里)
+11. [常见问题排查](#11-常见问题排查)
+12. [本指南的验证情况](#12-本指南的验证情况)
 
 ---
 
@@ -73,7 +72,7 @@ BatteryML-Agent 是建立在
 | 第 8 步（预处理 MATR） | 10–30 分钟 |
 | 第 9 步（第一次预测） | CPU 上 1–5 分钟 |
 
-> 下载与预处理时间是**估计值，不是实测值**，取决于你的网络和磁盘。见 §13。
+> 下载与预处理时间是**估计值，不是实测值**，取决于你的网络和磁盘。见 §12。
 
 ### 关于终端
 
@@ -180,73 +179,7 @@ all imports OK
 
 ---
 
-## 5. 两处一次性修复（重要）
-
-全新克隆的仓库有两个坑会卡住你，每个都只需一行。
-**请在继续之前完成**，否则第 6–9 步会报出让人摸不着头脑的错误。
-
-### 修复 1 — 可选的 CPTransformer 模型会让命令行完全无法启动
-
-仓库登记了一个模型（`cptransformer`），
-但它的源码位于另一个**没有包含在本仓库里**的项目中。
-因此 BatteryML 的命令行会直接拒绝启动：
-
-```
-error: Could not import extension model module batteryml_web.models.cptransformer:
-FileNotFoundError: BatteryLife CPTransformer source not found: .../third_party/BatteryLife/models/CPTransformer.py
-```
-
-除非你确实需要 CPTransformer，否则把它禁用：
-
-```bash
-# 重命名该模块，使它被当作辅助文件而不是模型
-mv batteryml_web/models/cptransformer.py batteryml_web/models/_cptransformer.py
-
-# 从已注册模型列表中移除它
-python - <<'PY'
-from pathlib import Path
-p = Path("batteryml_web/models/__init__.py")
-s = p.read_text()
-p.write_text(s.replace('    "cptransformer",\n', ''))
-print("cptransformer disabled")
-PY
-```
-
-验证命令行现在可以启动了：
-
-```bash
-python batteryml_web/core/run_batteryml_cli.py run --help
-```
-
-期望结果：出现以 `usage: BatteryML command line utilities. run [-h] ...` 开头的用法说明，
-并且**没有** error 行。
-其他所有模型——XGBoost、随机森林、Ridge、SVM、variance / discharge 模型、BatLiNet——都不受影响。
-
-### 修复 2 — 数据清单工具指向的是别人机器上的路径
-
-`tools/sync_data_and_config_manifests.py` 目前写死了原作者服务器上的绝对路径。
-在你的机器上它会把文件写到错误的位置，导致网页界面**永远显示没有数据集**。
-把它改成指向你自己的仓库：
-
-```bash
-python - <<'PY'
-from pathlib import Path
-p = Path("tools/sync_data_and_config_manifests.py")
-s = p.read_text()
-old = 'ROOT = Path("/root/share/szs/BatteryML").resolve()'
-new = 'ROOT = Path(__file__).resolve().parents[1]'
-assert old in s, "可能已经改过了，或文件有变动——请手动检查第 8 行"
-p.write_text(s.replace(old, new, 1))
-print("manifest tool now uses this repository as its root")
-PY
-```
-
-> 如果命令报 `AssertionError`，请打开文件查看第 8 行。
-> 要么这个修复已经被应用过，要么那一行位置变了。
-
----
-
-## 6. 健康检查
+## 5. 健康检查
 
 在接触任何数据之前，先确认安装是正常的：
 
@@ -258,10 +191,9 @@ python -m scripts.verify.run_all
 在**刚装好、还没有数据**的情况下，出现下面这些是正常且符合预期的：
 
 ```
-[SKIP] DATA-01 dataset_status: data does not exist, so no dataset has raw or processed files...
 [SKIP] SPLIT-01 split_requirements: data/processed does not exist...
 ...
-X passed, Y failed, 3 skipped of 13 check(s)
+X passed, Y failed, 1 skipped of 13 check(s)
 ```
 
 **此阶段你真正该关注的：**
@@ -269,16 +201,22 @@ X passed, Y failed, 3 skipped of 13 check(s)
 | 检查项 | 应该是 | 如果不是 |
 | --- | --- | --- |
 | `ENV-01 environment` | `[PASS]`，或 `[FAIL]` 并指出缺哪个包 | 按提示安装后重跑 |
-| `CLI-01 cli_contract` | `[PASS]` | 你跳过了 §5 的**修复 1** |
-| `EXT-01 extension_contract` | `[PASS]` | 你跳过了 §5 的**修复 1** |
-| `DATA-01`、`SPLIT-01`、`VAL-01` | `[SKIP]` | 正常——你还没有数据 |
+| `CLI-01 cli_contract` | `[PASS]` | 安装不完整，重做第 4 步 |
+| `EXT-01 extension_contract` | `[PASS]` | 同上 |
+| `CFG-01 config_validity` | `[PASS]` | 阅读提示信息，它会指出是哪个配置 |
+| `SPLIT-01` | `[SKIP]` | 正常——你还没有数据 |
+
+> **有一条提示你会看到，可以忽略。** `VAL-01` 会报告有 1 个配置
+> 「correctly refused because a third-party source is not vendored here」。
+> 那是 `CPTransformer`——一个可选的深度模型，它的网络代码位于另一个仓库，
+> 本仓库不包含。这对你没有任何影响：其他所有模型（XGBoost、随机森林、
+> Ridge、SVM、CNN、variance / discharge 模型、BatLiNet）都能正常运行，
+> 本指南的示例也不使用它。
 
 逐项说明见 [`docs/VERIFY.md`](./docs/VERIFY.md)。
 机器可读的报告会写到 `runs/verify/verification_report.json`。
 
----
-
-## 7. 下载电池数据
+## 6. 下载电池数据
 
 我们使用 **MATR**（MIT/Toyota 的 LFP 数据集，180 个电芯）——本平台的参考示例。
 
@@ -310,7 +248,7 @@ ls -lh data/raw/MATR
 
 ---
 
-## 8. 预处理数据
+## 7. 预处理数据
 
 原始循环仪文件并不是模型直接读取的格式。
 这一步把它们转换成 BatteryML 统一的 `BatteryData` 格式。
@@ -328,7 +266,7 @@ ls data/processed/MATR | wc -l
 
 期望输出：**180**——每个电芯一个 `.pkl` 文件。
 
-然后生成网页界面读取的清单文件（这就是修复 2 的意义所在）：
+然后生成网页界面读取的清单文件——Dataset Overview 页面列出的就是它：
 
 ```bash
 python tools/sync_data_and_config_manifests.py
@@ -356,7 +294,7 @@ print('present datasets:', [x['name'] for x in d if x.get('status') == 'present'
 
 ---
 
-## 9. 运行你的第一次预测
+## 8. 运行你的第一次预测
 
 两种方式，效果相同。
 
@@ -420,7 +358,7 @@ SOH 的结果也永远不能和 RUL 的基准比较。
 
 ---
 
-## 10. 可选：LLM 助手
+## 9. 可选：LLM 助手
 
 **如果你只想要预测结果，可以完全跳过本节。** 上面所有内容都不依赖它。
 
@@ -440,7 +378,7 @@ SOH 的结果也永远不能和 RUL 的基准比较。
 
 ---
 
-## 11. 结果在哪里
+## 10. 结果在哪里
 
 每一次运行——无论来自网页界面还是命令行——都会写入
 `runs/web_projects/<项目名>/`：
@@ -472,16 +410,16 @@ report.html
 
 ---
 
-## 12. 常见问题排查
+## 11. 常见问题排查
 
 | 你看到的报错 | 含义 | 解决办法 |
 | --- | --- | --- |
 | `ModuleNotFoundError: ... 'batteryml' is not a package` | 你直接运行了 `python bin/batteryml.py` | 改用 `python batteryml_web/core/run_batteryml_cli.py ...` |
-| `error: Could not import extension model module ... cptransformer` | 缺少可选的第三方源码 | 执行 §5 的**修复 1** |
+| `error: Could not import extension model module ... cptransformer` | 旧版本的代码；现在这不会再阻断 CLI | `git pull`；CPTransformer 是可选的，会被自动跳过 |
 | `unrecognized arguments: --config` | `config` 是位置参数 | 写 `run configs/....yaml`，不要写 `run --config ...` |
 | 运行后只打印 workspace 路径就退出了 | 缺少 `--train --eval` | 补上这两个参数 |
-| `AssertionError: data/processed/MATR` | 没有执行预处理 | 执行 §8。这**不是**网页层的 bug |
-| 网页显示「No datasets are available yet」 | 清单缺失，或被写到了别的路径 | 执行 §5 的**修复 2**，再重跑 `python tools/sync_data_and_config_manifests.py` |
+| `AssertionError: data/processed/MATR` | 没有执行预处理 | 执行 §7。这**不是**网页层的 bug |
+| 网页显示「No datasets are available yet」 | 预处理之后没有重新生成清单 | 运行 `python tools/sync_data_and_config_manifests.py`，再点 **Refresh datasets** |
 | `[FAIL] ENV-01 ... not installed: fire` | 声明的依赖没装上 | `pip install fire`，或重新执行 `pip install -r requirements.txt` |
 | 远程服务器上浏览器打不开 | Streamlit 只绑定了 localhost | 用 SSH 端口转发，或加 `--server.address 0.0.0.0` |
 | `CUDA out of memory` | 模型超出显存 | 加 `--device cpu`。本示例不需要 GPU |
@@ -492,24 +430,25 @@ report.html
 
 ---
 
-## 13. 本指南的验证情况
+## 12. 本指南的验证情况
 
 这里把话说清楚，因为一份夸大自己测试范围的教程只会浪费你的时间。
 
 **在干净的 Linux 容器（Python 3.11）里真实运行并验证过：**
 
 - `pip install -r requirements.txt` 以及 §4 的导入自检
-- §5 的两处修复，包括
-  `run_batteryml_cli.py run --help` 修复前后的对比（退出码 2 → 0）
-- `python -m scripts.verify.run_all`（§6）
-- 应用修复 2 之后运行 `python tools/sync_data_and_config_manifests.py`——
-  生成了 15 条数据集记录和 180 条模型配置记录（§8）
+- 在没有 `third_party/` 目录的克隆上运行
+  `python batteryml_web/core/run_batteryml_cli.py run --help`——可正常启动并打印用法
+- `python -m scripts.verify.run_all`（§5）：全新克隆、无数据时 13 项中有 10 项通过
+- 运行 `python tools/sync_data_and_config_manifests.py`——
+  生成了 15 条数据集记录和 180 条模型配置记录（§7）
 - `python -m streamlit run batteryml_web/app.py`，
-  并在真实浏览器中渲染了 §9 提到的每一个页面
+  并在真实浏览器中渲染了 §8 提到的每一个页面
+- 仓库自带的测试套件：1340 个测试，0 失败
 
 **未在此环境执行、依据代码与项目记录写出的部分：**
 
-- MATR 的下载（§7）与预处理（§8）。本环境没有下载任何数据集。
+- MATR 的下载（§6）与预处理（§7）。本环境没有下载任何数据集。
   文件名和「180」这个数量来自数据集登记与项目记录，不是实跑得到的。
 - 完整的训练/评估流程及其产生的 `metrics.csv`。
   334 个循环是**已发表的基准值**，不是这里实测出来的。
@@ -525,7 +464,7 @@ report.html
 
 | 文档 | 内容 |
 | --- | --- |
-| [`README.md`](./README.md) | 上游 BatteryML：论文、数据集、完整基准表 |
+| [`README_BATTERYML.md`](./README_BATTERYML.md) | 上游 BatteryML：论文、数据集、完整基准表 |
 | [`dataprepare.md`](./dataprepare.md) | 各数据集的手动准备方法 |
 | [`docs/VERIFY.md`](./docs/VERIFY.md) | 每一项验证检查证明了什么 |
 | [`docs/EXTENDING_MODELS.md`](./docs/EXTENDING_MODELS.md) | 如何接入你自己的模型 |

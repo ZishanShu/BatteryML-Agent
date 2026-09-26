@@ -27,17 +27,19 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-try:
-    from batteryml_web.core import readiness as readiness_mod
+# The shared gate, not a local one. This file used to check only that the
+# config registry could be read, which succeeds with no battery data on
+# disk — so these tests ran in an environment where every model reports
+# NEEDS_DATA, and failed on that rather than on the split logic they are
+# about. `test_readiness` states both requirements (registries readable,
+# processed MATR present) in one place; importing it keeps the two gates
+# from drifting apart again.
+from .test_readiness import (  # noqa: E402
+    DEMO_ENVIRONMENT_AVAILABLE,
+    DEMO_ENVIRONMENT_SKIP_MESSAGE,
+)
 
-    readiness_mod.get_config_registry(str(REPO_ROOT)).entries
-    REGISTRIES_AVAILABLE = True
-    REGISTRY_SKIP_MESSAGE = ""
-except Exception as exc:  # noqa: BLE001 - skip reason only
-    REGISTRIES_AVAILABLE = False
-    REGISTRY_SKIP_MESSAGE = f"registries unavailable: {exc}"
-
-require_registries = unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+require_registries = unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
 
 CNN_MATR_1 = "configs/baselines/nn_models/cnn/matr_1.yaml"
 CNN_MATR_2 = "configs/baselines/nn_models/cnn/matr_2.yaml"
