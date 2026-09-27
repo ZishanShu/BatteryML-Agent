@@ -307,6 +307,11 @@ the one failure; that is expected. What each line should say:
 | `DATA-01` `SPLIT-01` | `[SKIP]` | No data has been downloaded yet (§8). |
 | `REG-01` | `[FAIL]` | Upstream BatteryML lists six cycler formats (`BATTERYARCHIVE`, `BIOLOGIC`, `INDIGO`, `LANDT`, `MACCOR`, `NOVONIX`) that have no preprocessor. It does not affect anything in this guide. |
 
+The first time it runs, two lines starting with a date may appear between
+the checks: `INFO - Failed to extract font properties from …` and
+`INFO - generated new fontManager`. Matplotlib is building its font cache;
+this happens once and is not an error.
+
 If any check other than `REG-01` says `[FAIL]`, read its message — it names
 the problem — and see §18. The full report is written to
 `runs/verify/verification_report.json`.
@@ -324,6 +329,12 @@ python batteryml_web/core/run_batteryml_cli.py download MATR data/raw/MATR
 
 This downloads four large `.mat` files from `data.matr.io`. It takes a long
 time; leave it running.
+
+If it ends with a long error whose last line contains `ConnectionError`,
+`ProxyError`, `Max retries exceeded` or `403 Forbidden`, the machine cannot
+reach `data.matr.io`. Fix the network first (open
+<https://data.matr.io> in a browser on the same machine; a university or
+company proxy may block it), then follow the box below.
 
 > Always start BatteryML through `batteryml_web/core/run_batteryml_cli.py`.
 > Running `python bin/batteryml.py` directly fails with
@@ -384,6 +395,14 @@ prints `180`.
 If preprocessing stops with
 `FileNotFoundError: Batch file not found: data/raw/MATR/MATR_batch_….mat`,
 the download in §8 is incomplete: redo §8, then run this step again.
+
+If it stops with `OSError: Unable to synchronously open file (file signature
+not found)`, one of the `.mat` files is empty or cut off (a failed download):
+run the `rm -rf data/raw/MATR` box in §8, then this step again.
+
+A failed preprocessing run leaves an **empty** `data/processed/MATR` folder
+behind. That is why §10 then reports `INCOMPLETE_PROCESSED`, and a model run
+fails with `KeyError: 'b1c1'`. Running this step again successfully fixes both.
 
 ---
 
@@ -679,9 +698,12 @@ Stop the website with `Ctrl+C` before updating and start it again afterwards.
 | `ModuleNotFoundError: No module named 'batteryml_web'` | The command was run outside the `BatteryML-Agent` folder. | `cd ~/BatteryML-Agent` and run it again. |
 | `torch.cuda.is_available()` prints `False` on a GPU machine | NVIDIA driver older than PyTorch's CUDA version. | §5, last part. |
 | `[INFO] data/raw/MATR/… already exists. Skip it.` after a failed download | An incomplete file was left behind. | `rm -rf data/raw/MATR`, then §8 again. |
+| `ConnectionError` / `ProxyError` / `403 Forbidden` during §8 | The machine cannot reach the download server. | Fix the network, then `rm -rf data/raw/MATR` and §8 again. |
 | `FileNotFoundError: Batch file not found: data/raw/MATR/…` | The download is incomplete. | §8 again, then §9. |
+| `OSError: Unable to synchronously open file (file signature not found)` in §9 | A `.mat` file is empty or cut off. | `rm -rf data/raw/MATR`, §8 again, then §9. |
 | MATR shows `INCOMPLETE_PROCESSED` | Preprocessing failed or was interrupted. | §9 again. |
 | `AssertionError: data/processed/MATR` when running a model | §9 was not run. | Run §9. |
+| `KeyError: 'b1c1'` when running a model | `data/processed/MATR` exists but is empty — §9 failed. | Fix the cause of the §9 error, run §9 again. |
 | `unrecognized arguments: --config` | `--config` was typed in front of the config file. | Remove `--config`. |
 | The run only prints a path and ends | `--train --eval` are missing. | Add both. |
 | Health check: `[FAIL] REG-01 …` and exit code 1 | Upstream gap, expected. | Nothing. See §7. |
@@ -752,7 +774,7 @@ What was actually executed, and what was not:
 | §8 download command | Executed; it reached `data.matr.io`, but the test machine's network policy blocked the transfer, so no data was downloaded. The broken-file behaviour and the recovery command were reproduced with that failure. |
 | §9 preprocess, §10 readiness | Executed without data: the error message for missing raw files and the `INCOMPLETE_PROCESSED` state were observed. The count `180` and `MATR READY` come from a separate server that holds the processed MATR data. |
 | §11 start the website, §12.1 create a project, §12.2 Refresh datasets, page and button names in §12 | Executed in a browser against this installation. |
-| §12.3–12.4 a run and its results in the website, §13 a completed run | Not executed here (no data). Labels in §12.3 were taken from the code. The CLI commands in §13 were checked as far as the data step (`AssertionError: data/processed/MATR`). A one-epoch MATR CNN run completed on the separate server. |
+| §12.3–12.4 a run and its results in the website, §13 a completed run | Not executed here (no data). Labels in §12.3 were taken from the code. The CLI commands in §13 were checked as far as the data step: they stop with `AssertionError: data/processed/MATR` when that folder does not exist, and with `KeyError: 'b1c1'` when it exists but is empty. A one-epoch MATR CNN run completed on the separate server. |
 | §5 GPU case, the `--index-url` command, `nvidia-smi` | Not executed (no GPU on the test machine; `download.pytorch.org` was blocked). |
 | §15 LLM assistant | Fields and buttons checked in the browser; no connection was made. |
 | macOS, Windows/WSL2 | Not tested. |

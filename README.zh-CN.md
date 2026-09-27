@@ -291,6 +291,10 @@ python -m scripts.verify.run_all
 | `DATA-01` `SPLIT-01` | `[SKIP]` | 还没有下载数据（§8）。 |
 | `REG-01` | `[FAIL]` | 上游 BatteryML 列出了六种没有预处理器的循环仪格式（`BATTERYARCHIVE`、`BIOLOGIC`、`INDIGO`、`LANDT`、`MACCOR`、`NOVONIX`）。它不影响本指南的任何步骤。 |
 
+第一次运行时，检查结果之间可能出现两行以日期开头的信息：
+`INFO - Failed to extract font properties from …` 和 `INFO - generated new fontManager`。
+这是 Matplotlib 在建立字体缓存，只会出现一次，不是错误。
+
 如果除 `REG-01` 以外还有 `[FAIL]`，请阅读它的提示信息——里面写明了问题所在——并参考 §18。
 完整报告会写入 `runs/verify/verification_report.json`。
 
@@ -305,6 +309,11 @@ python batteryml_web/core/run_batteryml_cli.py download MATR data/raw/MATR
 ```
 
 这会从 `data.matr.io` 下载四个很大的 `.mat` 文件，耗时较长，请让它一直运行。
+
+如果它以一长串报错结束，且最后一行包含 `ConnectionError`、`ProxyError`、
+`Max retries exceeded` 或 `403 Forbidden`，说明这台机器连不上 `data.matr.io`。
+先解决网络问题（在同一台机器的浏览器里打开 <https://data.matr.io> 试试；
+学校或公司的代理可能会拦截它），然后按下面方框里的步骤操作。
 
 > 始终通过 `batteryml_web/core/run_batteryml_cli.py` 启动 BatteryML。
 > 直接运行 `python bin/batteryml.py` 会报错
@@ -359,6 +368,13 @@ ls data/processed/MATR | wc -l
 如果预处理中止并报错
 `FileNotFoundError: Batch file not found: data/raw/MATR/MATR_batch_….mat`，
 说明 §8 的下载不完整：重新做 §8，然后再运行这一步。
+
+如果报错 `OSError: Unable to synchronously open file (file signature not found)`，
+说明某个 `.mat` 文件是空的或不完整（下载失败）：执行 §8 方框里的 `rm -rf data/raw/MATR`
+那一段，然后再运行这一步。
+
+预处理失败后会留下一个**空的** `data/processed/MATR` 文件夹。所以之后 §10 会显示
+`INCOMPLETE_PROCESSED`，运行模型会报 `KeyError: 'b1c1'`。只要重新成功运行这一步，两者都会消失。
 
 ---
 
@@ -629,9 +645,12 @@ python -m scripts.verify.run_all
 | `ModuleNotFoundError: No module named 'batteryml_web'` | 命令不是在 `BatteryML-Agent` 文件夹里运行的。 | `cd ~/BatteryML-Agent` 后重新运行。 |
 | 有 GPU 的机器上 `torch.cuda.is_available()` 打印 `False` | NVIDIA 驱动比 PyTorch 的 CUDA 版本旧。 | 见 §5 最后一部分。 |
 | 下载失败后出现 `[INFO] data/raw/MATR/… already exists. Skip it.` | 留下了不完整的文件。 | `rm -rf data/raw/MATR`，然后重做 §8。 |
+| §8 中出现 `ConnectionError` / `ProxyError` / `403 Forbidden` | 这台机器连不上下载服务器。 | 先解决网络问题，然后 `rm -rf data/raw/MATR` 并重做 §8。 |
 | `FileNotFoundError: Batch file not found: data/raw/MATR/…` | 下载不完整。 | 重做 §8，再做 §9。 |
+| §9 中出现 `OSError: Unable to synchronously open file (file signature not found)` | 某个 `.mat` 文件是空的或不完整。 | `rm -rf data/raw/MATR`，重做 §8，再做 §9。 |
 | MATR 显示 `INCOMPLETE_PROCESSED` | 预处理失败或被中断。 | 重做 §9。 |
 | 运行模型时报 `AssertionError: data/processed/MATR` | 没有执行 §9。 | 执行 §9。 |
+| 运行模型时报 `KeyError: 'b1c1'` | `data/processed/MATR` 存在但是空的——§9 失败了。 | 解决 §9 报错的原因，重新执行 §9。 |
 | `unrecognized arguments: --config` | 在配置文件前面写了 `--config`。 | 去掉 `--config`。 |
 | 运行只打印一个路径就结束了 | 缺少 `--train --eval`。 | 两个都加上。 |
 | 健康检查出现 `[FAIL] REG-01 …` 且退出码为 1 | 上游缺口，属预期。 | 无需处理。见 §7。 |
@@ -693,7 +712,7 @@ conda env remove -n batteryml -y
 | §8 下载命令 | 已执行；它连上了 `data.matr.io`，但测试机器的网络策略拦截了传输，所以没有下载到数据。「损坏文件被跳过」的行为和恢复命令都是用这次失败复现出来的。 |
 | §9 预处理、§10 就绪状态 | 在无数据情况下执行：观察到了缺少原始文件时的报错，以及 `INCOMPLETE_PROCESSED` 状态。数量 `180` 和 `MATR READY` 来自另一台存有 MATR 预处理数据的服务器。 |
 | §11 启动网站、§12.1 创建项目、§12.2 Refresh datasets、§12 中的页面与按钮名称 | 在浏览器中针对这次安装实际执行过。 |
-| §12.3–12.4 在网站中运行并查看结果，§13 一次完整的运行 | 此处未执行（没有数据）。§12.3 中的名称取自代码。§13 的命令行检查到数据步骤为止（`AssertionError: data/processed/MATR`）。一次 1 个 epoch 的 MATR CNN 运行在另一台服务器上完成过。 |
+| §12.3–12.4 在网站中运行并查看结果，§13 一次完整的运行 | 此处未执行（没有数据）。§12.3 中的名称取自代码。§13 的命令行检查到数据步骤为止：该文件夹不存在时报 `AssertionError: data/processed/MATR`，存在但为空时报 `KeyError: 'b1c1'`。一次 1 个 epoch 的 MATR CNN 运行在另一台服务器上完成过。 |
 | §5 的 GPU 情形、`--index-url` 命令、`nvidia-smi` | 未执行（测试机器没有 GPU；`download.pytorch.org` 被拦截）。 |
 | §15 LLM 助手 | 在浏览器中核对了字段和按钮；没有实际建立连接。 |
 | macOS、Windows/WSL2 | 未测试。 |
