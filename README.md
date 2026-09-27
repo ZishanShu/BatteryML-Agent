@@ -455,8 +455,17 @@ Start it from the `BatteryML-Agent` folder — the settings in
 Open `http://localhost:8501` in a browser. The page title is
 **LLM-guided BatteryML Protocol Platform**.
 
-The website runs until you press `Ctrl+C` in this terminal. Closing the
-terminal stops it too.
+The website runs until you press `Ctrl+C` in this terminal (it prints
+`Stopping...`). Closing the terminal stops it too.
+
+While you use the website, this terminal prints lines starting with a date,
+such as ``Please replace `use_container_width` with `width`.``,
+``Please replace `st.components.v1.html` with `st.iframe`.``, or
+`The widget with key "agent_request_input" was created with a default value
+but also had its value set via the Session State API.` followed by a
+`Stack (most recent call last):` block. These are Streamlit warnings, not
+errors; the website keeps working. Errors that matter are shown on the web
+page itself.
 
 ### If the code runs on a remote server
 
@@ -497,10 +506,16 @@ project are saved inside it.
 1. In the sidebar, click **1. 🧪 Prepare Data**.
 2. On the **Dataset Overview** tab, click **Refresh datasets**.
 
-**Check:** a card for **MATR** appears with the status **Ready**. (Clicking
-**Refresh datasets** runs `tools/sync_data_and_config_manifests.py`, which
-writes the two files in `data/metadata/` that the website reads. Click it
-again whenever you add or preprocess a dataset.)
+**Check:** a card for **MATR** appears. Its last two lines read
+`Status: READY` and **Ready**. (Clicking **Refresh datasets** runs
+`tools/sync_data_and_config_manifests.py`, which writes the two files in
+`data/metadata/` that the website reads. Click it again whenever you add or
+preprocess a dataset.)
+
+If the card instead ends with `Status: INCOMPLETE_PROCESSED` and
+**Processed incomplete**, or `Status: RAW_ONLY` and
+**Preprocessing required**, go back to §9, then click **Refresh datasets**
+again.
 
 ### 12.3 Train and evaluate a model
 
@@ -514,8 +529,18 @@ It does **not** need an API key — the request is interpreted by fixed rules.
    Use XGBoost on MATR to predict RUL.
    ```
 
-   (**Use template** fills in the pattern `Use [Model] on [dataset] to predict [task].`)
-3. Click **Analyze**. The page shows MATR's readiness and the models that can run.
+   (**Use template** fills in an example of the form
+   `Use [Model] on [dataset] to predict [task].`, for example
+   `Use CNN on HUST to predict battery lifetime.`. If you click it, replace
+   the text with the line above.)
+3. Click **Analyze**. Under **Workflow analysis** the page shows
+   **Dataset** `MATR`, **Task** `RUL prediction` and **Dataset readiness**
+   `READY`, followed by the models that can run.
+
+   If it shows **Dataset readiness** `INCOMPLETE_PROCESSED` (or `RAW_ONLY`)
+   and the message `xgb cannot run for this dataset and task.`, MATR has not
+   been preprocessed: go back to §9, then **Prepare Data → Refresh datasets**,
+   then click **Analyze** again. No model can be selected until then.
 4. In **Model (runnable models only; blocked models cannot be selected)**, choose **XGBoost**.
 5. In **Config — evaluation protocol (validated only)**, choose
    `configs/baselines/sklearn/xgb/matr_1.yaml`. The list also offers
@@ -684,6 +709,14 @@ python -m scripts.verify.run_all
 
 Stop the website with `Ctrl+C` before updating and start it again afterwards.
 
+`git pull` prints `Updating …` and `Fast-forward` and a list of changed files
+(or `Already up to date.`). `pip install -r requirements.txt` prints
+`Requirement already satisfied` for everything that did not change.
+
+Read the health check as in §7: `REG-01` stays `[FAIL]` (expected). Once you
+have data, `DATA-01` and `SPLIT-01` no longer say `[SKIP]`. Any other `[FAIL]`
+line names its problem; see §18.
+
 ---
 
 ## 18. Troubleshooting
@@ -707,6 +740,7 @@ Stop the website with `Ctrl+C` before updating and start it again afterwards.
 | `unrecognized arguments: --config` | `--config` was typed in front of the config file. | Remove `--config`. |
 | The run only prints a path and ends | `--train --eval` are missing. | Add both. |
 | Health check: `[FAIL] REG-01 …` and exit code 1 | Upstream gap, expected. | Nothing. See §7. |
+| Health check: `[FAIL] DATA-01 … processed directory/directories exist but contain no *.pkl file: MATR` | §9 failed and left an empty `data/processed/MATR`. | Fix the cause of the §9 error, run §9 again. |
 | Website: **No datasets are available yet.** | The website has not re-read the data folder. | **Prepare Data → Refresh datasets**. |
 | Website: **No run is selected. Choose one in Run History above.** | No Agent Workflow run exists in this project yet, or the run was started from the Run Model page. | Run a model from **Agent Workflow** (§12.3). |
 | Browser cannot open `localhost:8501` from your own computer | The website runs on a remote server. | Use the SSH tunnel in §11. |
@@ -770,13 +804,14 @@ What was actually executed, and what was not:
 
 | Step | Status |
 | --- | --- |
-| §1 `git`/`curl` check, §2 Miniconda (download, install, `conda init`, reopened terminal, Terms of Service), §3 clone, §4 environment, §5 `pip install torch` and the check (CPU), §6 requirements and import check, §7 health check (`10 passed, 1 failed, 2 skipped`) | Executed exactly as written. |
-| §8 download command | Executed; it reached `data.matr.io`, but the test machine's network policy blocked the transfer, so no data was downloaded. The broken-file behaviour and the recovery command were reproduced with that failure. |
-| §9 preprocess, §10 readiness | Executed without data: the error message for missing raw files and the `INCOMPLETE_PROCESSED` state were observed. The count `180` and `MATR READY` come from a separate server that holds the processed MATR data. |
+| §1 `git`/`curl` check, §2 Miniconda (download, install, `conda init`, reopened terminal, Terms of Service), §3 clone, §4 environment, §5 `pip install torch` and the check (CPU), §6 requirements and import check, §7 health check (`10 passed, 1 failed, 2 skipped`) | Executed exactly as written, twice: the second time by copying every command block of this file, unchanged, into a new terminal with an empty home directory. |
+| §8 download command | Executed; the test machine's network policy refused the connection to `data.matr.io` (`403 Forbidden`), so no data was downloaded. The 0-byte file it left behind, the `find … -size 0` check and the recovery command were reproduced with that failure. |
+| §9 preprocess, §10 readiness | Executed without data: the error messages for missing raw files (`FileNotFoundError`) and for an empty raw file (`OSError … file signature not found`), and the `INCOMPLETE_PROCESSED` state, were observed. The count `180` and `MATR READY` come from a separate server that holds the processed MATR data. |
 | §11 start the website, §12.1 create a project, §12.2 Refresh datasets, page and button names in §12 | Executed in a browser against this installation. |
-| §12.3–12.4 a run and its results in the website, §13 a completed run | Not executed here (no data). Labels in §12.3 were taken from the code. The CLI commands in §13 were checked as far as the data step: they stop with `AssertionError: data/processed/MATR` when that folder does not exist, and with `KeyError: 'b1c1'` when it exists but is empty. A one-epoch MATR CNN run completed on the separate server. |
+| §12.3–12.4 a run and its results in the website, §13 a completed run | Not executed here (no data). §12.3 steps 1–3 (request, **Use template**, **Analyze**, and the no-data message) were executed in the browser; the labels in steps 4–8 were taken from the code. The CLI commands in §13 were checked as far as the data step: they stop with `AssertionError: data/processed/MATR` when that folder does not exist, and with `KeyError: 'b1c1'` when it exists but is empty. A one-epoch MATR CNN run completed on the separate server. |
 | §5 GPU case, the `--index-url` command, `nvidia-smi` | Not executed (no GPU on the test machine; `download.pytorch.org` was blocked). |
-| §15 LLM assistant | Fields and buttons checked in the browser; no connection was made. |
+| §15 LLM assistant | Fields, buttons and the six provider presets checked in the browser; no connection was made. |
+| §16 coming back, §17 updating, §18 "Starting over" | Executed exactly as written (website started and stopped with `Ctrl+C`; `git pull` fast-forwarded; `conda env remove` left only `base`). |
 | macOS, Windows/WSL2 | Not tested. |
 
 ---

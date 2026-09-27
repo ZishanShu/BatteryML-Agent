@@ -426,7 +426,14 @@ python -m streamlit run batteryml_web/app.py
 在浏览器里打开 `http://localhost:8501`。页面标题是
 **LLM-guided BatteryML Protocol Platform**。
 
-网站会一直运行，直到你在这个终端里按 `Ctrl+C`。关闭这个终端也会让网站停止。
+网站会一直运行，直到你在这个终端里按 `Ctrl+C`（会打印 `Stopping...`）。关闭这个终端也会让网站停止。
+
+使用网站时，这个终端会打印一些以日期开头的行，例如
+``Please replace `use_container_width` with `width`.``、
+``Please replace `st.components.v1.html` with `st.iframe`.``，或者
+`The widget with key "agent_request_input" was created with a default value but also had its value set via the Session State API.`
+后面跟着一段 `Stack (most recent call last):`。这些是 Streamlit 的警告，不是错误，网站照常工作。
+真正需要处理的错误会显示在网页上。
 
 ### 如果代码运行在远程服务器上
 
@@ -462,9 +469,12 @@ ssh -L 8501:localhost:8501 user@server
 1. 在侧边栏点击 **1. 🧪 Prepare Data**。
 2. 在 **Dataset Overview** 标签页里，点击 **Refresh datasets**。
 
-**检查：** 出现一张 **MATR** 的卡片，状态为 **Ready**。
+**检查：** 出现一张 **MATR** 的卡片，最后两行是 `Status: READY` 和 **Ready**。
 （点击 **Refresh datasets** 会运行 `tools/sync_data_and_config_manifests.py`，
 它会在 `data/metadata/` 中写入网站读取的两个文件。以后每次新增或预处理了数据集，都要再点一次。）
+
+如果卡片最后两行是 `Status: INCOMPLETE_PROCESSED` 和 **Processed incomplete**，
+或者 `Status: RAW_ONLY` 和 **Preprocessing required**，请回到 §9，然后再点一次 **Refresh datasets**。
 
 ### 12.3 训练并评估一个模型
 
@@ -478,8 +488,14 @@ ssh -L 8501:localhost:8501 user@server
    Use XGBoost on MATR to predict RUL.
    ```
 
-   （点击 **Use template** 会填入格式模板 `Use [Model] on [dataset] to predict [task].`）
-3. 点击 **Analyze**。页面会显示 MATR 的就绪状态和可以运行的模型。
+   （点击 **Use template** 会按 `Use [Model] on [dataset] to predict [task].` 的格式填入一个例子，
+   例如 `Use CNN on HUST to predict battery lifetime.`。如果点了它，请把文字换成上面那一行。）
+3. 点击 **Analyze**。在 **Workflow analysis** 下，页面显示 **Dataset** `MATR`、
+   **Task** `RUL prediction` 和 **Dataset readiness** `READY`，下面是可以运行的模型。
+
+   如果显示的是 **Dataset readiness** `INCOMPLETE_PROCESSED`（或 `RAW_ONLY`），
+   并出现 `xgb cannot run for this dataset and task.`，说明 MATR 还没有预处理：
+   回到 §9，然后 **Prepare Data → Refresh datasets**，再点一次 **Analyze**。在此之前无法选择任何模型。
 4. 在 **Model (runnable models only; blocked models cannot be selected)** 中选择 **XGBoost**。
 5. 在 **Config — evaluation protocol (validated only)** 中选择
    `configs/baselines/sklearn/xgb/matr_1.yaml`。列表里还有 `clo.yaml` 和 `matr_2.yaml`：
@@ -631,6 +647,12 @@ python -m scripts.verify.run_all
 
 更新前先用 `Ctrl+C` 停止网站，更新后再重新启动。
 
+`git pull` 会打印 `Updating …`、`Fast-forward` 和改动的文件列表（或 `Already up to date.`）。
+`pip install -r requirements.txt` 对没有变化的包会打印 `Requirement already satisfied`。
+
+健康检查的结果按 §7 的方法看：`REG-01` 仍然是 `[FAIL]`（属预期）。有了数据之后，
+`DATA-01` 和 `SPLIT-01` 不再是 `[SKIP]`。其他任何 `[FAIL]` 都会写明问题所在，见 §18。
+
 ---
 
 ## 18. 常见问题排查
@@ -654,6 +676,7 @@ python -m scripts.verify.run_all
 | `unrecognized arguments: --config` | 在配置文件前面写了 `--config`。 | 去掉 `--config`。 |
 | 运行只打印一个路径就结束了 | 缺少 `--train --eval`。 | 两个都加上。 |
 | 健康检查出现 `[FAIL] REG-01 …` 且退出码为 1 | 上游缺口，属预期。 | 无需处理。见 §7。 |
+| 健康检查出现 `[FAIL] DATA-01 … processed directory/directories exist but contain no *.pkl file: MATR` | §9 失败，留下了一个空的 `data/processed/MATR`。 | 解决 §9 报错的原因，重新执行 §9。 |
 | 网页显示 **No datasets are available yet.** | 网站还没有重新读取数据文件夹。 | **Prepare Data → Refresh datasets**。 |
 | 网页显示 **No run is selected. Choose one in Run History above.** | 这个项目里还没有 Agent Workflow 的运行，或者运行是从 Run Model 页发起的。 | 从 **Agent Workflow** 运行一个模型（§12.3）。 |
 | 在自己电脑上打不开 `localhost:8501` | 网站运行在远程服务器上。 | 使用 §11 中的 SSH 隧道。 |
@@ -708,13 +731,14 @@ conda env remove -n batteryml -y
 
 | 步骤 | 情况 |
 | --- | --- |
-| §1 `git`/`curl` 检查，§2 Miniconda（下载、安装、`conda init`、重开终端、服务条款），§3 克隆，§4 环境，§5 `pip install torch` 及检查（CPU），§6 依赖与导入检查，§7 健康检查（`10 passed, 1 failed, 2 skipped`） | 完全按文中命令执行。 |
-| §8 下载命令 | 已执行；它连上了 `data.matr.io`，但测试机器的网络策略拦截了传输，所以没有下载到数据。「损坏文件被跳过」的行为和恢复命令都是用这次失败复现出来的。 |
-| §9 预处理、§10 就绪状态 | 在无数据情况下执行：观察到了缺少原始文件时的报错，以及 `INCOMPLETE_PROCESSED` 状态。数量 `180` 和 `MATR READY` 来自另一台存有 MATR 预处理数据的服务器。 |
+| §1 `git`/`curl` 检查，§2 Miniconda（下载、安装、`conda init`、重开终端、服务条款），§3 克隆，§4 环境，§5 `pip install torch` 及检查（CPU），§6 依赖与导入检查，§7 健康检查（`10 passed, 1 failed, 2 skipped`） | 完全按文中命令执行，共两遍：第二遍是把本文件中每个命令块原样复制到一个全新的终端（空的 home 目录）中执行。 |
+| §8 下载命令 | 已执行；测试机器的网络策略拒绝了到 `data.matr.io` 的连接（`403 Forbidden`），所以没有下载到数据。它留下的 0 字节文件、`find … -size 0` 检查和恢复命令都是用这次失败复现出来的。 |
+| §9 预处理、§10 就绪状态 | 在无数据情况下执行：观察到了缺少原始文件时的报错（`FileNotFoundError`）、原始文件为空时的报错（`OSError … file signature not found`），以及 `INCOMPLETE_PROCESSED` 状态。数量 `180` 和 `MATR READY` 来自另一台存有 MATR 预处理数据的服务器。 |
 | §11 启动网站、§12.1 创建项目、§12.2 Refresh datasets、§12 中的页面与按钮名称 | 在浏览器中针对这次安装实际执行过。 |
-| §12.3–12.4 在网站中运行并查看结果，§13 一次完整的运行 | 此处未执行（没有数据）。§12.3 中的名称取自代码。§13 的命令行检查到数据步骤为止：该文件夹不存在时报 `AssertionError: data/processed/MATR`，存在但为空时报 `KeyError: 'b1c1'`。一次 1 个 epoch 的 MATR CNN 运行在另一台服务器上完成过。 |
+| §12.3–12.4 在网站中运行并查看结果，§13 一次完整的运行 | 此处未执行（没有数据）。§12.3 的第 1–3 步（请求、**Use template**、**Analyze** 以及无数据时的提示）在浏览器中执行过；第 4–8 步中的名称取自代码。§13 的命令行检查到数据步骤为止：该文件夹不存在时报 `AssertionError: data/processed/MATR`，存在但为空时报 `KeyError: 'b1c1'`。一次 1 个 epoch 的 MATR CNN 运行在另一台服务器上完成过。 |
 | §5 的 GPU 情形、`--index-url` 命令、`nvidia-smi` | 未执行（测试机器没有 GPU；`download.pytorch.org` 被拦截）。 |
-| §15 LLM 助手 | 在浏览器中核对了字段和按钮；没有实际建立连接。 |
+| §15 LLM 助手 | 在浏览器中核对了字段、按钮和六个服务商预设；没有实际建立连接。 |
+| §16 再次使用、§17 更新、§18「从头再来」 | 完全按文中命令执行（网站启动后用 `Ctrl+C` 停止；`git pull` 快进更新；`conda env remove` 之后只剩 `base`）。 |
 | macOS、Windows/WSL2 | 未测试。 |
 
 ---
