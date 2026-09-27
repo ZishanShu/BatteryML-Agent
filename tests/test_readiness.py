@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import zipfile
 import unittest
 from pathlib import Path
 
@@ -24,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from batteryml_web.core.readiness import (  # noqa: E402
+    BATTERYLIFE_RAW_PARTS,
     DatasetStatus,
     EXTERNAL_MODELS,
     ModelStatus,
@@ -106,18 +108,62 @@ DEMO_ENVIRONMENT_SKIP_MESSAGE = (
 
 
 class _TempRoots:
-    """Create paired raw/processed roots that are removed on exit."""
+    """Paired raw/processed roots on an isolated repository, removed on exit.
+
+    Isolating ``raw_root`` and ``processed_root`` is not enough, and that
+    gap made two of these tests read the developer's own disk.
+
+    ``assess_dataset`` recognises three raw shapes. Two of them — the
+    extracted ``data/raw/BatteryLife/v11/<NAME>/`` directory and the
+    ``<NAME>.zip`` archive beside it — live at a **fixed repository path**
+    and are deliberately *not* resolved against a caller-supplied
+    ``raw_root``: see the comment in ``_raw_layouts``, where gating them on
+    ``raw_root is None`` is recorded as a bug that made the detection vanish
+    for any caller naming its own raw directory. That behaviour is correct
+    and is left alone.
+
+    The consequence for a test is that ``raw_root`` cannot reach those two
+    shapes, and ``assess_dataset`` takes no repository-root argument — it
+    calls ``readiness._repo_root()``. So a machine that genuinely holds
+    ``data/raw/BatteryLife/v11/MICH`` answered ``RAW_ONLY`` for MICH, which
+    is the *right* answer for that machine and the wrong one for a test that
+    believed it had supplied an empty world. It passed here and failed on
+    the server, which is the signature of a fixture, not of a defect.
+
+    The repository root is therefore redirected at the same temporary base
+    for the duration, so every shape — native, extracted and archived —
+    resolves inside the fixture and nothing on the host is consulted.
+    """
 
     def __enter__(self) -> tuple[Path, Path]:
         self._tmp = tempfile.TemporaryDirectory()
         base = Path(self._tmp.name)
+        self.root = base / "repo"
         self.raw = base / "raw"
         self.processed = base / "processed"
+        self.root.mkdir()
         self.raw.mkdir()
         self.processed.mkdir()
+
+        from batteryml_web.core import readiness as readiness_mod
+
+        self._module = readiness_mod
+        self._saved_repo_root = readiness_mod._repo_root
+        readiness_mod._repo_root = lambda: self.root
         return self.raw, self.processed
 
+    def batterylife_raw(self, dataset: str) -> Path:
+        """The extracted BatteryLife v11 directory for ``dataset``, created.
+
+        Lets a test exercise the fixed-repository-path shape on purpose,
+        rather than inheriting it by accident from the host.
+        """
+        target = self.root.joinpath(*BATTERYLIFE_RAW_PARTS) / dataset
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
     def __exit__(self, *exc_info) -> None:
+        self._module._repo_root = self._saved_repo_root
         self._tmp.cleanup()
 
 
@@ -173,6 +219,86 @@ class TestDatasetReadiness(unittest.TestCase):
         self.assertIs(report.status, DatasetStatus.MISSING)
         self.assertFalse(report.raw_available)
         self.assertFalse(report.processed_available)
+
+    def test_extracted_batterylife_raw_is_raw_only(self) -> None:
+        """The other half of the contract, stated instead of inherited.
+
+        MICH has no native BatteryML preprocessor; its raw data arrives as
+        the BatteryLife v11 distribution at a fixed repository path. Before
+        this, no test placed that data on purpose — the only machine where
+        the shape was exercised was one that happened to have it on disk,
+        where it silently contradicted ``test_missing_dataset``. Both
+        answers are now asserted, from data this test puts there itself.
+        """
+        fixture = _TempRoots()
+        with fixture as (raw, processed):
+            (fixture.batterylife_raw("MICH") / "cell_0.pkl").write_bytes(b"x")
+
+            report = assess_dataset("MICH", raw_root=raw, processed_root=processed)
+
+        self.assertIs(report.status, DatasetStatus.RAW_ONLY)
+        self.assertTrue(report.raw_available)
+        self.assertFalse(report.processed_available)
+
+    def test_a_downloaded_batterylife_archive_is_raw_only(self) -> None:
+        """The third recognised shape: downloaded but not yet extracted.
+
+        ``_raw_layouts`` recognises the ``<NAME>.zip`` archive beside the
+        extracted directory, and that branch had no test at all — a mutation
+        deleting it passed the whole suite. It is the plainest reading of
+        "downloaded recognised raw only", so it is asserted here.
+        """
+        fixture = _TempRoots()
+        with fixture as (raw, processed):
+            v11 = fixture.root.joinpath(*BATTERYLIFE_RAW_PARTS)
+            v11.mkdir(parents=True, exist_ok=True)
+            # A real archive, because the production signature is
+            # `zipfile.is_zipfile`, not the `.zip` suffix. A first draft of
+            # this test wrote plausible-looking bytes and reported MISSING —
+            # the code being stricter than the test expected.
+            with zipfile.ZipFile(v11 / "MICH.zip", "w") as archive:
+                archive.writestr("MICH/cell_0.pkl", "x")
+
+            report = assess_dataset("MICH", raw_root=raw, processed_root=processed)
+
+        self.assertIs(report.status, DatasetStatus.RAW_ONLY)
+        self.assertTrue(report.raw_available)
+        self.assertFalse(report.processed_available)
+
+    def test_a_half_downloaded_archive_is_not_counted_as_present(self) -> None:
+        """The strictness above, asserted rather than assumed.
+
+        A file carrying the ``.zip`` name but not the data is exactly the
+        state an interrupted download leaves behind. Reporting it as raw
+        data would send the user to preprocess something unreadable.
+        """
+        fixture = _TempRoots()
+        with fixture as (raw, processed):
+            v11 = fixture.root.joinpath(*BATTERYLIFE_RAW_PARTS)
+            v11.mkdir(parents=True, exist_ok=True)
+            (v11 / "MICH.zip").write_bytes(b"PK\x03\x04truncated")
+
+            report = assess_dataset("MICH", raw_root=raw, processed_root=processed)
+
+        self.assertIs(report.status, DatasetStatus.MISSING)
+        self.assertFalse(report.raw_available)
+
+    def test_a_supplied_raw_root_cannot_reach_the_batterylife_path(self) -> None:
+        """Why the fixture redirects the repository root at all.
+
+        ``raw_root`` names the *native* raw directory only. Putting the
+        BatteryLife layout under it must change nothing, because that shape
+        is resolved against the repository root by design. This pins the
+        boundary the two failing tests fell through.
+        """
+        with _TempRoots() as (raw, processed):
+            decoy = raw.joinpath(*BATTERYLIFE_RAW_PARTS) / "MICH"
+            decoy.mkdir(parents=True)
+            (decoy / "cell_0.pkl").write_bytes(b"x")
+
+            report = assess_dataset("MICH", raw_root=raw, processed_root=processed)
+
+        self.assertIs(report.status, DatasetStatus.MISSING)
 
     def test_only_pkl_files_count_as_processed(self) -> None:
         with _TempRoots() as (raw, processed):
