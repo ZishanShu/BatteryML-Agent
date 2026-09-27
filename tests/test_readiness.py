@@ -82,7 +82,7 @@ def _demo_data_reason() -> str | None:
         return (
             f"{processed.relative_to(REPO_ROOT).as_posix()} does not exist. "
             "These tests assert a runnable MATR demo; preprocess it first "
-            "(see README.md §7)."
+            "(see README.md §9)."
         )
     if not any(processed.glob("*.pkl")):
         return (

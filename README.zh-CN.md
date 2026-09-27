@@ -1,329 +1,363 @@
 <div align="center">
 
-# BatteryML-Agent
-
-**面向电池研究者的部署与使用指南。**
-不需要机器学习背景，不需要 GPU。
+# BatteryML-Agent — 安装指南
 
 [English](./README.md) · **简体中文**
 
 </div>
 
----
+BatteryML-Agent 是一个用于电池寿命（RUL）与健康状态（SOH）预测的网页应用，
+构建在 [BatteryML](https://github.com/microsoft/BatteryML) 之上。
+本指南带你从一台空机器开始，一条命令一条命令地把它装好，直到网站跑起来。
 
-## 这是什么
+全部完成后，你会得到：
 
-**[BatteryML](https://github.com/microsoft/BatteryML)**（Microsoft，ICLR 2024）
-是一个用于电池退化机器学习的开源库。它定义了数据格式、预处理器、训练/测试划分、
-模型与指标。它是科学内核——本平台报告的每一个数字都来自它。
+- 一个名为 `batteryml` 的 conda 环境，里面装好了 BatteryML 及其全部依赖；
+- 已下载并预处理好的 MATR 电池数据集；
+- 运行在 `http://localhost:8501` 的网站；
+- 一个在 MATR 上训练并评估完成的模型，结果既保存在磁盘上，也显示在网页上。
 
-**BatteryML-Agent** 是构建其上的工作流层。它增加了：
-
-- 覆盖整条流程的**网页界面**——查看数据、预处理、配置运行、执行、阅读结果；
-- **数据集就绪状态**——直接回答「这个数据集现在能不能跑，不能的话还缺什么」；
-- 磁盘上**固定的结果目录结构**，使每次运行可引用、可复现；
-- 一个**可选的 LLM 助手**，用于解释配置、报错与结果。
-
-它**不增加任何新的科学内容**，不改动 BatteryML 的模型、指标或数据划分。
-
-### 两条路线
-
-| 路线 | 是什么 | 需要 API key 吗？ |
-| --- | --- | --- |
-| **路线 B — 确定性** | 网页界面，或一条命令行。即 §1–§12 的全部内容。 | **不需要。** 可完全离线运行。 |
-| **路线 A — LLM 辅助** | 叠加在上面的可选助手（§13）。 | 需要——且完全可选。 |
-
-**路线 B 是默认路线，也是本指南所讲的内容。** 即使你从不配置助手，
-也不会有任何功能降级：每个页面都能手动操作。
-
-> **助手永远不产生任何数字。** 它不训练、不预测、不计算指标，
-> 也不判断数据集是否就绪。这些全部来自 BatteryML 和确定性的就绪判断层。
-> 助手只负责解释已经存在的内容。
+请**严格按顺序**操作。每一步最后都有一个「检查」：检查没通过，就不要往下走。
+所有命令都在终端里执行（Linux / macOS 的终端；Windows 请用 WSL2，见 §0）。
 
 ---
 
-## 目录
+## 步骤
 
-1. [开始之前](#1-开始之前)
-2. [获取代码](#2-获取代码)
-3. [创建 Python 环境](#3-创建-python-环境)
-4. [安装依赖](#4-安装依赖)
-5. [验证环境](#5-验证环境)
-6. [获取电池数据](#6-获取电池数据)
-7. [预处理并登记数据](#7-预处理并登记数据)
-8. [数据集就绪状态](#8-数据集就绪状态)
-9. [启动网页应用](#9-启动网页应用)
-10. [运行冒烟测试](#10-运行冒烟测试)
-11. [查看结果](#11-查看结果)
-12. [什么才算基准性能](#12-什么才算基准性能)
-13. [可选：LLM 助手](#13-可选llm-助手)
-14. [常见问题排查](#14-常见问题排查)
-15. [已知限制](#15-已知限制)
-16. [本指南的验证情况](#16-本指南的验证情况)
+0. [你需要什么](#0-你需要什么)
+1. [检查机器](#1-检查机器)
+2. [安装 Miniconda](#2-安装-miniconda)
+3. [下载代码](#3-下载代码)
+4. [创建 Python 环境](#4-创建-python-环境)
+5. [安装 PyTorch](#5-安装-pytorch)
+6. [安装其余依赖](#6-安装其余依赖)
+7. [运行健康检查](#7-运行健康检查)
+8. [下载 MATR 数据集](#8-下载-matr-数据集)
+9. [预处理数据集](#9-预处理数据集)
+10. [检查数据集就绪状态](#10-检查数据集就绪状态)
+11. [启动网站](#11-启动网站)
+12. [在网站里完成第一次运行](#12-在网站里完成第一次运行)
+13. [改用命令行运行](#13-改用命令行运行)
+14. [结果在哪里](#14-结果在哪里)
+15. [可选：连接 LLM 助手](#15-可选连接-llm-助手)
+16. [以后每次重新打开](#16-以后每次重新打开)
+17. [更新到新版本](#17-更新到新版本)
+18. [常见问题排查](#18-常见问题排查)
+19. [已知限制](#19-已知限制)
+20. [测试版本与验证情况](#20-测试版本与验证情况)
 
 ---
 
-## 1. 开始之前
+## 0. 你需要什么
 
-### 你需要准备
-
-| 项目 | 要求 | 如何确认 |
-| --- | --- | --- |
-| 操作系统 | Linux、macOS，或 Windows（建议 WSL2） | — |
-| Python | **3.9 或更高** | `python3 --version` |
-| 磁盘空间 | **约 10 GB 可用**（仅 MATR 原始数据就有数 GB） | `df -h .` |
-| 内存 | 最低 8 GB，16 GB 更从容 | — |
-| GPU | **不需要。** 默认用 CPU；支持单张 GPU。 | — |
-| 网络 | 需要一次，用于安装依赖和下载数据 | — |
-
-### 大概需要多久
-
-| 步骤 | 大致时间 |
+| 项目 | 要求 |
 | --- | --- |
-| §2–§5 — 安装与验证 | 15–30 分钟 |
-| §6 — 下载 MATR | 20–60 分钟，取决于网速 |
-| §7 — 预处理 MATR | 10–30 分钟 |
-| §9–§10 — 第一次运行 | CPU 上冒烟运行 1–5 分钟 |
-
-> 这些是**估计值，不是实测值**，取决于你的网络、磁盘和 CPU。
-> §16 说明了哪些计过时、哪些没有。
-
-### 关于终端
-
-下面每条命令都输入在终端里（macOS 的「终端」，Windows 上的 Ubuntu/WSL）。
-以 `#` 开头的行是注释，**不用输入**。一次复制一个代码块，然后回车。
+| 操作系统 | **Linux x86_64**（已测试）。macOS：未测试。Windows：先安装 [WSL2 + Ubuntu](https://learn.microsoft.com/windows/wsl/install)，然后在 WSL 里按 Linux 步骤操作——未测试。 |
+| 磁盘空间 | 软件需要 **12 GB**（实测：Miniconda + 环境 8.0 GB，pip 下载缓存 3.5 GB），**另外**还要留出原始数据和预处理数据的空间。 |
+| 网络 | 安装和下载数据时需要。会访问：`repo.anaconda.com`、`pypi.org`、`files.pythonhosted.org`、`github.com`、`data.matr.io`。 |
+| GPU | **不需要。** 全部可在 CPU 上运行。如果有 NVIDIA GPU 会被用上（§5）。 |
+| 管理员权限 | 不需要。所有东西都装在你的用户目录下。 |
 
 ---
 
-## 2. 获取代码
+## 1. 检查机器
 
 ```bash
+git --version
+curl --version
+```
+
+**检查：** 两条命令都打印出版本号。如果没有 `git`，用系统的包管理器安装
+（Ubuntu 上：`sudo apt-get install -y git`）。如果没有 `curl`，同样安装
+（`sudo apt-get install -y curl`）。
+
+可选——仅当机器有 NVIDIA GPU 时：
+
+```bash
+nvidia-smi
+```
+
+**检查：** 显示出一张表格。记下表格右上角的 **`CUDA Version`**，§5 会用到。
+如果提示找不到命令，说明这台机器没有可用的 NVIDIA 驱动，所有计算都会在 CPU 上进行——这完全没问题。
+
+---
+
+## 2. 安装 Miniconda
+
+Miniconda 提供 `conda`，用它给 BatteryML 建一个独立的 Python 环境，
+这样不会改动你机器上的其他任何东西。
+
+> **已经装过 conda 或 Anaconda？** 运行 `conda --version`。
+> 如果能打印出版本号，跳过 2.1–2.3，直接做 **2.4**。
+
+### 2.1 下载安装程序
+
+```bash
+cd ~
+curl -LO https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+```
+
+其他平台请替换 URL 中的文件名：
+
+| 平台 | 文件名 |
+| --- | --- |
+| Linux，ARM（aarch64） | `Miniconda3-latest-Linux-aarch64.sh` |
+| macOS，Apple 芯片（M1/M2/M3/M4） | `Miniconda3-latest-MacOSX-arm64.sh` |
+| macOS，Intel 芯片 | `Miniconda3-latest-MacOSX-x86_64.sh` |
+
+**检查：** `ls -lh Miniconda3-latest-*.sh` 显示一个约 120–190 MB 的文件。
+
+### 2.2 运行安装程序
+
+```bash
+bash Miniconda3-latest-Linux-x86_64.sh -b -p $HOME/miniconda3
+```
+
+`-b` 表示不询问直接安装；`-p` 把安装目录设为 `~/miniconda3`。
+
+**检查：** 输出的最后一行是 `installation finished.`
+
+### 2.3 让终端认识 conda
+
+```bash
+$HOME/miniconda3/bin/conda init bash
+```
+
+（macOS 的默认 shell 是 zsh，请改为运行 `$HOME/miniconda3/bin/conda init zsh`。）
+
+然后**关闭当前终端，重新打开一个新的终端。** 这一步必须做：改动只在新终端里生效。
+
+**检查：** 新终端的命令提示符以 `(base)` 开头，并且
+
+```bash
+conda --version
+```
+
+能打印出版本号（测试安装时打印的是 `conda 26.7.1`）。
+
+### 2.4 接受 Anaconda 服务条款
+
+新版 Miniconda 在你接受默认频道的服务条款之前，拒绝创建任何环境。
+如果跳过这一步，§4 会报错
+`CondaToSNonInteractiveError: Terms of Service have not been accepted`。
+
+```bash
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+```
+
+**检查：** 打印出的两行分别是
+`accepted Terms of Service for https://repo.anaconda.com/pkgs/main` 和
+`accepted Terms of Service for https://repo.anaconda.com/pkgs/r`。
+
+---
+
+## 3. 下载代码
+
+```bash
+cd ~
 git clone https://github.com/ZishanShu/BatteryML-Agent.git
 cd BatteryML-Agent
 ```
 
-后面所有命令都默认你**位于 `BatteryML-Agent` 目录内**。
-如果之后新开了终端，请先 `cd` 回到这个目录。
-
-确认你在正确的位置：
+**检查：**
 
 ```bash
 ls
 ```
 
-你应该看到 `batteryml`、`batteryml_web`、`configs`、`requirements.txt` 等。
-如果没看到，说明目录不对。
+列表中包含 `batteryml`、`batteryml_web`、`configs`、`requirements.txt` 和 `README.md`。
+
+> **重要：** 从这里开始，本指南的每一条命令都要在 **`BatteryML-Agent` 文件夹里**执行。
+> 以后每次打开新终端，都先运行 `cd ~/BatteryML-Agent`。
 
 ---
 
-## 3. 创建 Python 环境
-
-这一步把 BatteryML 的依赖和你电脑上其他东西隔离开，
-避免升级或破坏你已经在用的包。**二选一即可。**
-
-<details open>
-<summary><b>方案 A — conda（如果你已经在用 Anaconda，推荐）</b></summary>
+## 4. 创建 Python 环境
 
 ```bash
 conda create -n batteryml python=3.10 -y
 conda activate batteryml
 ```
 
-每次新开终端，都需要重新运行 `conda activate batteryml`。
-
-</details>
-
-<details>
-<summary><b>方案 B — venv（Python 自带，无需额外安装）</b></summary>
-
-```bash
-python3 -m venv .venv
-
-# macOS / Linux：
-source .venv/bin/activate
-
-# Windows PowerShell：
-.venv\Scripts\Activate.ps1
-```
-
-每次新开终端，都需要重新运行上面的 `activate` 那一行。
-
-</details>
-
-**确认是否成功。** 命令行提示符前面应该出现 `(batteryml)` 或 `(.venv)`。
-检查 Python 版本：
+**检查：** 命令提示符现在以 `(batteryml)` 开头（不再是 `(base)`），并且
 
 ```bash
 python --version
 ```
 
-期望输出：`Python 3.9.x` 或更高。
-如果显示 3.8 或更低，请退回去用更新的 Python 重建环境。
+打印 `Python 3.10.x`。
+
+本指南是用 Python 3.10 测试的。不要用 Python 3.13：
+`requirements.txt` 要求 `numpy<2.0`，而它没有 Python 3.13 的安装包。
 
 ---
 
-## 4. 安装依赖
+## 5. 安装 PyTorch
+
+先单独安装 PyTorch，这样可以在装其他东西之前先确认 GPU 是否可用。
 
 ```bash
-pip install --upgrade pip
+python -m pip install --upgrade pip
+pip install torch
+```
+
+这是整个安装过程中最大的一次下载（测试安装中：PyTorch 2.14.0 加上它自带的 NVIDIA CUDA 库，
+磁盘占用约 5.5 GB，在高速网络下用时 222 秒）。
+这同一个安装包在**有 GPU 和没有 GPU** 的机器上都能用。
+
+**检查：**
+
+```bash
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+| 打印结果 | 含义 |
+| --- | --- |
+| 在**没有** GPU 的机器上打印 `2.14.0+cu130 13.0 False` | 正确。全部在 CPU 上运行。 |
+| 在**有** GPU 的机器上最后是 `… True` | 正确。可以使用 GPU。 |
+| 在**有** GPU 的机器上最后是 `… False` | 你的 NVIDIA 驱动比 PyTorch 编译时用的 CUDA 版本旧。见下文。 |
+
+**仅当你有 GPU 却打印了 `False` 时：** 比较第二个数字（PyTorch 编译所用的 CUDA 版本，例如 `13.0`）
+和 §1 中 `nvidia-smi` 显示的 `CUDA Version`。如果 `nvidia-smi` 显示的数字更小，
+要么更新 NVIDIA 驱动，要么换成对应你 CUDA 版本的 PyTorch。
+准确的命令请到 <https://pytorch.org/get-started/locally/> 的选择器里生成
+（选 *Pip*、*Linux*、你的 CUDA 版本）。它的形式如下——`cu126` 表示 CUDA 12.6：
+
+```bash
+pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu126
+```
+
+然后重新运行上面的检查命令。
+
+---
+
+## 6. 安装其余依赖
+
+```bash
 pip install -r requirements.txt
 ```
 
-这会安装 numpy、pandas、scikit-learn、xgboost、torch、streamlit 等。
-这是最慢的一步，花上几分钟是正常的，其中 `torch` 体积最大。
+这会安装 numpy、scipy、pandas、numba、scikit-learn、xgboost、h5py、matplotlib、
+streamlit 以及 BatteryML 需要的其他包（测试安装用时 53 秒）。
 
-> **如果你的机器没有 NVIDIA 显卡**，默认的 `torch` 依然可用——它会在 CPU 上运行。
-> 本指南中的任何步骤都不需要 CUDA。
+如果你是以 `root` 身份登录的，pip 会打印一条以
+`WARNING: Running pip as the 'root' user` 开头的警告。在 conda 环境里，这条警告不影响使用。
 
-确认关键依赖都能导入：
+**检查：**
 
 ```bash
 python -c "import numpy, pandas, sklearn, xgboost, torch, streamlit; print('all imports OK')"
 ```
 
-期望输出：
+打印 `all imports OK`。
 
-```
-all imports OK
-```
+> **不要运行 `pip install .`** 上游 BatteryML 的 README 要求这一步，但 BatteryML-Agent 不需要：
+> 网站和命令行工具总是从这个文件夹加载 BatteryML。
+> 执行 `pip install .` 会把代码的一份快照复制进环境，
+> 而这份副本在你之后运行 `git pull` 时**不会**被更新。
 
-如果某一行报错，重新运行 `pip install -r requirements.txt` 并阅读报错，
-它通常会指出缺少哪个系统库。
+可选——删除 pip 的下载缓存，释放 3.5 GB 磁盘空间：
+
+```bash
+pip cache purge
+```
 
 ---
 
-## 5. 验证环境
-
-在接触任何数据之前，先确认安装是正常的：
+## 7. 运行健康检查
 
 ```bash
 python -m scripts.verify.run_all
 ```
 
-它会运行 13 项独立检查，每项打印一行。
-在全新克隆、**还没有数据**的情况下，期望结果是：
+它会运行 13 项检查，每项打印一行。在还没有数据的新安装上，最后一行正好是：
 
 ```
-9 passed, 2 failed, 2 skipped of 13 check(s)
+10 passed, 1 failed, 2 skipped of 13 check(s)
 ```
 
-等你预处理完一个数据集（§7）之后，`DATA-01` 就会开始通过，
-结果变为 `10 passed, 2 failed, 1 skipped`。
+**这个结果是正确的。** 由于那一项 failed，这条命令的退出码也是 `1`，这同样是预期中的。
+每一行应该显示：
 
-**此阶段你真正该关注的：**
-
-| 检查项 | 应该是 | 如果不是 |
+| 检查项 | 预期 | 原因 |
 | --- | --- | --- |
-| `CLI-01 cli_contract` | `[PASS]` | 安装不完整，重做 §4 |
-| `EXT-01 extension_contract` | `[PASS]` | 同上 |
-| `CFG-01 config_validity` | `[PASS]` | 阅读提示信息，它会指出是哪个配置 |
-| `DATA-01 dataset_status` | §6 之前 `[SKIP]`，§7 之后 `[PASS]` | 它报告数据状态，没有数据时就跳过 |
-| `SPLIT-01 split_requirements` | `[SKIP]` | 正常——你还没有预处理数据 |
+| `ENV-01` `CLI-01` `CFG-01` `VAL-01` `EXT-01` `DEV-01` `INTENT-01` `RUN-01` `UI-01` `FIG-01` | `[PASS]` | 安装完整。 |
+| `DATA-01` `SPLIT-01` | `[SKIP]` | 还没有下载数据（§8）。 |
+| `REG-01` | `[FAIL]` | 上游 BatteryML 列出了六种没有预处理器的循环仪格式（`BATTERYARCHIVE`、`BIOLOGIC`、`INDIGO`、`LANDT`、`MACCOR`、`NOVONIX`）。它不影响本指南的任何步骤。 |
 
-**全新克隆上预期会出现的两个 failed**，它们都不影响本指南的任何步骤：
-
-- `ENV-01 environment` —— 报告 `fire` 未安装。它在 `requirements.txt` 中声明，
-  但仓库里没有任何模块 import 它。
-- `REG-01 registry_integrity` —— 报告上游 BatteryML 声明了六种 cycler 输入格式
-  （`BATTERYARCHIVE`、`BIOLOGIC`、`INDIGO`、`LANDT`、`MACCOR`、`NOVONIX`）
-  却没有对应的预处理器。这是**上游的缺口**，不是 BatteryML-Agent 的功能退化。
-
-你可能还会看到 `VAL-01` 提示有 1 个配置被**正确拒绝**，
-原因是某个第三方源码没有包含在本仓库中。那是 `CPTransformer`——
-一个可选的深度模型，其网络代码位于另一个仓库。
-这对你没有任何影响，其他所有模型都能正常运行。详见 §15。
-
-逐项说明见 [`docs/VERIFY.md`](./docs/VERIFY.md)。
-机器可读的报告会写到 `runs/verify/verification_report.json`。
+如果除 `REG-01` 以外还有 `[FAIL]`，请阅读它的提示信息——里面写明了问题所在——并参考 §18。
+完整报告会写入 `runs/verify/verification_report.json`。
 
 ---
 
-## 6. 获取电池数据
+## 8. 下载 MATR 数据集
 
-本指南使用 **MATR**（MIT/Toyota 的 LFP 数据集，180 个电芯）——本平台的参考示例。
+MATR 包含 180 个 LFP/石墨电芯，是本指南使用的参考数据集。
 
 ```bash
 python batteryml_web/core/run_batteryml_cli.py download MATR data/raw/MATR
 ```
 
-> **一定要通过 `batteryml_web/core/run_batteryml_cli.py` 调用命令行。**
-> 直接运行 `python bin/batteryml.py` 会报
-> `ModuleNotFoundError: ... 'batteryml' is not a package`，
-> 因为该脚本的文件名遮蔽了它自己要导入的同名包。
+这会从 `data.matr.io` 下载四个很大的 `.mat` 文件，耗时较长，请让它一直运行。
 
-这会下载 4 个 `.mat` 文件（总计数 GB），需要一段时间。下载完成后确认：
+> 始终通过 `batteryml_web/core/run_batteryml_cli.py` 启动 BatteryML。
+> 直接运行 `python bin/batteryml.py` 会报错
+> `ModuleNotFoundError: No module named 'batteryml.…'; 'batteryml' is not a package`。
+
+**检查：**
 
 ```bash
 ls -lh data/raw/MATR
+find data/raw/MATR -type f -size 0
 ```
 
-期望看到：`MATR_batch_20170512.mat`、`MATR_batch_20170630.mat`、
+第一条命令正好列出下面四个文件，而且每个都远大于零：
+`MATR_batch_20170512.mat`、`MATR_batch_20170630.mat`、
 `MATR_batch_20180412.mat`、`MATR_batch_20190124.mat`。
+第二条命令必须**什么都不打印**。
 
-**这条命令能下载的数据集：** `MATR`、`HUST`、`CALCE`、`RWTH`。
+> **如果下载中断、报错，或者第二条命令打印出了文件名：** 删除整个文件夹后重新下载。
+>
+> ```bash
+> rm -rf data/raw/MATR
+> python batteryml_web/core/run_batteryml_cli.py download MATR data/raw/MATR
+> ```
+>
+> 必须这样做，因为 BatteryML 会在下载**之前**就先创建文件。中断之后，不完整的文件留在磁盘上，
+> 再次运行下载命令只会打印 `[INFO] data/raw/MATR/…mat already exists. Skip it.`，并保留那个损坏的文件。
 
-**BatteryML 能预处理但不能自动下载的数据集**——`HNEI`、`SNL`、`UL_PUR`、`OX`
-——需要手动获取，参见 [`dataprepare.md`](./dataprepare.md)，
-放到 `data/raw/<名称>/` 下，再执行 §7。
+其他数据集：
 
-**其他数据集**（就绪层会列出的 `MICH`、`MICH_EXP`、`SDU`、`Stanford_2`、
-`Tongji`、`XJTU`、`ISU_ILCC`）来自 BatteryLife 数据分发，
-没有对应的原生 BatteryML 预处理器。它们**能被识别为原始数据，但无法在这里预处理**。
-详见 §8 与 §15。
+- `HUST`、`CALCE`、`RWTH` 可以用同样的方式下载——把命令中两处 `MATR` 都换掉。
+- `HNEI`、`SNL`、`UL_PUR`、`OX` 无法用这条命令下载。请按 [`dataprepare.md`](./dataprepare.md)
+  中的说明手动下载，并把文件放到 `data/raw/<名称>/`。
 
 ---
 
-## 7. 预处理并登记数据
+## 9. 预处理数据集
 
-原始循环仪文件不是模型直接读取的格式。
-这一步把它们转换成 BatteryML 统一的 `BatteryData` 格式。
+模型不直接读取原始文件。预处理会把它们转换成 BatteryML 自己的格式，每个电芯一个 `.pkl` 文件。
 
 ```bash
-python batteryml_web/core/run_batteryml_cli.py preprocess \
-  MATR data/raw/MATR data/processed/MATR
+python batteryml_web/core/run_batteryml_cli.py preprocess MATR data/raw/MATR data/processed/MATR
 ```
 
-确认：
+**检查：**
 
 ```bash
 ls data/processed/MATR | wc -l
 ```
 
-期望输出：**180**——每个电芯一个 `.pkl` 文件。
+打印 `180`。
 
-然后生成网页界面读取的清单文件。**Dataset Overview** 页面列出的就是它：
-
-```bash
-python tools/sync_data_and_config_manifests.py
-```
-
-它会在当前这个仓库内写出 `data/metadata/dataset_manifest.json` 和
-`data/metadata/model_config_manifest.json`。确认 MATR 已登记：
-
-```bash
-python -c "
-import json
-d = json.load(open('data/metadata/dataset_manifest.json'))
-print('present datasets:', [x['name'] for x in d if x.get('status') == 'present'])
-"
-```
-
-期望输出：`present datasets: ['MATR']`，以及你准备好的其他数据集。
-
-> 如果要描述**另一个**仓库副本（而不是脚本所在的这个），
-> 运行前设置 `BATTERYML_ROOT=/path/to/checkout` 即可。
-
-> **数据流向始终是
-> `data/raw/<名称>` → 预处理 → `data/processed/<名称>` → 运行。**
-> 训练永远不读原始文件。如果之后看到 `AssertionError: data/processed/MATR`，
-> 说明这一步没有执行，**并不是**网页层坏了。
+如果预处理中止并报错
+`FileNotFoundError: Batch file not found: data/raw/MATR/MATR_batch_….mat`，
+说明 §8 的下载不完整：重新做 §8，然后再运行这一步。
 
 ---
 
-## 8. 数据集就绪状态
-
-就绪状态完全由文件系统推断得出，与网页界面显示的是同一个答案。
-你随时可以查看：
+## 10. 检查数据集就绪状态
 
 ```bash
 python -c "
@@ -333,307 +367,331 @@ for r in list_dataset_readiness():
 "
 ```
 
-一共只有四种状态：
+每个数据集打印一行。**检查：** MATR 那一行是
+
+```
+MATR         READY
+```
+
+四种可能的状态：
 
 | 状态 | 含义 | 该怎么做 |
 | --- | --- | --- |
-| **`READY`** | 已有处理好的 `.pkl` 电芯文件。 | 可以直接运行。 |
-| **`RAW_ONLY`** | 已识别到原始数据，但还没有预处理产物。 | 执行预处理（§7）——前提是它有可用的预处理器（§15）。 |
-| **`INCOMPLETE_PROCESSED`** | 存在 processed 目录，但里面没有可用的 `.pkl` 电芯。 | 重新预处理；上一次没有完成。 |
-| **`MISSING`** | 既没有识别到原始数据，也没有预处理产物。 | 下载或放入原始数据（§6）。 |
+| `READY` | 预处理后的 `.pkl` 文件已存在。 | 无需操作，可以直接使用。 |
+| `RAW_ONLY` | 有原始文件，但还没有预处理文件。 | 对该数据集执行 §9。 |
+| `INCOMPLETE_PROCESSED` | `data/processed/<名称>` 存在但里面没有 `.pkl` 文件——预处理失败或被中断。 | 重新执行 §9。 |
+| `MISSING` | 既没有原始文件也没有预处理文件。 | 对该数据集执行 §8。 |
 
-原始数据有三种被识别的形态：BatteryML 原生的 `data/raw/<名称>/`、
-已解压的 BatteryLife 分发 `data/raw/BatteryLife/v11/<名称>/`，
-以及与之并列的压缩包 `<名称>.zip`。
-一个只有 `.zip` 文件名、内容却不是有效压缩包的文件（即下载中断的残留）
-会被**刻意判定为不存在**。
-
-<details>
-<summary><b>示例——某台真实机器的就绪状态（不是通用预期）</b></summary>
-
-这是某台已配置好的研究服务器报告的结果。你的机器会完全不同，
-它只取决于你下载了什么。
-
-```
-READY                 MATR（180 个处理后电芯）、HUST（77 个处理后电芯）
-RAW_ONLY              CALCE、MICH、MICH_EXP、RWTH、SDU、Stanford_2、Tongji、XJTU
-INCOMPLETE_PROCESSED  HNEI、SNL、UL_PUR
-MISSING               ISU_ILCC
-```
-
-</details>
+你没下载的数据集会显示为 `MISSING`，这是正常的。
 
 ---
 
-## 9. 启动网页应用
+## 11. 启动网站
 
 ```bash
 python -m streamlit run batteryml_web/app.py
 ```
 
-打开它打印出的地址，通常是 <http://localhost:8501>。
+请在 `BatteryML-Agent` 文件夹里启动——`.streamlit/config.toml` 中的设置只会从这里读取。
 
-> **在远程服务器上？** 加上 `--server.port 8501 --server.address 0.0.0.0`，
-> 或者从本地笔记本做 SSH 端口转发：
-> `ssh -L 8501:localhost:8501 你@服务器`，然后在本地打开 `localhost:8501`。
+**检查：** 终端打印
 
-### 确定性工作流（路线 B）
+```
+  You can now view your Streamlit app in your browser.
 
-1. **Prepare Data** → **Dataset Overview** → **Refresh datasets**。
-   MATR 应该显示为 **READY**。
-2. **Run Model** → 选择 **Dataset**、**Task**（RUL prediction 或 SOH estimation）、
-   **Model**、**Device**、**Seed**。
-3. 阅读页面上的**命令预览**。那就是即将执行的完整命令——没有隐藏或额外添加的内容。
-4. 点击深色的 **Run BatteryML** 按钮。进度会实时刷新。
-5. **Review Results** → 指标表、实测-预测对比图、残差图和预测表格。
-
-界面约定：**深色实心按钮**永远是该页面的主操作，
-**描边按钮**是辅助操作，**扁平面板**只是信息展示。
-
-**设备。** 正常界面支持 **CPU 或单张 GPU**（`cpu`，或单个 `cuda:N`）。
-多卡与分布式训练**不是**受支持的产品功能，详见 §15。
-
-不开浏览器，用命令行完成同样的运行：
-
-```bash
-python batteryml_web/core/run_batteryml_cli.py run \
-  configs/baselines/sklearn/xgb/matr_1.yaml \
-  --workspace runs/native_matr_xgb \
-  --train --eval --device cpu --seed 0
+  Local URL: http://localhost:8501
 ```
 
-**三个最容易写错的地方：**
+在浏览器里打开 `http://localhost:8501`。页面标题是
+**LLM-guided BatteryML Protocol Platform**。
 
-- 配置文件路径是**位置参数**。写成 `run --config configs/...` 会报
+网站会一直运行，直到你在这个终端里按 `Ctrl+C`。关闭这个终端也会让网站停止。
+
+### 如果代码运行在远程服务器上
+
+浏览器运行在你自己的电脑上，所以需要转发端口。在**你自己的电脑上**打开一个新终端，运行
+（把 `user@server` 换成你登录服务器的方式）：
+
+```bash
+ssh -L 8501:localhost:8501 user@server
+```
+
+保持这个终端开着，然后在本地浏览器中打开 `http://localhost:8501`。
+
+> 网站没有登录功能。任何能访问 8501 端口的人都能使用它。
+> 请优先使用上面的 SSH 隧道，而不是把端口直接开放到网络上。
+
+---
+
+## 12. 在网站里完成第一次运行
+
+网站左侧有一个侧边栏。下面的步骤使用的都是网页上按钮和标签页的原文名称。
+
+### 12.1 创建一个项目
+
+1. 在 **Home** 页的 **Create New Project** 下，保留默认的 **Project name** `my_battery_project`（或输入你自己的名字）。
+2. **Projects base directory** 保持为 `runs/web_projects`。
+3. 点击 **Create New Project**。
+
+**检查：** 侧边栏的 **Current project** 下显示出你的项目名，
+并且文件夹 `runs/web_projects/my_battery_project/` 已经创建。这个项目的所有运行结果都会保存在里面。
+
+### 12.2 让网站识别数据
+
+1. 在侧边栏点击 **1. 🧪 Prepare Data**。
+2. 在 **Dataset Overview** 标签页里，点击 **Refresh datasets**。
+
+**检查：** 出现一张 **MATR** 的卡片，状态为 **Ready**。
+（点击 **Refresh datasets** 会运行 `tools/sync_data_and_config_manifests.py`，
+它会在 `data/metadata/` 中写入网站读取的两个文件。以后每次新增或预处理了数据集，都要再点一次。）
+
+### 12.3 训练并评估一个模型
+
+使用 **Agent Workflow** 页：在这里发起的运行会出现在 **Review Results** 页。
+它**不需要** API key——请求是按固定规则解析的。
+
+1. 在侧边栏点击 **Agent Workflow**。
+2. 在 **Workflow request** 中输入：
+
+   ```text
+   Use XGBoost on MATR to predict RUL.
+   ```
+
+   （点击 **Use template** 会填入格式模板 `Use [Model] on [dataset] to predict [task].`）
+3. 点击 **Analyze**。页面会显示 MATR 的就绪状态和可以运行的模型。
+4. 在 **Model (runnable models only; blocked models cannot be selected)** 中选择 **XGBoost**。
+5. 在 **Config — evaluation protocol (validated only)** 中选择
+   `configs/baselines/sklearn/xgb/matr_1.yaml`。列表里还有 `clo.yaml` 和 `matr_2.yaml`：
+   它们是同一份 MATR 数据的不同测试划分，选定一个，比较不同运行时保持一致。
+6. **1-epoch smoke test — workflow validation only; not benchmark performance.**
+   保持不勾选。（它只对神经网络模型有意义，见 §13。）
+7. 在 **Compute device** 下选择 **CPU**，如果有 GPU 也可以选 **GPU**。
+8. 点击 **Run**。页面会实时显示进度。运行过程中点击 **Stop run** 可以取消。
+
+**检查：** 运行结束后显示成功信息，并给出 RMSE、MAE 和 MAPE。
+
+### 12.4 查看结果
+
+1. 在侧边栏点击 **3. 📈 Review Results**。
+2. 在 **Run history** 下的 **Open a run** 中选择你的运行（默认选中最新的一次）。
+3. 依次查看 **Summary**、**Metrics**、**Predictions**、**Logs**、**Files** 这几个标签页。
+
+**Predictions** 标签页显示实测值与预测值对比、残差，以及预测表格。
+
+### 12.5 Run Model 页
+
+侧边栏里的 **2. 🚀 Run Model** 通过一个表单运行同样的 BatteryML 命令：
+标签页 **Configuration**（选择 **Dataset**、**Task**、**Model**、**Device**、**Seed**）、
+**Dataset Readiness**、**Command & Run**（显示完整命令，然后点击 **Run BatteryML**）
+以及 **Logs / Debug**。
+
+在这里发起的运行会保存到磁盘（§14）并显示在该页面上，但**不会出现在 Review Results 中**。
+想在 Review Results 中查看结果，请使用 **Agent Workflow**（§12.3）。
+
+---
+
+## 13. 改用命令行运行
+
+网站运行的每一个任务，本质上都是一条 BatteryML 命令。你也可以直接运行它
+（需要已激活 `batteryml` 环境，并位于 `BatteryML-Agent` 文件夹内）。
+
+**完整运行**——在 CPU 上用 MATR 训练并评估 XGBoost：
+
+```bash
+python batteryml_web/core/run_batteryml_cli.py run configs/baselines/sklearn/xgb/matr_1.yaml --workspace runs/cli_matr_xgb --train --eval --device cpu --seed 0
+```
+
+**冒烟测试**——CNN 模型只训练 1 个 epoch，只用来确认这台机器上训练流程能跑通：
+
+```bash
+python batteryml_web/core/run_batteryml_cli.py run configs/baselines/nn_models/cnn/matr_1.yaml --workspace runs/smoke_matr_cnn --train --eval --device cpu --seed 0 --epochs 1
+```
+
+把 `--device cpu` 换成 `--device cuda:0` 即可使用第一张 GPU。
+
+这条命令的三条规则：
+
+- 配置文件前面**不要**写 `--config`。写成 `run --config …` 会报错
   `unrecognized arguments: --config`。
-- `--train --eval` 是**必须的**。不加这两个参数，BatteryML 只会打印
-  workspace 路径然后退出，什么也不做。
-- 始终传入 `--seed`，这样结果才可复现。
+- `--train` 和 `--eval` 两个都必须写。缺了它们，命令只会打印 workspace 路径，什么也不做。
+- 始终写上 `--seed`，这样运行才能重复得到同样的结果。
+
+运行结束时，最后打印的一行就是分数，例如
+`{'RMSE': …, 'MAE': …, 'MAPE': …}`。
+
+> **冒烟测试的分数不是结果。** 一个 epoch 几乎什么都没训练到，它只说明数据加载、训练和评估能跑通。
+> 不要拿它和任何东西比较。已发表的 BatteryML 基准（RMSE，单位是循环数；越低越好；
+> MATR1 与 MATR2 是不同的测试集）在 [`README_BATTERYML.md`](./README_BATTERYML.md) 中。
 
 ---
 
-## 10. 运行冒烟测试
+## 14. 结果在哪里
 
-冒烟测试只回答一个问题：**这台机器上，整条执行链路能不能跑通？**
-它**不是**对模型质量的衡量。
+BatteryML 不会生成指标表格文件。它在运行结束时打印分数，
+并把分数和预测结果一起保存在一个 `.pkl` 文件里。
+
+**来自 Agent Workflow 的运行**（§12.3）：
+
+```
+runs/web_projects/<project>/agent_<dataset>_<model>/<run_id>/
+├── run.json                                  run record: command, status, seed, device, git commit, scores
+├── run.log   stdout.log   stderr.log         everything the run printed
+├── config_<timestamp>.yaml                   the config as BatteryML used it
+└── predictions_seed_<seed>_<timestamp>.pkl   predictions and scores
+```
+
+（`run.json` 记录命令、状态、seed、设备、git commit 和分数；三个日志文件包含运行时打印的全部内容；
+`config_<timestamp>.yaml` 是 BatteryML 实际使用的配置；`.pkl` 文件保存预测结果和分数。）
+
+**来自 Run Model 页、Home 页的 Run MATR Demo 按钮，或命令行 `--workspace <folder>` 的运行**（§12.5、§13）：
+
+```
+<folder>/
+├── config_<timestamp>.yaml
+└── predictions_seed_<seed>_<timestamp>.pkl
+```
+
+对于 Run Model 页，`<folder>` 是 `runs/web_projects/<project>/workspace/`，
+日志是 `runs/web_projects/<project>/logs/run_model.log`。
+
+打印某个 `.pkl` 文件里保存的分数（在 `BatteryML-Agent` 文件夹中运行；把路径换成你的文件）：
 
 ```bash
-python batteryml_web/core/run_batteryml_cli.py run \
-  configs/baselines/nn_models/cnn/matr_1.yaml \
-  --workspace runs/smoke_matr_cnn \
-  --train --eval --device cpu --seed 0 --epochs 1
+python -c "import pickle; print(pickle.load(open('runs/cli_matr_xgb/predictions_seed_0_TIMESTAMP.pkl', 'rb'))['scores'])"
 ```
-
-`--epochs 1` 正是让它成为冒烟测试的原因。
-如果你有一张 GPU，可以把 `--device cpu` 换成 `--device cuda:0`。
-
-成功的冒烟运行会输出指标和完整的预测结果。作为参考，
-在 `cuda:0` 上用完全相同的配置做一次真实的单轮运行，得到：
-
-```
-RMSE  381.609375
-MAE   254.52743530273438
-MAPE  0.34497949481010437
-42 predictions, 42 distinct values
-```
-
-> ### ⚠ 这些数字**不是**基准性能
->
-> 一个 epoch 几乎训练不了什么。冒烟运行只告诉你流程接通了——
-> 数据能加载、特征能构建、模型能训练、指标能计算、产物能写出。
-> **它完全说明不了模型预测得有多好。**
-> 不要引用、比较或发表冒烟运行的数字。
-> 关于什么才算基准性能，见 §12。
 
 ---
 
-## 11. 查看结果
+## 15. 可选：连接 LLM 助手
 
-每一次运行——无论来自网页界面还是命令行——都会写入
-`runs/web_projects/<项目名>/`：
+如果你没有 API key，跳过本节即可。第 1–14 步都不需要它。
 
+有了 key，网站还可以用自然语言解释配置、报错和结果。它从不计算任何数字，所有数字都来自 BatteryML。
+
+1. 在侧边栏打开 **Settings**。
+2. **Provider**：选择一个预设（OpenAI、Gemini、Claude、Kimi / Moonshot、GLM / Zhipu），
+   或选择 **Custom OpenAI-compatible** 以使用其他任何兼容 OpenAI 接口的服务。预设只是帮你填好 Base URL。
+3. **Base URL**：你的服务商的 API 地址（选预设时会自动填入）。
+4. **API key**：你的密钥。
+5. **Model**：你的 key 有权限使用的模型名。
+6. 先点击 **Save**，再点击 **Connect**。
+
+**检查：** 侧边栏底部的状态行从 **LLM: Not connected** 变为 **LLM: Connected**。
+
+API key 只保存在当前打开的浏览器会话中。它不会被写入任何文件、日志、运行记录或导出包，
+会话结束后即消失。永远不要把 API key 写进这个仓库里的任何文件。
+
+---
+
+## 16. 以后每次重新打开
+
+重启电脑后，或在任何新终端中：
+
+```bash
+cd ~/BatteryML-Agent
+conda activate batteryml
+python -m streamlit run batteryml_web/app.py
 ```
-project_state.json
-config.yaml
-schema_mapping.json          # 仅在你导入了自定义数据集时生成
-run_metadata.json            # git commit、包版本、seed、设备、
-                             # 配置哈希、数据指纹、耗时
-environment_check.json
-dataset_status.csv
-feature_summary.json
-training_log.txt
-metrics.csv                  # <- 你的 RMSE / MAE / MAPE
-predictions/
-figures/
-checkpoints/
-report.html
+
+然后打开 `http://localhost:8501`（如果在远程服务器上，先按 §11 建立 SSH 隧道）。
+你的项目、数据和运行结果都还在磁盘上。
+
+---
+
+## 17. 更新到新版本
+
+```bash
+cd ~/BatteryML-Agent
+conda activate batteryml
+git pull
+pip install -r requirements.txt
+python -m scripts.verify.run_all
 ```
 
-**`metrics.csv` 里就是你要引用的数字。**
-`run_metadata.json` 记录了复现这些数字所需的全部信息。
-
-在界面里，**Review Results** 会显示指标表、实测-预测对比图、残差图和预测表格。
-如果结果是「每个电芯一个寿命估计值」这种形态，就只显示这几项——
-**不会**为它画循环维度的曲线，因为那样的曲线并不存在。
-
-**可复现性。** 相同配置 + 相同 seed + 相同数据指纹，
-会产生完全一致的 `metrics.csv`。
-如果某个模型本身具有不确定性，这一事实会被**如实记录**在
-`run_metadata.json` 中，而不是被掩盖。
+更新前先用 `Ctrl+C` 停止网站，更新后再重新启动。
 
 ---
 
-## 12. 什么才算基准性能
+## 18. 常见问题排查
 
-上游 BatteryML 发布了 RUL 任务的基准表格。它位于
-**[`README_BATTERYML.md`](./README_BATTERYML.md)**（保留下来的上游 README），
-那才是用于引用和比较的参考。
-
-正确阅读方式：
-
-- 指标是 **RMSE**，单位是**循环数（cycles）**，**越低越好**；
-- **MATR1 与 MATR2 是不同的实验协议**——训练/测试划分不同。
-  MATR1 的结果不能和 MATR2 的数字相比；
-- **SOH** 的结果永远不能与 **RUL** 的基准相比；
-- **冒烟运行的结果不能与任何东西相比**（§10）。
-
-给一个具体的参照点：**MATR1 + XGBoost** 的已发表 RMSE 是 **334 个循环**。
-如果你用完全相同的配置做一次正常训练，结果落在这个量级附近，
-说明流程接通了。
-而使用了不同划分、不同任务，或只跑了一个 epoch 的运行，则不能这样比较。
-
-平台会替你把关：当实验协议不匹配时，结果页面会**拒绝**把已发表的基准值
-与你的结果并列显示。
-
----
-
-## 13. 可选：LLM 助手
-
-**如果你只想要预测结果，可以完全跳过本节。**
-上面所有内容都不依赖它，可离线运行，不需要任何账号。
-
-助手用于解释配置、诊断报错、用自然语言解读结果。
-它不计算任何数字，也不判断就绪状态。
-
-在左侧栏打开 **Settings**，填写：
-
-| 字段 | 填什么 |
-| --- | --- |
-| **Provider** | 选一个预设，或选 **Custom OpenAI-compatible** 自己填写端点 |
-| **Base URL** | 你的服务商提供的 OpenAI 兼容端点 |
-| **Model** | 你的 key 有权限使用的模型名 |
-| **API key** | 你的密钥——仅保存在当前浏览器会话中 |
-
-然后先点 **Save**（在本会话中保存），再点 **Connect**（测试连接）。
-
-任何 OpenAI 兼容端点都可以使用。下拉框提供的预设
-——OpenAI、Gemini、Claude、Kimi / Moonshot、GLM / Zhipu——
-纯粹是为了方便，帮你自动填好 Base URL；预设**不会锁定**该字段，
-选择 **Custom OpenAI-compatible** 可以填入任何你有权访问的网关。
-列出某个预设不代表推荐，也不是必须使用其中之一。
-
-**关于你的 API key：**
-
-- 它**只保存在当前浏览器会话中**。
-- 它**绝不会**被写入任何仓库文件、配置、项目元数据、`run_metadata.json`、
-  运行历史、日志、导出的结果包，或展示给你的报错信息中。
-- 会话结束即消失，下次需要重新输入。
-- **永远不要**把 API key 粘贴进任何会被 git 提交的文件里。
-
-如果助手不可用——没有 key、没有网络、服务商限流——
-每个页面仍然完全可以手动操作。这是设计上的硬性要求，不是降级方案。
-
----
-
-## 14. 常见问题排查
-
-| 你看到的报错 | 含义 | 解决办法 |
+| 报错或现象 | 原因 | 解决办法 |
 | --- | --- | --- |
-| `ModuleNotFoundError: ... 'batteryml' is not a package` | 你直接运行了 `python bin/batteryml.py` | 改用 `python batteryml_web/core/run_batteryml_cli.py ...` |
-| `unrecognized arguments: --config` | 配置路径是位置参数 | 写 `run configs/....yaml`，不要写 `run --config ...` |
-| 运行后只打印 workspace 路径就退出了 | 缺少 `--train --eval` | 补上这两个参数 |
-| `AssertionError: data/processed/MATR` | 没有执行预处理 | 执行 §7。这**不是**网页层的 bug |
-| 网页显示「No datasets are available yet」 | 预处理之后没有重新生成清单 | 运行 `python tools/sync_data_and_config_manifests.py`，再点 **Refresh datasets** |
-| 某个数据集显示 `RAW_ONLY` 且无法预处理 | 它没有原生预处理器 | 见 §8 与 §15 |
-| 某个数据集显示 `INCOMPLETE_PROCESSED` | 预处理没有完成 | 对该数据集重新执行 §7 |
-| `[FAIL] ENV-01 ... not installed: fire` | 声明了但未被使用的依赖 | 全新克隆上属预期（§5）；`pip install fire` 可消除 |
-| `[FAIL] REG-01 ... have no registered preprocessor` | 上游 BatteryML 的缺口 | 属预期（§5）；不是 BatteryML-Agent 的退化 |
-| 远程服务器上浏览器打不开 | Streamlit 只绑定了 localhost | 用 SSH 端口转发，或加 `--server.address 0.0.0.0` |
-| `CUDA out of memory` | 模型超出显存 | 改用 `--device cpu`，或换更小的模型。本指南不需要 GPU |
+| `conda: command not found` | §2.3 之后没有重新打开终端。 | 关闭终端，重新打开。如果仍然没有，再运行一次 `$HOME/miniconda3/bin/conda init bash`。 |
+| `CondaToSNonInteractiveError: Terms of Service have not been accepted` | 跳过了 §2.4。 | 运行 §2.4 中的两条命令。 |
+| 命令提示符显示 `(base)` 而不是 `(batteryml)` | 环境没有激活。 | `conda activate batteryml` |
+| `ModuleNotFoundError: No module named 'numpy'`（或 `torch`、`streamlit` 等） | 环境没有激活，或 §5/§6 没有完成。 | `conda activate batteryml`，然后重做 §5 和 §6。 |
+| `ModuleNotFoundError: … 'batteryml' is not a package` | 直接运行了 `python bin/batteryml.py`。 | 改用 `python batteryml_web/core/run_batteryml_cli.py …` |
+| `ModuleNotFoundError: No module named 'batteryml_web'` | 命令不是在 `BatteryML-Agent` 文件夹里运行的。 | `cd ~/BatteryML-Agent` 后重新运行。 |
+| 有 GPU 的机器上 `torch.cuda.is_available()` 打印 `False` | NVIDIA 驱动比 PyTorch 的 CUDA 版本旧。 | 见 §5 最后一部分。 |
+| 下载失败后出现 `[INFO] data/raw/MATR/… already exists. Skip it.` | 留下了不完整的文件。 | `rm -rf data/raw/MATR`，然后重做 §8。 |
+| `FileNotFoundError: Batch file not found: data/raw/MATR/…` | 下载不完整。 | 重做 §8，再做 §9。 |
+| MATR 显示 `INCOMPLETE_PROCESSED` | 预处理失败或被中断。 | 重做 §9。 |
+| 运行模型时报 `AssertionError: data/processed/MATR` | 没有执行 §9。 | 执行 §9。 |
+| `unrecognized arguments: --config` | 在配置文件前面写了 `--config`。 | 去掉 `--config`。 |
+| 运行只打印一个路径就结束了 | 缺少 `--train --eval`。 | 两个都加上。 |
+| 健康检查出现 `[FAIL] REG-01 …` 且退出码为 1 | 上游缺口，属预期。 | 无需处理。见 §7。 |
+| 网页显示 **No datasets are available yet.** | 网站还没有重新读取数据文件夹。 | **Prepare Data → Refresh datasets**。 |
+| 网页显示 **No run is selected. Choose one in Run History above.** | 这个项目里还没有 Agent Workflow 的运行，或者运行是从 Run Model 页发起的。 | 从 **Agent Workflow** 运行一个模型（§12.3）。 |
+| 在自己电脑上打不开 `localhost:8501` | 网站运行在远程服务器上。 | 使用 §11 中的 SSH 隧道。 |
+| `CUDA out of memory` | 模型放不进 GPU 显存。 | 选择 **CPU** / `--device cpu`。 |
 
-还是卡住？运行 `python -m scripts.verify.run_all`，
-把输出和 `runs/verify/verification_report.json` 一起提 issue。
-那份报告会指明是哪一项检查失败以及对应的修正动作。
+**完全从头再来**——只删除环境；你的代码、数据和运行结果都会保留：
 
----
+```bash
+conda deactivate
+conda env remove -n batteryml -y
+```
 
-## 15. 已知限制
-
-如实写在这里，因为做到一半才发现这些，比现在读到要糟糕得多。
-
-- **有些模型需要你自行提供第三方源码。** `CPTransformer` 封装的网络代码
-  位于另一个仓库（`third_party/` 下），本仓库不包含。
-  它会被**自动跳过**，不影响其他任何功能；它的配置会被报告为
-  「不可用」而不是「有错」。
-- **有些数据集在这里只能停留在 `RAW_ONLY`。** BatteryLife 系列数据集
-  （`MICH`、`MICH_EXP`、`SDU`、`Stanford_2`、`Tongji`、`XJTU`、`ISU_ILCC`）
-  能被识别为原始数据，但没有原生 BatteryML 预处理器，
-  因此无法通过本流程达到 `READY`。
-- **有六种 cycler 格式在上游被声明但未实现**：
-  `BATTERYARCHIVE`、`BIOLOGIC`、`INDIGO`、`LANDT`、`MACCOR`、`NOVONIX`。
-  `REG-01` 每次都会报告这一点（§5）。
-- **一个 epoch 的运行是冒烟测试，不是结果**（§10）。
-- **并非所有「数据集 × 模型 × 任务」的组合都可运行。** Run Model 页面
-  只会提供配置与数据都确实存在的组合；缺任何一项的组合会被报告为
-  blocked 并给出原因，而不是在执行时才悄悄失败。
-- **正常界面只支持 CPU 或单张 GPU。** 多卡与分布式（DDP）训练
-  **不是**受支持的产品功能，界面上也不提供，请不要据此做规划。
-- **LLM 助手依赖网络与服务商访问。** 它是可选的、可能不可用，
-  路线 B 的任何环节都不依赖它。
-- **Windows 未经验证。** 本指南的命令只在 Linux 上实际执行过。
+然后从 §4 重新开始。
 
 ---
 
-## 16. 本指南的验证情况
+## 19. 已知限制
 
-这里把话说清楚，因为一份夸大自己测试范围的教程只会浪费你的时间。
+- **CPTransformer** 需要把另一个仓库的源代码放到 `third_party/BatteryLife/`，而它不包含在本仓库中。
+  没有它时，只有这一个模型不可用，其他所有模型都正常。健康检查（`VAL-01`）会提到它。
+- BatteryLife 系列数据集（`MICH`、`MICH_EXP`、`SDU`、`Stanford_2`、`Tongji`、`XJTU`、`ISU_ILCC`）
+  没有 BatteryML 预处理器。它们能被识别（`RAW_ONLY`），但无法在这里预处理。
+- 点击 **Refresh datasets** 之后，就绪状态列表（§10）里还会多出一行 `BatteryLife  MISSING`。
+  它来自刷新时创建的 `data/raw/BatteryLife/` 文件夹，并不是一个数据集，可以忽略。
+- 在 **Run Model** 页发起的运行不会列在 **Review Results** 中（§12.5）。
+- 每次运行只能用一个设备：CPU，或一张 GPU。网站不支持多卡训练。
+- 并非所有「数据集 × 模型 × 任务」的组合都有配置文件。网站只会提供实际存在的组合。
+- 只在 Linux 上测试过。
 
-**在干净的 Linux 容器（Python 3.11、无任何数据集）中实际执行过：**
+---
 
-- `pip install -r requirements.txt` 以及 §4 的导入自检
-- `python -m scripts.verify.run_all`（§5）——在**没有 `data/` 也没有
-  `third_party/` 的全新 worktree** 中：**9 passed、2 failed、2 skipped**，
-  两个 failed 正是 `ENV-01`（`fire`）与 `REG-01`（上游预处理器缺口），
-  与 §5 描述完全一致
-- 在没有 `third_party/` 目录的克隆上运行
-  `python batteryml_web/core/run_batteryml_cli.py run --help`——可正常启动并打印用法
-- §8 的就绪状态查询命令——已运行，退出码 0，输出了那四种状态的词汇表
-- §10 的冒烟运行命令——已解析并运行到
-  `AssertionError: data/processed/MATR`，
-  这验证了包括 `--epochs` 在内的**命令语法**，仅此而已
-- `python tools/sync_data_and_config_manifests.py`（§7）——
-  在仓库内写出了 15 条数据集记录和 180 条模型配置记录
-- `python -m streamlit run batteryml_web/app.py`（§9）——已启动，
-  上文提到的各个页面在真实浏览器中渲染成功
-- 仓库自带的测试套件：**1355 个测试，0 失败**
+## 20. 测试版本与验证情况
 
-**由一台已配置好的研究服务器报告，并非在此执行：**
+在一台没有 GPU 的 Linux x86_64 机器上，从一个空的用户目录开始，按本指南从 §1 执行到 §7 装好的版本：
 
-- MATR `READY`，180 个处理后电芯；HUST `READY`，77 个
-- `python -m unittest -v tests.test_agent_config_selection`——12/12 通过
-- §10 中 MATR + CNN 的单轮冒烟运行，包括其指标与 42 个互不相同的预测值
+| 组件 | 版本 |
+| --- | --- |
+| conda | 26.7.1 |
+| Python | 3.10.21 |
+| torch | 2.14.0+cu130 |
+| numpy | 1.26.4 |
+| scipy | 1.15.3 |
+| pandas | 2.3.3 |
+| numba | 0.67.0 |
+| scikit-learn | 1.7.2 |
+| xgboost | 3.2.0 |
+| h5py | 3.16.0 |
+| matplotlib | 3.10.9 |
+| streamlit | 1.64.0 |
 
-**在编写本指南的过程中，任何环境下都未执行过：**
+哪些真正执行过、哪些没有：
 
-- MATR 的下载（§6）与预处理（§7）。本环境没有下载任何数据集。
-  那 4 个文件名与「180」这个数量来自数据集登记与项目记录。
-- 完整的多轮训练/评估。§12 中的 334 个循环是**上游已发表的基准值**，
-  不是这里实测出来的。
-- §1 的所有时间——均为估计值。
-- macOS 与 Windows。
-
-如果某一步在你的机器上表现不同，欢迎提 issue——
-那是本指南的疏漏，不是你的问题。
+| 步骤 | 情况 |
+| --- | --- |
+| §1 `git`/`curl` 检查，§2 Miniconda（下载、安装、`conda init`、重开终端、服务条款），§3 克隆，§4 环境，§5 `pip install torch` 及检查（CPU），§6 依赖与导入检查，§7 健康检查（`10 passed, 1 failed, 2 skipped`） | 完全按文中命令执行。 |
+| §8 下载命令 | 已执行；它连上了 `data.matr.io`，但测试机器的网络策略拦截了传输，所以没有下载到数据。「损坏文件被跳过」的行为和恢复命令都是用这次失败复现出来的。 |
+| §9 预处理、§10 就绪状态 | 在无数据情况下执行：观察到了缺少原始文件时的报错，以及 `INCOMPLETE_PROCESSED` 状态。数量 `180` 和 `MATR READY` 来自另一台存有 MATR 预处理数据的服务器。 |
+| §11 启动网站、§12.1 创建项目、§12.2 Refresh datasets、§12 中的页面与按钮名称 | 在浏览器中针对这次安装实际执行过。 |
+| §12.3–12.4 在网站中运行并查看结果，§13 一次完整的运行 | 此处未执行（没有数据）。§12.3 中的名称取自代码。§13 的命令行检查到数据步骤为止（`AssertionError: data/processed/MATR`）。一次 1 个 epoch 的 MATR CNN 运行在另一台服务器上完成过。 |
+| §5 的 GPU 情形、`--index-url` 命令、`nvidia-smi` | 未执行（测试机器没有 GPU；`download.pytorch.org` 被拦截）。 |
+| §15 LLM 助手 | 在浏览器中核对了字段和按钮；没有实际建立连接。 |
+| macOS、Windows/WSL2 | 未测试。 |
 
 ---
 
@@ -641,16 +699,14 @@ report.html
 
 | 文档 | 内容 |
 | --- | --- |
-| [`README_BATTERYML.md`](./README_BATTERYML.md) | 上游 BatteryML：论文、数据集、完整基准表 |
-| [`dataprepare.md`](./dataprepare.md) | 各数据集的手动准备方法 |
-| [`docs/VERIFY.md`](./docs/VERIFY.md) | 每一项验证检查证明了什么 |
-| [`docs/EXTENDING_MODELS.md`](./docs/EXTENDING_MODELS.md) | 如何接入你自己的模型 |
-| [`docs/AGENT_WORKFLOW.md`](./docs/AGENT_WORKFLOW.md) | 可选助手的实现方式 |
-| [`docs/SOH_PROTOCOL.md`](./docs/SOH_PROTOCOL.md) | SOH 估计的实验协议 |
+| [`README_BATTERYML.md`](./README_BATTERYML.md) | 原版 BatteryML README：论文、数据集、基准表格 |
+| [`dataprepare.md`](./dataprepare.md) | 各数据集的手动下载说明 |
+| [`docs/VERIFY.md`](./docs/VERIFY.md) | 健康检查每一行测试的内容 |
+| [`docs/EXTENDING_MODELS.md`](./docs/EXTENDING_MODELS.md) | 接入你自己的模型 |
 
 ## 引用
 
-BatteryML-Agent 构建于 BatteryML 之上。如果本项目对你有帮助，请引用：
+BatteryML-Agent 构建于 BatteryML 之上。如果你使用了它，请引用：
 
 ```bibtex
 @inproceedings{zhang2024batteryml,
