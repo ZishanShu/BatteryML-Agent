@@ -1,0 +1,84 @@
+# MATR SOH estimation — Random Forest regression.
+#
+# One of the compatible SOH baselines. Everything below the `model:` block is
+# byte-identical to configs/soh/ridge/matr.yaml on purpose: same dataset, same
+# cell-level split, same reference-capacity convention, same sample policy,
+# same feature extractor, same transformations. Only the estimator differs, so
+# two SOH results differ only by the estimator. See docs/SOH_PROTOCOL.md.
+#
+# This is model coverage, not a benchmark. No hyperparameter here was chosen
+# by looking at a score.
+
+task: 'SOH estimation'
+
+model:
+    # sklearn.ensemble.RandomForestRegressor through RandomForestRULPredictor.
+    # The RUL in the class name is naming only: SklearnModel.fit is
+    # model.fit(feature.view(n, -1), label) with no lifetime, end-of-life or
+    # cycle semantics. Displayed as "Random Forest".
+    #
+    # The first non-linear estimator on this route. Ridge, Lasso and Elastic
+    # Net all fit one global linear map from the voltage curve to SOH; a forest
+    # does not, so it is the entry that says whether the linear family's error
+    # is the feature's limit or the model's.
+    #
+    # No hyperparameters are declared, matching every Random Forest config in
+    # configs/baselines/. sklearn's defaults apply: 100 fully-grown trees,
+    # bootstrap sampling, all 37 features considered per split.
+    #
+    # Reproducibility: `random_state` is deliberately NOT pinned here. Leaving
+    # it unset means the forest draws its seeds from numpy's global RNG, which
+    # batteryml.pipeline.set_seed fixes from the run's --seed immediately
+    # before fit. Pinning it would make --seed a no-op for this model and turn
+    # the platform's seed contract into a claim that is not true.
+    # [VERIFIED] in this container on a synthetic bundle of the same width, at
+    # the same row count: two runs at seed 0 produce bit-identical predictions,
+    # and seed 0 and seed 1 produce different ones — so the seed both fixes and
+    # genuinely controls the result. Not measured on MATR.
+    #
+    # COST: the only entry here that is not near-instant. ~18 s to fit at this
+    # route's scale (≈6.4k training rows x 37) on one CPU core in this
+    # container, against well under a second for the linear models and
+    # XGBoost. Still a smoke, not a benchmark run.
+    name: 'RandomForestRULPredictor'
+
+train_test_split:
+    # Cell-level. Cells are partitioned by explicit ID before any expansion
+    # into cycle-level samples; Task.build asserts the two sides share no cell.
+    name: 'MATRPrimaryTestTrainTestSplitter'
+    cell_data_path: 'data/processed/MATR'
+
+feature:
+    # The voltage curve observed at cycle t, resampled to a fixed width plus
+    # five summary scalars. Reads cycles <= t only, and never capacity: the
+    # label is capacity / Q_ref, so capacity as a feature would make the target
+    # an arithmetic function of the input.
+    name: 'SOHVoltageCurveFeatureExtractor'
+    n_voltage_points: 32
+    n_history_cycles: 1
+    include_cycle_number: false
+
+label:
+    # SOH(cell, t) = Q_discharge(cell, t) / Q_ref(cell), a ratio.
+    name: 'CycleSOHLabelAnnotator'
+    reference_capacity_mode: 'first_valid_discharge_capacity'
+    min_cycle: 10
+    max_cycle: null
+    cycle_stride: 5
+
+feature_transformation:
+    # Kept, although a forest does not need it: splits are chosen on the order
+    # of a feature's values, and a z-score is monotone, so this cannot change
+    # a single split. It is here so that the only difference between this
+    # config and the Ridge one is the estimator — dropping it for the tree
+    # models would be a per-model protocol change, which C1 forbids, for no
+    # effect on the result.
+    name: 'ZScoreDataTransformation'
+
+label_transformation:
+    # Invertible, and DataBundle.evaluate inverse-transforms before scoring, so
+    # the recorded MAE and RMSE are on the canonical SOH ratio scale.
+    # LogScale is deliberately NOT stacked here as it is for RUL: a log of a
+    # ratio near 1.0 compresses exactly the range SOH lives in, and is
+    # undefined at 0.
+    name: 'ZScoreDataTransformation'

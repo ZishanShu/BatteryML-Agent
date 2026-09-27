@@ -1,6 +1,4 @@
-"""User-facing settings, in the left sidebar and wherever they are needed.
-
-Two problems this solves at once.
+"""The LLM configuration form. There is exactly one, and it lives in Settings.
 
 The app leaned on Streamlit's top-right menu as if it were product UI. It is
 not: it holds *developer* actions ("Clear caches", "Rerun", a screencast
@@ -8,49 +6,56 @@ recorder) that mean nothing to a battery scientist and one of which can throw
 away a run. Application settings belong somewhere we own, which is the
 sidebar.
 
-And "Explain computed result" was a dead end: disabled, with a caption
-telling the user to configure an assistant the page gave them no way to
-configure. The button is now always clickable; when the assistant is not
-configured it opens the same configuration form the sidebar shows.
+**One form, in one place.** Five surfaces used to be able to render this
+form — the sidebar, Home, Run Model, Review Results, and a dialog on the
+Agent page. They all wrote the same store, so the *values* never diverged;
+what diverged was the user's model of the app. Being asked for a provider, a
+Base URL and an API key on the Review Results page reads as "this page wants
+its own credentials", whatever the implementation does underneath, and that
+is the complaint this module now answers. Every other surface shows
+:data:`CONFIGURE_IN_SETTINGS_MESSAGE` and sends the user here.
 
-**One source of truth.** Both entry points read and write the existing LLM
-session state through :mod:`batteryml_web.ui.llm_state` — the same
-``llm_base_url`` / ``llm_api_key`` / ``llm_model`` keys the rest of the app
-already uses. There is no second settings system.
+Everything is read and written through :mod:`batteryml_web.ui.llm_state`,
+which owns the session keys. This module contributes the provider presets
+and the widgets; it stores nothing of its own.
 
 Secrets: the API key is rendered with ``type="password"``, is never written
 to a caption, a log, a toast or a debug expander, and is never persisted by
-this module. It lives in Streamlit's session state for the session, which is
-the mechanism the app already used.
+this module. It lives in Streamlit's session state for the session only.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional
+from typing import Callable, Dict, Optional
 
 import streamlit as st
 
 from ..agent.failure_taxonomy import classify_llm_failure
 from ..agent.llm_client import test_llm_connection
 from .feedback import notify_success
+from .surfaces import PRIMARY_ROLE
 from .llm_state import (
-    LLM_STATUS_CONFIGURED,
-    describe_llm_status,
-    LLM_STATUS_CONNECTED,
-    LLM_STATUS_FAILED,
+    CUSTOM_PROVIDER,
     LLM_STATUS_NOT_CONFIGURED,
+    PROVIDER_KEY,
+    describe_llm_status,
     ensure_llm_state_defaults,
+    get_llm_provider,
     is_llm_configured,
+    llm_credentials,
+    llm_settings_fingerprint,
+    llm_settings_summary,
+    set_llm_connection_result,
     set_llm_settings,
 )
 
-#: Session key holding the pending "what to do after saving" intent.
-PENDING_ACTION_KEY = "llm_settings_pending_action"
-
-#: Session key that opens the inline fallback form.
-FORM_OPEN_KEY = "llm_settings_form_open"
-
-DIALOG_TITLE = "LLM configuration"
+#: What every surface that is *not* Settings says when the assistant is not
+#: configured. One sentence, one destination: a page that explains how to
+#: configure an assistant is a page that has started to become a second
+#: settings screen.
+CONFIGURE_IN_SETTINGS_MESSAGE = (
+    "LLM Assistant is not configured. Configure it in Settings (left sidebar)."
+)
 
 #: The two actions the form offers, in render order. Save stores; Connect
 #: stores *and* tests. Neither is "Cancel": closing the form is not an
@@ -88,16 +93,10 @@ PROVIDER_PRESETS: Dict[str, str] = {
     "Claude (OpenAI-compatible)": "https://api.anthropic.com/v1",
     "Kimi / Moonshot": "https://api.moonshot.cn/v1",
     "GLM / Zhipu": "https://open.bigmodel.cn/api/paas/v4",
-    "Custom OpenAI-compatible": "",
+    CUSTOM_PROVIDER: "",
 }
 
-CUSTOM_PROVIDER = "Custom OpenAI-compatible"
-
 PROVIDER_LABEL = "Provider"
-
-#: Session key for the chosen preset. Part of the same single settings
-#: state as the credentials themselves.
-PROVIDER_KEY = "llm_provider_preset"
 
 #: One line, because it is a hint and not a specification. The precise claim
 #: it summarises: this client speaks the OpenAI chat-completions protocol, so
@@ -118,33 +117,12 @@ FIELD_LABELS: Dict[str, str] = {
 }
 
 
-def llm_settings_summary() -> Dict[str, Any]:
-    """What the page may say about the LLM settings — never the key itself.
-
-    ``api_key_set`` is a boolean. The key's value does not appear in the
-    returned structure, so nothing built from this can leak it into a
-    caption, a log line or a test recorder.
-    """
-    ensure_llm_state_defaults()
-    return {
-        "configured": is_llm_configured(),
-        "base_url": str(st.session_state.get("llm_base_url", "")),
-        "model": str(st.session_state.get("llm_model", "")),
-        "api_key_set": bool(str(st.session_state.get("llm_api_key", "")).strip()),
-        "status": str(st.session_state.get("llm_status", LLM_STATUS_NOT_CONFIGURED)),
-    }
-
-
-def dialog_supported() -> bool:
-    """Whether this Streamlit build has ``st.dialog``.
-
-    Older builds do not; they get the inline expander fallback instead of an
-    exception. The feature is a nicety, and losing it must not break a page.
-    """
-    return callable(getattr(st, "dialog", None))
-
-
-def connect_llm(base_url: str, api_key: str, model: str) -> tuple[bool, str]:
+def connect_llm(
+    base_url: str,
+    api_key: str,
+    model: str,
+    provider: Optional[str] = None,
+) -> tuple[bool, str]:
     """Store these credentials, then test them through the existing client.
 
     The connection test is :func:`batteryml_web.agent.llm_client.test_llm_connection`
@@ -157,20 +135,18 @@ def connect_llm(base_url: str, api_key: str, model: str) -> tuple[bool, str]:
     the key is not logged, printed or returned.
     """
     ensure_llm_state_defaults()
-    set_llm_settings(base_url, api_key, model)
+    set_llm_settings(base_url, api_key, model, provider=provider)
     _invalidate_all_form_syncs()
     if not is_llm_configured():
         st.session_state["llm_status"] = LLM_STATUS_NOT_CONFIGURED
         st.session_state["llm_status_message"] = INCOMPLETE_MESSAGE
         return False, INCOMPLETE_MESSAGE
 
-    ok, message = test_llm_connection(
-        base_url=str(st.session_state.get("llm_base_url", "")),
-        api_key=str(st.session_state.get("llm_api_key", "")),
-        model=str(st.session_state.get("llm_model", "")),
-    )
-    st.session_state["llm_status"] = LLM_STATUS_CONNECTED if ok else LLM_STATUS_FAILED
-    st.session_state["llm_status_message"] = str(message)
+    # Credentials come back out of the store, not from the arguments: the
+    # store is what every other surface will use, so the test must be of
+    # what was actually written.
+    ok, message = test_llm_connection(**llm_credentials())
+    set_llm_connection_result(bool(ok), str(message))
     return bool(ok), str(message)
 
 
@@ -238,8 +214,10 @@ def render_llm_settings_form(
     """The LLM configuration form: Save and Connect.
 
     Args:
-        key_prefix: namespace for the widget keys, so the sidebar copy and
-            the dialog copy can coexist in one session.
+        key_prefix: namespace for the widget keys. Only Settings renders
+            this form now, but the parameter stays: a keyed widget's session
+            value wins over its ``value=`` argument, so two forms sharing
+            widget keys would silently become one form with two positions.
         on_saved: called after Save writes the settings.
         on_connected: called after Connect writes them *and* the test
             succeeded. Not called on a failed test.
@@ -257,7 +235,7 @@ def render_llm_settings_form(
     st.caption(SUPPORTED_API_NOTE)
 
     names = list(PROVIDER_PRESETS)
-    stored = str(st.session_state.get(PROVIDER_KEY) or CUSTOM_PROVIDER)
+    stored = get_llm_provider()
     provider = st.selectbox(
         PROVIDER_LABEL,
         names,
@@ -296,10 +274,23 @@ def render_llm_settings_form(
 
     columns = st.columns(2)
     action: Optional[str] = None
-    if columns[0].button(SAVE_LABEL, key=f"{key_prefix}_save", use_container_width=True):
+    # Save is this panel's primary action: it is the one that commits
+    # state. Connect stays secondary — it verifies what Save stored, and a
+    # panel with two filled buttons side by side ranks neither of them.
+    #
+    # The role is passed as `type=` rather than through
+    # `surfaces.primary_action`, because the helpers wrap `st.button` and
+    # this call goes through a column receiver. Same native parameter,
+    # same rendered `data-testid`, so the stylesheet treats it identically.
+    if columns[0].button(
+        SAVE_LABEL,
+        key=f"{key_prefix}_save",
+        type=PRIMARY_ROLE,
+        use_container_width=True,
+    ):
         # Stores only. Whether these credentials work is a separate question,
         # asked by Connect, so saving can never block on a network call.
-        set_llm_settings(base_url, api_key, model)
+        set_llm_settings(base_url, api_key, model, provider=provider)
         _invalidate_all_form_syncs()
         notify_success(
             SAVED_MESSAGE,
@@ -312,7 +303,7 @@ def render_llm_settings_form(
     if columns[1].button(
         CONNECT_LABEL, key=f"{key_prefix}_connect", use_container_width=True
     ):
-        ok, message = connect_llm(base_url, api_key, model)
+        ok, message = connect_llm(base_url, api_key, model, provider=provider)
         if not ok and message == INCOMPLETE_MESSAGE:
             # Not a connection failure: nothing was sent, because a field is
             # empty. Classifying this as an LLM error would report "the cause
@@ -348,17 +339,23 @@ def render_llm_settings_form(
 def llm_settings_signature() -> str:
     """Identity of the current settings, for toast de-duplication.
 
-    Built from the endpoint and model plus *whether* a key is set — never
-    from the key itself, so nothing derived from this can carry it.
+    The one implementation lives in :mod:`batteryml_web.ui.llm_state`, beside
+    the values it is derived from. Built from provider, endpoint and model
+    plus *whether* a key is set — never from the key itself, so nothing
+    derived from this can carry it.
     """
-    summary = llm_settings_summary()
-    return "|".join(
-        [
-            summary["base_url"],
-            summary["model"],
-            "key" if summary["api_key_set"] else "nokey",
-        ]
-    )
+    return llm_settings_fingerprint()
+
+
+def render_configure_in_settings_notice() -> None:
+    """What a non-Settings surface shows when nothing is configured.
+
+    One caption, no fields. This is the whole of the "second form" removal:
+    a page that needs an assistant says so and names where to set one up,
+    and a page that tries to be helpful by offering the fields is a page
+    that has become a second settings screen.
+    """
+    st.caption(CONFIGURE_IN_SETTINGS_MESSAGE)
 
 
 def render_sidebar_settings() -> None:
@@ -376,54 +373,3 @@ def render_sidebar_settings() -> None:
             else "LLM assistant: not configured"
         )
         render_llm_settings_form(key_prefix="sidebar_llm")
-
-
-def request_llm_configuration(pending_action: str) -> None:
-    """Ask for the configuration form to open, remembering why."""
-    st.session_state[PENDING_ACTION_KEY] = str(pending_action)
-    st.session_state[FORM_OPEN_KEY] = True
-
-
-def clear_llm_configuration_request() -> None:
-    st.session_state.pop(PENDING_ACTION_KEY, None)
-    st.session_state.pop(FORM_OPEN_KEY, None)
-
-
-def llm_configuration_requested() -> bool:
-    return bool(st.session_state.get(FORM_OPEN_KEY))
-
-
-def pending_action() -> Optional[str]:
-    value = st.session_state.get(PENDING_ACTION_KEY)
-    return str(value) if value else None
-
-
-def render_llm_configuration_prompt() -> Optional[str]:
-    """Show the configuration form, as a dialog where one is available.
-
-    The same two actions as the sidebar — Save and Connect — because there is
-    one form and one credential store. Returns what the user did; nothing is
-    sent anywhere from here, and in particular a successful Connect does not
-    explain anything. It only makes explaining possible: the user presses
-    Explain again, deliberately.
-    """
-    if not llm_configuration_requested():
-        return None
-    outcome: Dict[str, Optional[str]] = {"action": None}
-
-    def body() -> None:
-        st.write(
-            "The assistant is not configured yet. Add the endpoint below to "
-            "enable result explanation."
-        )
-        outcome["action"] = render_llm_settings_form(key_prefix="dialog_llm")
-
-    if dialog_supported():
-        decorated = st.dialog(DIALOG_TITLE)(body)
-        decorated()
-    else:
-        # Inline fallback for builds without st.dialog: same form, same
-        # single source of truth, no exception.
-        with st.expander(DIALOG_TITLE, expanded=True):
-            body()
-    return outcome["action"]

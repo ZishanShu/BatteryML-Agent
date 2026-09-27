@@ -237,6 +237,40 @@ def _run_results(args: argparse.Namespace) -> int:
                 "alignment_verified": artifact.cells.alignment_verified,
                 "n_dropped_nan_label": artifact.cells.n_dropped_nan_label,
             }
+        elif spec.figure_id == "soh_vs_cycle":
+            # Needs the recorded per-sample identity, not the inferred
+            # per-cell one: a cycle-level artifact has many rows per cell, so
+            # without cycle numbers there is nothing to plot against.
+            if not artifact.is_cycle_level:
+                skipped.append(
+                    render.SkippedFigure(
+                        spec.figure_id,
+                        "the artifact records no sample_index, so no prediction "
+                        "names the cycle it was made at. This figure applies to "
+                        "a cycle-level task such as SOH estimation; a "
+                        "whole-cell run has no cycle to plot against.",
+                    )
+                )
+                continue
+            records = artifact.sample_index or []
+            fig = figures.soh_vs_cycle_figure(
+                [str(record["cell_id"]) for record in records],
+                [int(record["cycle_index"]) for record in records],
+                artifact.y_true,
+                artifact.y_pred,
+                theme=theme,
+                title="SOH at observed cycles",
+                subtitle=subtitle,
+                unit_label=unit,
+                dpi=args.dpi,
+            )
+            details = {
+                "n_points": artifact.n_predictions,
+                "n_cells": len({str(record["cell_id"]) for record in records}),
+                "reference_capacity_mode": artifact.task_metadata.get(
+                    "reference_capacity_mode"),
+                "estimate_kind": "at observed cycle; not a forecast",
+            }
         elif spec.figure_id == "metrics_summary":
             fig = figures.metric_summary_figure(
                 artifact.scores,

@@ -4,7 +4,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import streamlit as st
 
@@ -33,15 +33,37 @@ def run_command_with_progress(
     cwd: Optional[Path],
     log_path: Path,
     steps: list[tuple[int, str]],
+    container: Any = None,
 ) -> dict:
+    """Run ``command``, drawing its progress into ``container``.
+
+    ``container`` is where every element this function draws goes — the bar,
+    the status line, the elapsed time, the command box and the log. It
+    defaults to ``st``, i.e. whatever container is current at the call site.
+
+    It exists because the two Run buttons live in ``st.columns`` so that they
+    sit beside another control, and anything drawn under a button inherits
+    that column's width: the run progress bar came out at 66% of the content
+    area on Run Model and 49% on the Home demo. A progress bar is a
+    full-width element — it is read as a proportion of the page — so the
+    caller hands in a container created *outside* the columns and the bar
+    spans the content area while the buttons stay side by side.
+
+    Nothing here sets a pixel width. The bar fills whatever container it is
+    given, so it stays responsive and cannot overflow.
+    """
     start = time.perf_counter()
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    progress = st.progress(0)
-    status_text = st.empty()
-    elapsed_text = st.empty()
-    cmd_box = st.empty()
-    log_box = st.empty()
+    # Every element below is drawn through this, never through `st` directly,
+    # so a caller's container is honoured for all of them or for none.
+    host = container if container is not None else st
+
+    progress = host.progress(0)
+    status_text = host.empty()
+    elapsed_text = host.empty()
+    cmd_box = host.empty()
+    log_box = host.empty()
     logs: list[str] = []
 
     cmd_box.code(" ".join(str(part) for part in command), language="bash")
@@ -86,14 +108,14 @@ def run_command_with_progress(
         progress.progress(100)
         status_text.error("Task failed. Please check logs below.")
         if return_code in {139, -11} or "segmentation fault" in output_tail.lower():
-            st.error(
+            host.error(
                 "Native dependency crash / segmentation fault detected. Possible causes: xgboost, libomp, numpy, sklearn, torch, or cache incompatibility."
             )
-        st.error(f"Return code: {return_code}")
+        host.error(f"Return code: {return_code}")
 
     elapsed_text.caption(f"Elapsed time: {_format_elapsed(elapsed)}")
-    st.caption(f"Log file: `{log_path}`")
-    with st.expander("Logs", expanded=not success):
+    host.caption(f"Log file: `{log_path}`")
+    with host.expander("Logs", expanded=not success):
         st.code(output_tail or "No logs captured.", language="text")
 
     log_path.write_text(

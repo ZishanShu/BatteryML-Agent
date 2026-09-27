@@ -1,3 +1,11 @@
+# LEGACY EXAMPLE — not the SOH estimation task.
+#
+# This config demonstrates label plumbing with DummyRULPredictor
+# (sklearn DummyRegressor, which predicts the training mean), one
+# label per cell at a single cycle, and RUL features from earlier
+# cycles. The canonical cycle-level SOH route uses
+# CycleSOHLabelAnnotator; see docs/SOH_PROTOCOL.md.
+legacy_example: true
 model:
     name: 'DummyRULPredictor'
 train_test_split:
@@ -14,7 +22,7 @@ feature:
 label:
     name: 'SOHLabelAnnotator'
     cycle_index: 300
-    mode: 'relative'  # relative or absolute
+    reference_capacity_mode: 'first_valid_discharge_capacity'
     # soh_filepath: data/exaple_qd_map.json 
 feature_transformation:
     name: 'ZScoreDataTransformation'

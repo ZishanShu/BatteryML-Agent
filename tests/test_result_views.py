@@ -370,16 +370,72 @@ class TestReproducibilityBundle(_RunDirCase):
              "packages", "note"},
         )
         self.assertIsInstance(snapshot["packages"], dict)
+
         # Whatever is on this machine's environment must not be in here.
+        #
+        # Checked against the *values* the snapshot records, not against its
+        # serialized text. Searching `json.dumps(snapshot)` for every
+        # environment value conflated two different strings: a leaked value
+        # and a legitimate package **name**. On a machine whose conda
+        # environment is itself called "batteryml", $CONDA_DEFAULT_ENV is
+        # "batteryml" — nine characters, so past the length filter — and the
+        # snapshot's own `"packages": {"batteryml": ...}` key matched it. The
+        # test failed while the code was behaving exactly as intended.
+        #
+        # A leak can only surface as a recorded value, so that is what is
+        # inspected: every string the snapshot carries, at any depth. This is
+        # stricter than the old check in the way that matters — a value is
+        # now rejected even when it would not have survived JSON escaping —
+        # and blind only to a package having the same *name* as an
+        # environment variable's content, which is not a disclosure.
         import os
 
+        def _recorded_values(node) -> list[str]:
+            if isinstance(node, dict):
+                return [v for item in node.values() for v in _recorded_values(item)]
+            if isinstance(node, (list, tuple)):
+                return [v for item in node for v in _recorded_values(item)]
+            return [node] if isinstance(node, str) else []
+
+        recorded = _recorded_values(snapshot)
         for name, value in os.environ.items():
-            if len(str(value)) < 8:
+            value = str(value)
+            if len(value) < 8:
                 continue  # too short to be a meaningful match
-            self.assertNotIn(
-                str(value), json.dumps(snapshot),
-                f"the value of ${name} leaked into the environment snapshot",
-            )
+            for carried in recorded:
+                self.assertNotIn(
+                    value, carried,
+                    f"the value of ${name} leaked into the environment "
+                    f"snapshot, in the recorded value {carried!r}",
+                )
+
+        # $CONDA_DEFAULT_ENV by name, because it is the one this test was
+        # written for and the one whose collision hid the check. Asserted
+        # whatever its length, so a short environment name is covered too.
+        conda_env = os.environ.get("CONDA_DEFAULT_ENV")
+        if conda_env:
+            for carried in recorded:
+                self.assertNotIn(
+                    conda_env, carried,
+                    "the active conda environment name leaked into the "
+                    f"environment snapshot, in {carried!r}",
+                )
+
+        # The keys must stay package names. A leak that dumped os.environ
+        # wholesale would put variable *names* here and their values beside
+        # them, which the value scan above would catch — but only if the
+        # value were long enough, so the shape is pinned as well.
+        for package in snapshot["packages"]:
+            with self.subTest(package=package):
+                self.assertNotIn("=", package)
+                self.assertNotIn("/", package)
+                self.assertNotRegex(package, r"\s")
+                self.assertNotIn(
+                    package, os.environ,
+                    f"{package!r} is an environment variable name, not a "
+                    "package; os.environ looks to have been recorded",
+                )
+
         import ast
 
         source = (

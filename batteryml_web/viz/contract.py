@@ -68,6 +68,16 @@ RESULT_FIGURES: tuple[FigureSpec, ...] = (
         description="Absolute error per test cell, sorted worst first.",
     ),
     FigureSpec(
+        figure_id="soh_vs_cycle",
+        builder="soh_vs_cycle_figure",
+        template=RESULTS_SUBDIR + "/soh_vs_cycle_{dataset}_{model}_seed{seed}.{fmt}",
+        requires_cell_ids=True,
+        description=(
+            "Measured and estimated SOH across each test cell's observed "
+            "cycles. Every point is an at-cycle estimate, not a forecast."
+        ),
+    ),
+    FigureSpec(
         figure_id="metrics_summary",
         builder="metric_summary_figure",
         template=RESULTS_SUBDIR + "/metrics_summary_{dataset}_{model}_seed{seed}.{fmt}",

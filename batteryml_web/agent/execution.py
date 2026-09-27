@@ -27,10 +27,80 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..core.device_inventory import validate_device
+from ..core.readiness import TASK_SOH
 from .intent import resolve_workflow_intent
 from .prompts import build_agent_workflow_context
 
+#: Metrics requested per task. Not one list for everything: MAPE is a
+#: percentage error, which is informative for a cycle count of order 100 and
+#: close to meaningless for an SOH ratio of order 1, where it merely restates
+#: MAE. SOH therefore asks for MAE and RMSE only, rather than inheriting the
+#: RUL set because it happens to be the default.
+TASK_METRICS: Dict[str, Tuple[str, ...]] = {
+    TASK_SOH: ("MAE", "RMSE"),
+}
+
+#: What every other task asks for — BatteryML's own CLI default.
+DEFAULT_METRICS: Tuple[str, ...] = ("RMSE", "MAE", "MAPE")
+
+
+def metrics_for_task(task: str | None) -> Tuple[str, ...]:
+    """The canonical metric list for ``task``."""
+    return TASK_METRICS.get(str(task or ""), DEFAULT_METRICS)
+
 WRAPPER = "batteryml_web/core/run_batteryml_cli.py"
+
+
+def build_run_command(
+    *,
+    config_path: str,
+    workspace: str,
+    task: str | None,
+    device: str,
+    seed: Any,
+    epochs: Optional[int] = None,
+    resume_from: Optional[str] = None,
+) -> List[str]:
+    """The argv for one BatteryML run. **The only place one is built.**
+
+    Both execution routes call this — the Agent Workflow through
+    :func:`build_execution_plan`, and the Run Model page directly — because
+    they drifted apart when each spelled the argv out for itself. The Run
+    Model page omitted ``--metric``, so the same config evaluated through
+    the two buttons reported different metrics: an SOH run scored MAE and
+    RMSE from the Agent and fell back to the CLI's ``RMSE,MAE,MAPE`` default
+    from Run Model. MAPE on a ratio of order 1 merely restates MAE, so the
+    two routes disagreed about what a result even was.
+
+    The argv follows the CLI contract in CLAUDE.md §5: ``run`` takes the
+    config as a *positional* argument, and ``--train --eval`` are mandatory —
+    without them BatteryML prints the workspace path and exits without
+    training anything.
+    """
+    command = [
+        sys.executable,
+        WRAPPER,
+        "run",
+        str(config_path),
+        "--workspace",
+        str(workspace),
+        "--train",
+        "--eval",
+        "--device",
+        str(device),
+        "--seed",
+        str(seed),
+        "--metric",
+        ",".join(metrics_for_task(task)),
+    ]
+    if epochs is not None:
+        command.extend(["--epochs", str(epochs)])
+    if resume_from:
+        # The CLI already accepts this flag and forwards it to
+        # Pipeline.train. Combined with --epochs as the *total* target,
+        # training continues from the checkpoint's epoch to that total.
+        command.extend(["--ckpt-to-resume", str(resume_from)])
+    return command
 
 
 def _registry_tables() -> Tuple[Dict[str, str], Dict[str, str], Any]:
@@ -179,6 +249,8 @@ def build_execution_plan(
     workflow_context: Optional[Dict[str, Any]] = None,
     epochs: int | None = None,
     resume_from: str | None = None,
+    split_hint: str | None = None,
+    config_path: str | None = None,
 ) -> Dict[str, Any]:
     """Build a validated, non-executing run plan for one model.
 
@@ -231,7 +303,9 @@ def build_execution_plan(
     context = (
         workflow_context
         if workflow_context is not None
-        else build_agent_workflow_context(dataset, task, repo_root=repo_root)
+        else build_agent_workflow_context(
+            dataset, task, repo_root=repo_root, split_hint=split_hint
+        )
     )
     dataset_status = str(context.get("dataset_status") or "UNKNOWN")
     resolved_task = str(context.get("task") or task)
@@ -279,7 +353,39 @@ def build_execution_plan(
         }
 
     validated = entry.get("validated_config")
+    choices = [str(c) for c in (entry.get("config_choices") or []) if c]
+    selection = str(entry.get("config_selection") or "chosen")
+    if validated and str(validated) not in choices:
+        choices = [str(validated)] + choices
+    if config_path is not None:
+        # Explicit user selection (e.g. the workflow config dropdown). It is
+        # authoritative only inside the runnable candidate set — anything
+        # else is refused, never silently replaced.
+        if str(config_path) not in choices:
+            return {
+                "dataset": dataset,
+                "task": resolved_task,
+                "model": model_key,
+                "model_display": entry.get("model_display"),
+                "model_status": model_status,
+                "dataset_status": dataset_status,
+                "config_path": None,
+                "config_valid": False,
+                "can_execute": False,
+                "validation_errors": [],
+                "command": None,
+                "config_choices": choices,
+                "reason": (
+                    f"Selected config {config_path!r} is not one of the validated "
+                    f"configs for model {model_key!r} "
+                    f"({', '.join(choices) or 'none'}); execution is refused."
+                ),
+            }
+        validated = str(config_path)
     if not validated:
+        # Ambiguous protocols or an invalid explicit request: the model is
+        # READY but no config may be picked silently. The UI offers
+        # ``config_choices``; the run stays disabled until one is chosen.
         return {
             "dataset": dataset,
             "task": resolved_task,
@@ -290,9 +396,11 @@ def build_execution_plan(
             "config_path": None,
             "config_valid": False,
             "can_execute": False,
-            "validation_errors": ["Runnable entry carries no validated_config."],
+            "validation_errors": [],
             "command": None,
-            "reason": f"Model {model_key!r} is READY but supplies no validated config.",
+            "config_choices": choices,
+            "config_selection": selection,
+            "reason": str(entry.get("config_message") or "Select a config explicitly."),
         }
 
     config_path = str(validated)
@@ -303,27 +411,15 @@ def build_execution_plan(
     can_execute = bool(config_valid and runnable_data and model_status == "READY")
     if can_execute:
         ws = workspace or _default_workspace(dataset, model_key)
-        command: Optional[List[str]] = [
-            sys.executable,
-            WRAPPER,
-            "run",
-            config_path,
-            "--workspace",
-            ws,
-            "--train",
-            "--eval",
-            "--device",
-            device_value,
-            "--seed",
-            str(seed),
-        ]
-        if epochs_value is not None:
-            command.extend(["--epochs", str(epochs_value)])
-        if resume_from:
-            # The CLI already accepts this flag and forwards it to
-            # Pipeline.train. Combined with --epochs as the *total* target,
-            # training continues from the checkpoint's epoch to that total.
-            command.extend(["--ckpt-to-resume", str(resume_from)])
+        command: Optional[List[str]] = build_run_command(
+            config_path=config_path,
+            workspace=ws,
+            task=resolved_task,
+            device=device_value,
+            seed=seed,
+            epochs=epochs_value,
+            resume_from=resume_from,
+        )
         reason = f"Model {model_key!r} is READY with a validated config; plan only, nothing executed."
     else:
         command = None
@@ -350,6 +446,8 @@ def build_execution_plan(
         "command": command,
         "epochs": epochs_value,
         "reason": reason,
+        "config_choices": choices,
+        "config_selection": selection,
     }
 
 
@@ -393,7 +491,9 @@ def plan_for_request(
             "command": None,
             "reason": intent["message"],
         }
-    context = build_agent_workflow_context(dataset, task, repo_root=repo_root)
+    context = build_agent_workflow_context(
+        dataset, task, repo_root=repo_root, split_hint=user_request
+    )
     mentioned = resolve_model_mention(user_request, context)
     if mentioned is None:
         runnable = [str(e.get("model")) for e in context.get("runnable_models", [])]
@@ -425,6 +525,7 @@ def plan_for_request(
         workspace=workspace,
         workflow_context=context,
         epochs=epochs,
+        split_hint=user_request,
     )
     plan["reason"] = f"Request resolved to dataset={dataset}, task={task}. " + str(plan.get("reason"))
     return plan

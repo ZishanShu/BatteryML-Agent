@@ -45,6 +45,30 @@ CHECK_NAME = "config_validity"
 REQUIRED_SECTIONS = ("model", "train_test_split", "feature", "label")
 
 # Section -> the builders registry its `name` must resolve in.
+def _extension_key(model_name: str) -> str:
+    """The extension module name behind a registered predictor class name."""
+    try:
+        from batteryml_web.core.config_registry import MODEL_CLASS_KEYS
+    except Exception:  # noqa: BLE001 - enrichment only; never fail the check here
+        return ""
+    return MODEL_CLASS_KEYS.get(str(model_name).strip().lower(), "")
+
+
+def _unavailable_external_models() -> dict[str, str]:
+    """Extensions skipped because their vendored third-party source is absent.
+
+    Empty when the models package cannot be imported: this only decides how
+    an already-detected condition is *worded and classified*, so it must not
+    be able to turn an import problem into a misleading config verdict.
+    """
+    try:
+        from batteryml_web.models import unavailable_extension_models
+
+        return dict(unavailable_extension_models())
+    except Exception:  # noqa: BLE001 - see docstring
+        return {}
+
+
 SECTION_REGISTRY = {
     "model": "MODELS",
     "train_test_split": "TRAIN_TEST_SPLITTERS",
@@ -159,14 +183,40 @@ def _inspect_config(
             "no `feature_transformation` section (blocked decision — reported, not judged)"
         )
 
+    # Decided per *config*, not per name. A wrapper module registers a model
+    # and usually its feature extractor too, so when its vendored source is
+    # absent every name it would have registered goes missing at once — the
+    # cptransformer config lost both `CPTransformerRULPredictor` and
+    # `BatteryLifeCycleCurveFeatureExtractor`. The config is gated on that
+    # one absent source, so that is what is reported.
+    #
+    # The config is not *invalid*: it parses, declares every required
+    # section, and names implementations this platform ships correct
+    # wrappers for. Calling it invalid gave a fresh clone a red CFG-01 that
+    # no config edit could fix. It is recorded as an observation and counted
+    # in the summary, so it is reported rather than hidden.
+    unavailable_source = _unavailable_external_models().get(
+        _extension_key((loaded.get("model") or {}).get("name") if isinstance(loaded.get("model"), dict) else "")
+    )
+
     for section_name, registry_attr in SECTION_REGISTRY.items():
         section = loaded.get(section_name)
         registry = registries.get(registry_attr, {})
         for name in _section_names(section):
-            if name not in registry:
-                record["errors"].append(
-                    f"`{section_name}.name` = {name!r} is not registered in {registry_attr}"
+            if name in registry:
+                continue
+            if unavailable_source is not None:
+                record["unavailable_external"] = {"requires": unavailable_source}
+                record["observations"].append(
+                    f"`{section_name}.name` = {name!r} is registered by a wrapper "
+                    f"whose third-party source is not vendored here "
+                    f"({unavailable_source}; third_party/ is gitignored). The "
+                    f"config itself is valid."
                 )
+                continue
+            record["errors"].append(
+                f"`{section_name}.name` = {name!r} is not registered in {registry_attr}"
+            )
 
     model = loaded.get("model")
     if isinstance(model, dict):
@@ -219,6 +269,9 @@ def check(output_dir: Path | None = None) -> CheckResult:
         record["config"] for record in run_configs if record.get("no_feature_transformation")
     ]
     with_missing_paths = [record["config"] for record in run_configs if record["missing_paths"]]
+    unvendored = [
+        record["config"] for record in run_configs if record.get("unavailable_external")
+    ]
 
     payload = {
         "check_id": CHECK_ID,
@@ -241,6 +294,7 @@ def check(output_dir: Path | None = None) -> CheckResult:
         ],
         "configs_without_feature_transformation": without_feature_transformation,
         "configs_with_missing_declared_paths": with_missing_paths,
+        "configs_needing_unvendored_source": unvendored,
     }
 
     if failing:
@@ -266,7 +320,9 @@ def check(output_dir: Path | None = None) -> CheckResult:
         f"[{registry_source}]. Observations: "
         f"{len(without_feature_transformation)} without feature_transformation "
         f"(blocked decision), {len(with_missing_paths)} whose declared cell_data_path "
-        f"is absent (see DATA-01). {len(skipped)} cycler column-map file(s) skipped.",
+        f"is absent (see DATA-01), {len(unvendored)} naming a model whose "
+        f"third-party source is not vendored here. "
+        f"{len(skipped)} cycler column-map file(s) skipped.",
         evidence,
         artifacts,
     )

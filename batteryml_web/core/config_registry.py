@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -133,6 +134,12 @@ class ConfigEntry:
     split_label: str
     config_path: Path
     metadata: dict[str, Any] = field(default_factory=dict)
+    #: Canonical split identity (``matr_primary``, ``matr_secondary``,
+    #: ``matr_clo``, ...), derived from the splitter class the config
+    #: declares — not from the filename. Two configs with different
+    #: ``split_key`` values are different evaluation protocols, even when
+    #: they share dataset, task and model.
+    split_key: str = ""
 
     @property
     def config_exists(self) -> bool:
@@ -162,6 +169,14 @@ class ConfigRegistry:
                 data = loaded
         except Exception:
             pass
+        # A config that declares itself a legacy example is not offered as a
+        # runnable choice. configs/soh/dummy/* demonstrate label plumbing with
+        # DummyRegressor and one label per cell; listing them as the platform's
+        # SOH support would claim a capability that does not exist yet. The
+        # files stay, and the notebook that uses them keeps working — they are
+        # only withheld from the catalog.
+        if isinstance(data, dict) and bool(data.get("legacy_example")):
+            return None
         hay = f"{path} {path.name} {text}".lower()
         dataset = self._infer_dataset(hay, data)
         task = self._infer_task(hay, data)
@@ -170,25 +185,133 @@ class ConfigRegistry:
         split_label = self._split_label(split_preset)
         if not (dataset and task and model_key and split_preset):
             return None
-        return ConfigEntry(dataset, task, model_key, model_display, split_preset, split_label, path, {"yaml": data})
+        split_key = self._infer_split_key(data, path)
+        return ConfigEntry(dataset, task, model_key, model_display, split_preset, split_label, path, {"yaml": data}, split_key)
+
+    #: Datasets a config's ``cell_data_path`` may name. Order is irrelevant
+    #: now that matching is structural; it was not when this searched the
+    #: whole YAML, where the first entry won whatever the config said.
+    _DATASETS = ("MATR", "HUST", "RWTH", "CALCE", "SNL", "UL_PUR", "HNEI")
 
     def _infer_dataset(self, hay: str, data: dict[str, Any]) -> str | None:
-        for ds in ("MATR", "HUST", "RWTH", "CALCE", "SNL", "UL_PUR"):
-            if ds.lower() in hay:
-                return ds
+        """The dataset this config trains on, from ``cell_data_path``.
+
+        Structure, not substrings — the same repair ``_infer_task`` needed,
+        for the same reason and with a worse symptom.
+
+        This used to search ``f"{path} {path.name} {text}"`` for each dataset
+        name in order, with ``MATR`` first. Every CNN config names
+        ``VoltageCapacityMatrixFeatureExtractor``, and *Matrix* contains
+        **matr** — so all eight CNN configs were registered as MATR,
+        including ``hust.yaml`` (``data/processed/HUST``) and ``snl.yaml``
+        (``data/processed/SNL``). Two consequences, both observed:
+
+        * CNN + MATR offered eight configs of which five read another
+          dataset's directory. A plan built from one of those says MATR and
+          runs HUST, so it is refused by the data-requiring validator, or —
+          if it starts — dies on ``AssertionError: data/processed/HUST``.
+          Whether a CNN run worked depended on which config was picked.
+        * ``HUST`` and ``SNL`` offered no CNN at all, although each has a
+          config written for it.
+
+        ``cell_data_path`` is what ``Task.build`` actually loads, so it
+        cannot disagree with the run the way a filename or a class name can.
+
+        A config whose ``cell_data_path`` is a **list** spans several
+        datasets (``mix``, ``cruh``, ``crush``). It is not any one dataset's
+        config and is not offered under one; it stays on disk and remains
+        runnable from the CLI. Returning ``MATR`` for ``mix.yaml`` because
+        MATR appears among its six directories is exactly the mislabelling
+        this function exists to stop.
+        """
         split = data.get("train_test_split", {}) if isinstance(data, dict) else {}
-        cdp = split.get("cell_data_path", "") if isinstance(split, dict) else ""
-        for ds in ("MATR", "HUST", "RWTH", "CALCE", "SNL", "UL_PUR"):
-            if ds.lower() in str(cdp).lower():
+        cdp = split.get("cell_data_path") if isinstance(split, dict) else None
+        if isinstance(cdp, (list, tuple)):
+            return None
+        if cdp:
+            # The last path segment, so "data/processed/MATR" resolves on
+            # "MATR" and never on a parent directory that happens to carry a
+            # dataset name.
+            leaf = str(cdp).rstrip("/").rsplit("/", 1)[-1].upper()
+            for ds in self._DATASETS:
+                if leaf == ds:
+                    return ds
+            return None
+        # No declared data path. Fall back to the *filename* alone — never
+        # the file's text, which is what produced the Matrix/MATR collision.
+        stem = Path(str(hay).strip().split()[0]).stem.upper() if hay else ""
+        for ds in self._DATASETS:
+            if stem == ds or stem.startswith(f"{ds}_"):
                 return ds
         return None
 
+    #: Label annotator class name -> canonical task. This is the authoritative
+    #: signal: the annotator *is* what the config trains against, so it cannot
+    #: disagree with the task the way a filename or a stray parameter can.
+    _TASK_BY_ANNOTATOR = {
+        "sohlabelannotator": "SOH estimation",
+        "cyclesohlabelannotator": "SOH estimation",
+        "rullabelannotator": "RUL prediction",
+    }
+
+    #: Parameter names that contain a task word but say nothing about the task.
+    #: ``eol_soh`` is RUL's end-of-life *threshold* — the SOH value at which a
+    #: cell is declared dead — and every RUL baseline config carries it.
+    _TASK_DECOYS = ("eol_soh",)
+
     def _infer_task(self, hay: str, data: dict[str, Any]) -> str | None:
-        label = data.get("label", {}) if isinstance(data, dict) else {}
-        label_name = str(label.get("name", "")).lower() if isinstance(label, dict) else ""
-        if any(x in hay or x in label_name for x in ("soh", "state of health")):
+        """The canonical task this config trains, from structure not substrings.
+
+        Substring matching over the whole YAML used to decide this, and it was
+        wrong for 42 of the 44 configs it called SOH: every RUL baseline sets
+        ``label: {name: RULLabelAnnotator, eol_soh: 0.9}``, and ``eol_soh``
+        contains ``soh``. Lifetime prediction was being advertised as state-of-
+        health estimation across the whole catalog.
+
+        The hierarchy is now:
+
+        1. an explicit ``task:`` field, when a config declares one;
+        2. the label annotator's registered class name;
+        3. the ``configs/<task>/`` directory, documented as a fallback for a
+           config that names neither.
+
+        A parameter name is never a signal.
+        """
+        if isinstance(data, dict):
+            declared = str(data.get("task", "") or "").strip()
+            if declared:
+                canonical = self._canonical_task(declared)
+                if canonical:
+                    return canonical
+
+            label = data.get("label", {})
+            if isinstance(label, dict):
+                annotator = str(label.get("name", "") or "").strip().lower()
+                if annotator in self._TASK_BY_ANNOTATOR:
+                    return self._TASK_BY_ANNOTATOR[annotator]
+                # An unregistered annotator whose own name states the task.
+                if annotator.startswith("soh") or "stateofhealth" in annotator:
+                    return "SOH estimation"
+                if annotator.startswith("rul"):
+                    return "RUL prediction"
+
+        # Fallback: the directory the repository files the config under. The
+        # decoy parameters are stripped first so they cannot leak back in.
+        path_hay = hay
+        for decoy in self._TASK_DECOYS:
+            path_hay = path_hay.replace(decoy, "")
+        if "configs/soh/" in path_hay or "configs\\soh\\" in path_hay:
             return "SOH estimation"
-        if any(x in hay or x in label_name for x in ("rul", "remaining useful life")):
+        if "configs/rul/" in path_hay or "configs\\rul\\" in path_hay:
+            return "RUL prediction"
+        return None
+
+    @staticmethod
+    def _canonical_task(declared: str) -> str | None:
+        lowered = declared.strip().lower()
+        if lowered.startswith("soh") or "state of health" in lowered:
+            return "SOH estimation"
+        if lowered.startswith("rul") or "remaining useful life" in lowered:
             return "RUL prediction"
         return None
 
@@ -240,6 +363,25 @@ class ConfigRegistry:
             "official_matr_split_2": "Official BatteryML split 2",
         }.get(preset, preset.replace("_", " ").title())
 
+    #: Splitter class name (lowercased, from the config's
+    #: ``train_test_split.name``) -> canonical split identity. The splitter
+    #: *is* the evaluation protocol, so it — never the filename — decides
+    #: which protocol a config runs. Unknown splitters fall back to the
+    #: config stem, which keeps every non-MATR config selectable exactly as
+    #: before.
+    _SPLIT_KEY_BY_SPLITTER = {
+        "matrprimarytesttraintestsplitter": "matr_primary",
+        "matrsecondarytesttraintestsplitter": "matr_secondary",
+        "matrclotesttraintestsplitter": "matr_clo",
+    }
+
+    def _infer_split_key(self, data: dict[str, Any], path: Path) -> str:
+        split = data.get("train_test_split", {}) if isinstance(data, dict) else {}
+        name = str(split.get("name", "") or "").strip().lower() if isinstance(split, dict) else ""
+        if name in self._SPLIT_KEY_BY_SPLITTER:
+            return self._SPLIT_KEY_BY_SPLITTER[name]
+        return path.stem.lower()
+
     def get_entries(self, dataset: str | None = None, task: str | None = None) -> list[ConfigEntry]:
         entries = self.entries
         if dataset:
@@ -278,3 +420,134 @@ class ConfigRegistry:
 @lru_cache(maxsize=1)
 def get_config_registry(repo_root: str | None = None) -> ConfigRegistry:
     return ConfigRegistry(Path(repo_root) if repo_root else None).build()
+
+
+#: Explicit user phrasings -> canonical split identity. Centralized here so
+#: the intent layer, the planner and the UI resolve "primary test split"
+#: identically. Only exact, verified aliases are listed — never fuzzy
+#: substrings against YAML text.
+SPLIT_ALIASES: dict[str, str] = {
+    "matr_1": "matr_primary",
+    "matr1": "matr_primary",
+    "matr 1": "matr_primary",
+    "primary": "matr_primary",
+    "primary test": "matr_primary",
+    "primary test split": "matr_primary",
+    "matr primary test split": "matr_primary",
+    "matr_2": "matr_secondary",
+    "matr2": "matr_secondary",
+    "matr 2": "matr_secondary",
+    "secondary": "matr_secondary",
+    "secondary test": "matr_secondary",
+    "secondary test split": "matr_secondary",
+    "matr secondary test split": "matr_secondary",
+    "clo": "matr_clo",
+    "clo split": "matr_clo",
+    "matr clo": "matr_clo",
+}
+
+_SPLIT_HINT_PATTERNS = sorted(SPLIT_ALIASES, key=len, reverse=True)
+
+_EXPLICIT_CONFIG_RE = re.compile(r"\b([a-z0-9_]+)\.yaml\b")
+_MATR_N_RE = re.compile(r"\bmatr[_.\- ]?(\d+)\b")
+
+
+def resolve_split_hint(text: str) -> str | None:
+    """Canonical split identity explicitly named in ``text``, if any.
+
+    Matches only the verified aliases in :data:`SPLIT_ALIASES` (longest
+    first, word-boundaried). Returns None when the request names no split —
+    a generic request must stay generic so the caller can ask the user to
+    choose instead of guessing.
+    """
+    lowered = f" {str(text or '').lower()} "
+    for phrase in _SPLIT_HINT_PATTERNS:
+        if f" {phrase} " in lowered or re.search(r"\b" + re.escape(phrase) + r"\b", lowered):
+            return SPLIT_ALIASES[phrase]
+    return None
+
+
+def hint_mentions_config_or_split(text: str) -> bool:
+    """Whether ``text`` reaches for a specific config/split at all.
+
+    Used to tell "the user named something that matches nothing" (a
+    deterministic error) apart from "the user named nothing" (ambiguity).
+    Signals are structural — a ``.yaml`` filename, a ``matr_N`` token, or
+    the words split/config/protocol — never dataset or model names.
+    """
+    lowered = str(text or "").lower()
+    if _EXPLICIT_CONFIG_RE.search(lowered):
+        return True
+    if _MATR_N_RE.search(lowered):
+        return True
+    return any(
+        word in lowered
+        for word in ("split", "config", "protocol", "primary", "secondary", "clo")
+    )
+
+
+def select_config_for_hint(
+    entries: list[ConfigEntry], hint_text: str | None
+) -> dict[str, Any]:
+    """Deterministically choose among one model's validated configs.
+
+    Returns ``{"status", "entry", "choices", "message"}`` where status is
+    one of:
+
+    ``chosen``
+        Exactly one protocol exists, or the request explicitly named the
+        protocol that was chosen. ``entry`` is the winner.
+    ``ambiguous``
+        Several protocols exist and the request named none. ``entry`` is
+        None and ``choices`` lists every candidate — the caller must ask
+        the user, never silently take the first list item.
+    ``invalid``
+        The request reached for a config/split that matches nothing.
+        ``entry`` is None and no fallback is applied.
+    ``empty``
+        No candidates at all.
+    """
+    choices = sorted(entries, key=lambda e: e.config_path.as_posix())
+    if not choices:
+        return {"status": "empty", "entry": None, "choices": [], "message": "No configs registered."}
+    distinct = sorted({e.split_key for e in choices})
+    if hint_text:
+        hint = resolve_split_hint(hint_text)
+        if hint is not None:
+            matched = [e for e in choices if e.split_key == hint]
+            if matched:
+                return {
+                    "status": "chosen",
+                    "entry": matched[0],
+                    "choices": choices,
+                    "message": f"Explicit split request resolved to {matched[0].config_path.name}.",
+                }
+        if hint_mentions_config_or_split(hint_text):
+            names = ", ".join(e.config_path.name for e in choices)
+            return {
+                "status": "invalid",
+                "entry": None,
+                "choices": choices,
+                "message": (
+                    f"The requested config/split matches none of the registered configs ({names}). "
+                    "Select one of the listed configs instead."
+                ),
+            }
+    if len(distinct) == 1:
+        only = [e for e in choices if e.split_key == distinct[0]]
+        return {
+            "status": "chosen",
+            "entry": only[0],
+            "choices": choices,
+            "message": f"Single registered protocol ({only[0].config_path.name}).",
+        }
+    names = ", ".join(e.config_path.name for e in choices)
+    return {
+        "status": "ambiguous",
+        "entry": None,
+        "choices": choices,
+        "message": (
+            "Several distinct evaluation protocols are registered "
+            f"({names}). No default is assumed; select one explicitly."
+        ),
+    }

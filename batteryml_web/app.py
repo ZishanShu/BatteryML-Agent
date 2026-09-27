@@ -12,8 +12,16 @@ import pandas as pd
 import streamlit as st
 import torch
 
+from batteryml_web.agent.failure_taxonomy import classify_llm_failure
+from batteryml_web.agent.result_agent import explain_run_result
+from batteryml_web.agent.result_analysis import (
+    build_analysis_context,
+    render_analysis_markdown,
+    result_context_from_analysis,
+)
 from batteryml_web.agent.llm_client import run_llm_prompt, save_llm_output
 from batteryml_web.agent.catalog import REQUEST_TEMPLATE_STRUCTURE
+from batteryml_web.agent.execution import build_run_command
 from batteryml_web.ui.agent_workflow import (
     USE_TEMPLATE_LABEL,
     accept_template as accept_request_template,
@@ -30,7 +38,12 @@ from batteryml_web.core.custom_uploads import (
     validate_custom_upload_layout,
     validate_processed_output,
 )
-from batteryml_web.core.results_reader import find_result_files, load_metrics, load_metrics_from_logs, load_predictions
+# Only the file discovery is still used here, and only ever against the
+# selected run's own directory. load_metrics / load_predictions read "the
+# first match" out of whatever list they are handed, which is what made the
+# page show the oldest run in the project; Review Results now reads the
+# selected run's manifest and its one recorded artifact instead.
+from batteryml_web.core.results_reader import find_result_files
 from batteryml_web.ui.feedback import (
     EVENT_PREPROCESS_DONE,
     EVENT_PROJECT_CREATED,
@@ -39,10 +52,25 @@ from batteryml_web.ui.feedback import (
     notify_success,
     toast,
 )
-from batteryml_web.ui.llm_state import describe_llm_status, ensure_llm_state_defaults, get_llm_status, is_llm_configured, refresh_llm_status_from_config, set_llm_settings
+from batteryml_web.ui.llm_state import (
+    describe_llm_status,
+    ensure_llm_state_defaults,
+    get_llm_status,
+    is_llm_configured,
+    llm_credentials,
+    llm_settings_fingerprint,
+    refresh_llm_status_from_config,
+    set_llm_connection_result,
+)
 from batteryml_web.core.project_context import resolve_project
 from batteryml_web.core.run_manager import get_run_manager
+from batteryml_web.core import run_manifest as rm
 from batteryml_web.core.run_manifest import find_run
+from batteryml_web.core.selected_result import (
+    SelectedResult,
+    cached_for,
+    resolve_selected_result,
+)
 from batteryml_web.ui.run_history import (
     render_file_browser,
     render_predictions_panel,
@@ -50,9 +78,25 @@ from batteryml_web.ui.run_history import (
     render_run_history,
     render_run_location,
 )
-from batteryml_web.ui.settings_panel import render_llm_settings_form
+from batteryml_web.ui.settings_panel import render_configure_in_settings_notice
 from batteryml_web.ui.progress_utils import get_safe_runtime_env, run_command_with_progress
 from batteryml_web.ui.scroll import render_scroll_to_top
+from batteryml_web.ui.surfaces import (
+    NAV_ROLE,
+    PRIMARY_ROLE,
+    command_viewport,
+    log_viewport,
+    render_info_card,
+    render_surface_css,
+)
+from batteryml_web.ui.tab_navigation import (
+    DATASET_OVERVIEW_TAB,
+    PREPARE_TABS,
+    VIEW_OVERVIEW_LABEL,
+    render_prepare_tabs,
+    request_tab,
+)
+from batteryml_web.ui.errors import error_boundary, render_copy_control
 from batteryml_web.ui.workflow_sidebar import NAV_STEPS, get_current_step_index, render_sidebar_workflow, set_current_step
 from batteryml_web.core.readiness import assess_dataset
 from batteryml_web.core.config_registry import get_config_registry
@@ -117,11 +161,31 @@ refresh_llm_status_from_config()
 st.markdown(
     """
 <style>
+/* The band the page opens with. Both rules here were written once and both
+   were quietly doing nothing; measured, the page still opened on 96px of
+   padding under a 60px toolbar, which is why the title sat 160px down.
+
+   `stMainBlockContainer` is the current name. `stAppViewBlockContainer` is
+   what Streamlit called this element when the rule was written, and it no
+   longer exists — a selector that matches nothing fails silently, which is
+   exactly how 96px went unnoticed. Both names are listed so the rule works
+   either side of that rename.
+
+   2.5rem (40px) clears the 36px toolbar with a little air. It cannot go
+   much below that: the toolbar is `position: absolute` with a z-index of
+   999990, so content under 36px slides beneath the ⋮ menu rather than
+   pushing it down. */
+[data-testid="stMainBlockContainer"],
 [data-testid="stAppViewBlockContainer"] {
-    padding-top: 1.5rem;
+    padding-top: 2.5rem;
 }
 [data-testid="stHeader"] {
+    /* min-height as well as height, or this does nothing: Streamlit floors
+       the band at 60px with its own min-height, and a height alone loses to
+       it. This is the same pair the sidebar's forehead sets — that one works
+       precisely because it sets both. */
     height: 2.25rem;
+    min-height: 2.25rem;
     background: transparent;
 }
 </style>
@@ -139,7 +203,10 @@ st.markdown(
     --app-muted: rgba(128, 128, 128, 0.95);
     --app-card-bg: rgba(128, 128, 128, 0.055);
     --app-card-bg-strong: rgba(128, 128, 128, 0.095);
-    --app-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+    /* No shadow variable any more. Elevation is an interaction cue — it
+       says "this floats above the page and can be pressed" — and the only
+       two users of the old `--app-shadow` were read-outs: the readiness
+       tile and the pipeline tile. Information sits *in* the page. */
 }
 
 .llm-output-wrap {
@@ -147,13 +214,18 @@ st.markdown(
     margin-bottom: 1.6rem;
 }
 
+/* The assistant's answer is a read-out too, and the loudest one on the
+   page it appears on. Same geometry as every other information surface:
+   4px, hairline, left rule, no shadow, not a control. */
 .llm-output-card {
     width: 100%;
-    border-radius: 18px;
-    border: 1px solid var(--app-border);
+    border-radius: 4px;
+    border: 1px solid var(--app-border-soft);
+    border-left: 3px solid var(--app-border);
     padding: 1.15rem 1.25rem;
     background: var(--app-card-bg);
     box-sizing: border-box;
+    cursor: default;
 }
 
 .llm-output-header {
@@ -238,36 +310,59 @@ st.markdown(
     margin-bottom: 1.25rem;
 }
 
+/* The readiness tiles and the pipeline tiles are read-outs, and both used
+   to be drawn as large rounded boxes — 18px and 20px radius, a 1.5px
+   saturated border all the way round, and a drop shadow lifting them off
+   the page. That is the visual vocabulary of something you press. Measured
+   beside a button (1px border, 8px radius, no shadow) they were in fact
+   *louder* than the controls they sat above, which is why a reader could
+   not tell the readiness summary from "Select MATR".
+
+   They now follow the same rule as `.bml-info-card` in ui/surfaces.py: a
+   4px radius against a control's 8px, a neutral hairline, no shadow, and
+   `cursor: default`. The readiness colour is not thrown away — it moves to
+   a 3px rule on the left edge, the way a printed table marks a block —
+   so the state is still legible at a glance, and the status word below
+   keeps the same colour in bold for anyone who cannot see it. No button in
+   this app has an asymmetric left edge, so the shape alone now says
+   "read-out". */
 .dataset-card {
-    padding: 1.25rem 1.35rem;
-    border-radius: 18px;
-    border: 1.5px solid rgba(80, 160, 100, 0.85);
-    min-height: 280px;
+    padding: 1rem 1.1rem;
+    border-radius: 4px;
+    border: 1px solid var(--app-border-soft);
+    border-left: 3px solid var(--app-border);
     margin-bottom: 1rem;
     box-sizing: border-box;
     background: var(--app-card-bg);
-    box-shadow: var(--app-shadow);
+    cursor: default;
 }
 
 .dataset-card.ready {
-    border-color: rgba(55, 140, 80, 0.95);
+    border-left-color: rgba(55, 140, 80, 0.95);
 }
 
 .dataset-card.warning {
-    border-color: rgba(190, 130, 40, 0.95);
+    border-left-color: rgba(190, 130, 40, 0.95);
 }
 
 .dataset-card.missing {
-    border-color: rgba(190, 70, 70, 0.95);
+    border-left-color: rgba(190, 70, 70, 0.95);
 }
 
+/* 320px fixed, for a tile holding an icon and three short lines, spent a
+   third of the Prepare Data screen on five boxes of mostly air. The height
+   stays fixed — five tiles in a row must still line up, and letting them
+   size to content would stagger them — but at the height the content
+   actually needs. Measured from the parts: 2rem icon + 3.2rem title +
+   4.6rem description + the status line + 2.4rem of padding ≈ 226px. */
 .pipeline-card {
-    height: 320px;
-    min-height: 320px;
-    max-height: 320px;
-    border-radius: 20px;
-    border: 1.5px solid rgba(55, 140, 80, 0.95);
-    padding: 1.2rem 1rem;
+    height: 230px;
+    min-height: 230px;
+    max-height: 230px;
+    border-radius: 4px;
+    border: 1px solid var(--app-border-soft);
+    border-left: 3px solid var(--app-border);
+    padding: 1rem 0.9rem;
     box-sizing: border-box;
     display: flex;
     flex-direction: column;
@@ -275,7 +370,7 @@ st.markdown(
     align-items: center;
     text-align: center;
     background: var(--app-card-bg);
-    box-shadow: var(--app-shadow);
+    cursor: default;
 }
 
 .pipeline-icon {
@@ -389,10 +484,10 @@ def render_bottom_step_navigation():
     idx = get_current_step_index()
     prev_col, next_col = st.columns(2)
     with prev_col:
-        if st.button("← Prev", disabled=(idx == 0), use_container_width=True, key="bottom_prev_step"):
+        if st.button("← Prev", type=NAV_ROLE, disabled=(idx == 0), use_container_width=True, key="bottom_prev_step"):
             set_current_step(NAV_STEPS[idx - 1]["key"])
     with next_col:
-        if st.button("Next →", disabled=(idx == len(NAV_STEPS) - 1), use_container_width=True, key="bottom_next_step"):
+        if st.button("Next →", type=NAV_ROLE, disabled=(idx == len(NAV_STEPS) - 1), use_container_width=True, key="bottom_next_step"):
             set_current_step(NAV_STEPS[idx + 1]["key"])
 
 
@@ -459,7 +554,7 @@ def render_home_agent_entry() -> None:
         if st.button(USE_TEMPLATE_LABEL, key="home_use_template_button"):
             st.session_state["home_use_template"] = True
             st.rerun()
-    if st.button("Analyze with Agent", use_container_width=True, key="home_agent_analyze"):
+    if st.button("Analyze with Agent", type=PRIMARY_ROLE, use_container_width=True, key="home_agent_analyze"):
         trimmed = str(request or "").strip()
         if not trimmed:
             st.warning(
@@ -483,6 +578,10 @@ def render_home_agent_entry() -> None:
                 "agent_suggestions",
                 "agent_model_choice",
                 "agent_run_signature",
+                # Run state for the previous request: why its results could
+                # not be read, and that it had executed at all.
+                "agent_result_error",
+                "agent_has_executed",
                 # The Agent Workflow page's own text box, so it shows this
                 # request rather than one typed there on an earlier visit.
                 # Safe to delete here: that widget is not rendered on Home.
@@ -534,7 +633,7 @@ def render_home_page():
         project_folder = Path(base_dir) / (project_name.strip() or "my_battery_project")
         st.caption("Project folder")
         st.code(str(project_folder), language="text")
-        if st.button("Create New Project", use_container_width=True, key="home_create_project"):
+        if st.button("Create New Project", type=PRIMARY_ROLE, use_container_width=True, key="home_create_project"):
             created = _ensure_project(project_name, base_dir)
             # The filesystem semantics are unchanged; only the confirmation is
             # new. Stored rather than printed because the rerun below would
@@ -555,7 +654,7 @@ def render_home_page():
             folder = DEFAULT_BASE_DIR / selected
             st.caption("Project folder")
             st.code(str(folder), language="text")
-            if st.button("Load Project", use_container_width=True, key="home_load_project"):
+            if st.button("Load Project", type=PRIMARY_ROLE, use_container_width=True, key="home_load_project"):
                 st.session_state["project_root"] = str(folder)
                 st.session_state["project_name"] = selected
                 st.session_state["current_project"] = selected
@@ -572,6 +671,8 @@ def render_home_page():
                     "agent_result_context",
                     "agent_run_context",
                     "agent_run_signature",
+                    "agent_result_error",
+                    "agent_has_executed",
                 ):
                     st.session_state.pop(key, None)
                 st.rerun()
@@ -579,15 +680,14 @@ def render_home_page():
             st.info("No existing project found yet.")
             st.caption("Project folder")
             st.code("runs/web_projects/<project_name>", language="text")
-            st.button("Load Project", disabled=True, use_container_width=True, key="home_load_disabled")
+            st.button("Load Project", type=PRIMARY_ROLE, disabled=True, use_container_width=True, key="home_load_disabled")
 
-    st.markdown("---")
-    # One settings surface, shared with the sidebar and the Explain prompt.
-    # This block used to carry its own three text inputs bound straight to
-    # the session keys, which bypassed set_llm_settings entirely: the status
-    # was never updated, and settings entered here did not register as
-    # configured elsewhere. That is what made the app ask twice.
-    render_inline_llm_settings("home", expanded=False)
+    # The rule belongs to the notice, not to the page: with an assistant
+    # configured the notice draws nothing, and an unconditional rule here
+    # left two horizontal lines stacked against each other.
+    if not is_llm_configured():
+        st.markdown("---")
+        render_llm_availability_notice()
 
     st.markdown("---")
     st.subheader("Quick Start", anchor=False)
@@ -621,11 +721,14 @@ def render_home_page():
         st.error("Raw dataset missing: data/raw/MATR")
     if not processed_path.exists():
         st.error("Processed dataset missing: data/processed/MATR. Please go to Prepare Data and run preprocessing first.")
-        if st.button("Go Prepare Data", use_container_width=True, key="home_go_prepare_data"):
+        if st.button("Go Prepare Data", type=NAV_ROLE, use_container_width=True, key="home_go_prepare_data"):
             set_current_step("prepare_data")
     if not config_path.exists():
         st.error("Config file missing: configs/baselines/sklearn/xgb/matr_1.yaml")
     q1, q2 = st.columns(2)
+    # Reserved outside the columns for the same reason as Run Model: the
+    # demo's progress bar spans the content area rather than q2's half.
+    demo_progress_host = st.container()
     with q1:
         if st.button("Load MATR Demo", use_container_width=True, key="home_load_matr_demo"):
             st.session_state["selected_dataset"] = "MATR"
@@ -637,7 +740,7 @@ def render_home_page():
                 int(st.session_state.get("quickstart_loaded_serial", 0)) + 1
             )
     with q2:
-        if st.button("Run MATR Demo", use_container_width=True, key="home_run_matr_demo", disabled=not preflight_ok):
+        if st.button("Run MATR Demo", type=PRIMARY_ROLE, use_container_width=True, key="home_run_matr_demo", disabled=not preflight_ok):
             workspace_root = project_root or Path("runs/web_projects/default")
             workspace_dir = workspace_root / "workspace"
             log_path = workspace_root / "logs" / "matr_demo.log"
@@ -668,6 +771,7 @@ def render_home_page():
                     (95, "Collect outputs"),
                     (100, "Demo completed"),
                 ],
+                container=demo_progress_host,
             )
             st.session_state["last_run_status"] = "success" if result["success"] else "failed"
             st.session_state["last_run_time"] = result["elapsed"]
@@ -695,7 +799,7 @@ def render_home_page():
     render_home_agent_entry()
 
     st.markdown("---")
-    if st.button("Start workflow →", use_container_width=True, key="home_start_workflow"):
+    if st.button("Start workflow →", type=NAV_ROLE, use_container_width=True, key="home_start_workflow"):
         set_current_step("prepare_data")
 
 
@@ -878,11 +982,10 @@ def render_prepare_data_page():
     # disagree about which dataset was being prepared. The dataset is chosen
     # once and the flow runs top to bottom: dataset → readiness → preprocess
     # → log → inspection. No step was dropped in the merge.
-    tabs = st.tabs([
-        "Dataset Overview",
-        "Preprocess & Inspect",
-        "Custom Dataset / Schema Mapping",
-    ])
+    # Built through the helper so a jump from the preprocess tab can open
+    # the overview tab. The labels live in one place, so a button and the
+    # tab it opens cannot drift apart.
+    tabs = render_prepare_tabs(PREPARE_TABS)
 
     datasets = _ui_dataset_options()
 
@@ -935,7 +1038,7 @@ def render_prepare_data_page():
                 status_text = "Ready" if active else "Pending"
                 st.markdown(
                     f"""
-                    <div class="pipeline-card" style="border-color: {color};">
+                    <div class="pipeline-card" style="border-left-color: {color};">
                         <div class="pipeline-icon">{icon}</div>
                         <div class="pipeline-title">{title}</div>
                         <div class="pipeline-desc">{desc}</div>
@@ -970,7 +1073,7 @@ def render_prepare_data_page():
             if not info["raw_exists"]:
                 st.error("Raw data missing")
                 st.button(
-                    "Run preprocessing",
+                    "Run preprocessing", type=PRIMARY_ROLE,
                     disabled=True,
                     use_container_width=True,
                     key="prep_run_disabled",
@@ -989,7 +1092,7 @@ def render_prepare_data_page():
                     "preprocessing is not enabled for this source yet."
                 )
                 st.button(
-                    "Run preprocessing",
+                    "Run preprocessing", type=PRIMARY_ROLE,
                     disabled=True,
                     use_container_width=True,
                     key="prep_run_unsupported",
@@ -1017,7 +1120,7 @@ def render_prepare_data_page():
                 )
 
                 if st.button(
-                    btn_label,
+                    btn_label, type=PRIMARY_ROLE,
                     use_container_width=True,
                     key="prep_run",
                 ):
@@ -1065,16 +1168,16 @@ def render_prepare_data_page():
                 for idx, p in enumerate(feature_files[:10]):
                     with cards[idx % 2]:
                         stat = p.stat()
-                        st.markdown(
-                            f"""
-                            <div style="border:1px solid rgba(255,255,255,0.12); border-radius:14px; padding:12px; min-height:110px;">
-                                <div style="font-weight:700; word-break:break-all;">{p.name}</div>
-                                <div style="font-size:0.85rem; opacity:0.85; margin-top:6px;">Type: {p.suffix or 'unknown'}</div>
-                                <div style="font-size:0.85rem; opacity:0.85;">Size: {stat.st_size} bytes</div>
-                                <div style="font-size:0.75rem; opacity:0.75; word-break:break-all; margin-top:6px;">Path: {p}</div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
+                        # Escaped by the helper: these are file names read
+                        # off disk, and one containing "<" would otherwise
+                        # reshape the page.
+                        render_info_card(
+                            p.name,
+                            [
+                                f"Type: {p.suffix or 'unknown'}",
+                                f"Size: {stat.st_size} bytes",
+                                f"Path: {p}",
+                            ],
                         )
                 st.write("**Feature / cache / artifact files:**")
                 st.code("\n".join(str(p) for p in feature_files[:30]), language="text")
@@ -1082,8 +1185,25 @@ def render_prepare_data_page():
                 st.info("Feature information is not available yet. Run model or inspect BatteryML cache outputs.")
             else:
                 st.info("Feature information is not available yet. Run model or inspect BatteryML cache outputs.")
-            if st.button("Go to Run Model", use_container_width=True, key="prep_go_run_model"):
+            if st.button("Go to Run Model", type=NAV_ROLE, use_container_width=True, key="prep_go_run_model"):
                 set_current_step("run_model")
+
+        # Outside the dataset branch on purpose. The natural question at the
+        # end of this tab is "did that change the dataset's readiness?", and
+        # the answer is on the overview tab — which is just as true when
+        # preprocessing is unavailable, when the source is RAW_ONLY, and
+        # when no dataset is registered at all. That last case previously
+        # left the tab with nothing to do but re-read "No datasets
+        # available". It navigates only: no preprocessing is started, and
+        # nothing about readiness is read or written here.
+        st.markdown("---")
+        if st.button(
+            VIEW_OVERVIEW_LABEL, type=NAV_ROLE,
+            use_container_width=True,
+            key="prep_view_dataset_overview",
+        ):
+            request_tab(DATASET_OVERVIEW_TAB)
+            st.rerun()
 
     with tabs[2]:
         st.caption("Upload raw cycling files exported from supported battery cyclers. Training and validation/test files must be uploaded separately. The platform will call BatteryML preprocessing before any training workflow is enabled.")
@@ -1101,7 +1221,7 @@ def render_prepare_data_page():
         train_uploaded = st.file_uploader("Upload training raw files", accept_multiple_files=True, key="custom_train_upload")
         valid_uploaded = st.file_uploader("Upload validation/test raw files", accept_multiple_files=True, key="custom_valid_upload")
         optional_config = st.file_uploader("Optional cycler config file", accept_multiple_files=False, key="custom_config_upload")
-        if st.button("Save uploads", use_container_width=True, key="custom_save_uploads"):
+        if st.button("Save uploads", type=PRIMARY_ROLE, use_container_width=True, key="custom_save_uploads"):
             if not source_format:
                 st.error("Please select a BatteryML-supported cycler format.")
             else:
@@ -1217,31 +1337,50 @@ def _safe_read_log_tail(log_path: Path, lines: int = 80) -> str:
         return "<unable to read log>"
 
 
-def render_inline_llm_settings(location_key: str, expanded: bool = False):
-    """The LLM settings, wherever a page offers them inline.
+def render_llm_availability_notice() -> None:
+    """What a page says about an assistant it does not configure.
 
-    One form, one credential store: this delegates to
-    :func:`batteryml_web.ui.settings_panel.render_llm_settings_form`, which is
-    the same form the sidebar and the Explain prompt show. It used to carry
-    its own copy of the fields and its own Save/Test handling — and that copy
-    had a real defect: ``test_llm_connection`` *returns* ``(ok, message)`` and
-    does not raise, so its ``except Exception`` never fired and a failed test
-    was reported as "connected". Delegating removes the second
-    implementation and the defect with it.
+    Home, Run Model and Review Results each used to open an "Optional LLM
+    Assistant settings" expander carrying the provider, Base URL, API key
+    and model fields. Every one of them wrote the same store, so no value
+    ever diverged — but a user who had filled the form in the sidebar and
+    was then shown the same three fields on Review Results reasonably
+    concluded the page wanted its own credentials. One settings screen, and
+    everywhere else a sentence naming it.
     """
-    with st.expander("Optional LLM Assistant settings", expanded=expanded):
-        st.caption(
-            "LLM assistant is optional. Without an LLM endpoint, the platform "
-            "still runs the deterministic BatteryML workflow."
-        )
-        # The form prints the status itself, from the one status vocabulary.
-        render_llm_settings_form(key_prefix=location_key)
+    if is_llm_configured():
+        return
+    render_configure_in_settings_notice()
+    st.caption(
+        "The deterministic BatteryML workflow runs without an assistant; "
+        "only the optional explanations need one."
+    )
+
+
+def describe_llm_exception(exc: BaseException) -> str:
+    """One user-facing sentence for a failed LLM call.
+
+    Routed through :func:`classify_llm_failure`, which is the platform's one
+    vocabulary for this: it separates "not configured" from a network or DNS
+    failure, a timeout, a 401/403, an unavailable model and a malformed
+    response, and it redacts anything key-shaped before the text is shown.
+    The previous ``f"LLM request failed: {exc}"`` did none of that — it put
+    the raw exception on the page, which for an HTTP error meant the
+    provider's response body verbatim.
+    """
+    finding = classify_llm_failure(exc, configured=is_llm_configured())
+    parts = [str(finding.get("short_title") or ""), str(finding.get("user_message") or "")]
+    action = str(finding.get("recommended_action") or "")
+    if action:
+        parts.append(action)
+    return " ".join(part for part in parts if part).strip() or "The LLM request failed."
 
 
 def set_llm_not_configured_message(output_key: str):
     st.session_state[output_key] = (
         "LLM assistant is not configured yet.\n\n"
-        "Please add Base URL, API key, and model in the Optional LLM Assistant settings below, then retry this action."
+        "Add the Base URL, API key and model in Settings (left sidebar), then "
+        "retry this action."
     )
 
 
@@ -1254,6 +1393,12 @@ def require_llm_or_show_message(output_key: str) -> bool:
 
 def _set_llm_output(output_key: str, text: str, save_path: Path | None = None) -> None:
     st.session_state[output_key] = text
+    # Which configuration wrote it, so the panel can say when the current
+    # one no longer matches. Never the API key: the fingerprint records
+    # only whether a key was set.
+    st.session_state[
+        f"{output_key}{SETTINGS_PROVENANCE_SUFFIX}"
+    ] = llm_settings_fingerprint()
     if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)
         save_path.write_text(text, encoding="utf-8")
@@ -1377,13 +1522,35 @@ def render_run_model_llm_output_panel(output_key: str, title: str, subtitle: str
     st.markdown("<div style='margin-bottom:1.9rem;'></div>", unsafe_allow_html=True)
 
 
+#: Session key recording which LLM configuration produced a stored output.
+#: Suffixed onto the output's own key so two panels cannot share one label.
+SETTINGS_PROVENANCE_SUFFIX = "_llm_settings"
+
+
 def render_llm_output_panel(output_key: str, title: str) -> None:
+    """Show a stored assistant output. Collapsed; sends nothing.
+
+    Collapsed because this is commentary on metrics and figures that are
+    already on the page, and an explanation that opens by itself pushes the
+    result it is explaining off the first screen. Opening it costs nothing:
+    the text is already in session state, so no call is made here — the only
+    thing that calls the assistant is the button that produced it.
+    """
     output = st.session_state.get(output_key)
     if not output:
         return
     st.markdown("---")
-    with st.expander(f"🤖 LLM Assistant Output · {title}", expanded=True):
+    with st.expander(f"🤖 LLM Assistant Output · {title}", expanded=False):
         st.caption("Suggestion only. This output does not automatically modify raw data, config files, predictions, or metrics.")
+        generated_with = st.session_state.get(f"{output_key}{SETTINGS_PROVENANCE_SUFFIX}")
+        if generated_with and generated_with != llm_settings_fingerprint():
+            # The provider or model changed after this text was written.
+            # Saying so is the whole of the claim; relabelling it with the
+            # model now configured would credit work it did not do.
+            st.caption(
+                "Generated with the LLM configuration in effect at the time; "
+                "the current configuration differs."
+            )
         st.markdown(output)
 
 
@@ -1419,14 +1586,14 @@ def _render_run_model_without_datasets() -> None:
     prepare_col, home_col = st.columns(2)
     with prepare_col:
         if st.button(
-            "Go to Prepare Data",
+            "Go to Prepare Data", type=NAV_ROLE,
             use_container_width=True,
             key="run_empty_go_prepare_data",
         ):
             set_current_step("prepare_data")
     with home_col:
         if st.button(
-            "Go to Home",
+            "Go to Home", type=NAV_ROLE,
             use_container_width=True,
             key="run_empty_go_home",
         ):
@@ -1458,11 +1625,23 @@ def render_run_model_page():
             with cols[idx % 2]:
                 status = "Ready" if info["ready"] else "Need preprocess" if info["raw_exists"] else "Missing raw"
                 color = "#1f7a3f" if info["ready"] else "#b26a00" if info["raw_exists"] else "#b42318"
-                st.markdown(f"<div style='border:1px solid {color}; border-radius:14px; padding:12px; margin-bottom:10px;'><b>{ds}</b><br>Raw files count: {info['raw_files']}<br>Processed files count: {info['processed_files']}<br><b>{status}</b></div>", unsafe_allow_html=True)
+                # A card, not a control. It used to carry a 1px solid
+                # border and a 14px radius directly above the "Select"
+                # button's 1px solid border and 8px radius, which is why
+                # the two read alike. The readiness colour is unchanged.
+                render_info_card(
+                    ds,
+                    [
+                        f"Raw files count: {info['raw_files']}",
+                        f"Processed files count: {info['processed_files']}",
+                    ],
+                    status=status,
+                    status_color=color,
+                )
                 if st.button(f"Select {ds}", key=f"run_select_{ds}", use_container_width=True):
                     st.session_state["selected_dataset"] = ds
                     st.rerun()
-        if st.button("Go Prepare Data", use_container_width=True, key="run_go_prepare_data"):
+        if st.button("Go Prepare Data", type=NAV_ROLE, use_container_width=True, key="run_go_prepare_data"):
             set_current_step("prepare_data")
 
     with tabs[0]:
@@ -1501,9 +1680,7 @@ def render_run_model_page():
             st.write(f"**Config exists:** {'Yes' if config_path and Path(str(config_path)).exists() else 'Missing'}")
             st.write(f"**Workspace dir:**")
             st.code(str(workspace_dir), language="text")
-            if not is_llm_configured():
-                st.caption("Need LLM help? Configure assistant below.")
-                render_inline_llm_settings("run_model", expanded=False)
+            render_llm_availability_notice()
             c1, c2 = st.columns(2)
             with c1:
                 if st.button("Explain this config", key="run_model_explain_config", use_container_width=True):
@@ -1512,17 +1689,13 @@ def render_run_model_page():
                             with st.spinner("Calling LLM assistant..."):
                                 response = run_llm_prompt(
                                     f"Explain this BatteryML config: {config_path}. Return suggestion only.",
-                                    base_url=st.session_state["llm_base_url"],
-                                    api_key=st.session_state["llm_api_key"],
-                                    model=st.session_state["llm_model"],
+                                    **llm_credentials(),
                                     system_prompt="You are an assistant for a BatteryML web protocol platform. Provide suggestions only. Do not modify raw data, metrics, predictions, or config files.",
                                 )
-                            st.session_state["llm_status"] = "connected"
-                            st.session_state["llm_status_message"] = "LLM request completed."
+                            set_llm_connection_result(True, "LLM request completed.")
                         except Exception as exc:
-                            response = f"LLM request failed: {exc}"
-                            st.session_state["llm_status"] = "failed"
-                            st.session_state["llm_status_message"] = response
+                            response = describe_llm_exception(exc)
+                            set_llm_connection_result(False, response)
                         _set_llm_output(
                             "run_model_config_llm_output",
                             response,
@@ -1543,17 +1716,13 @@ def render_run_model_page():
                                         dataset_readiness={"ready": info["ready"], "raw_exists": info["raw_exists"], "processed_exists": info["processed_exists"]},
                                         available_configs=[f"{k[0]} | {k[1]} | {k[2]} -> {v}" for k, v in list(configs.items())],
                                     ),
-                                    base_url=st.session_state["llm_base_url"],
-                                    api_key=st.session_state["llm_api_key"],
-                                    model=st.session_state["llm_model"],
+                                    **llm_credentials(),
                                     system_prompt="You are an assistant for a BatteryML web protocol platform. Provide suggestions only. Do not modify raw data, metrics, predictions, or config files.",
                                 )
-                            st.session_state["llm_status"] = "connected"
-                            st.session_state["llm_status_message"] = "LLM request completed."
+                            set_llm_connection_result(True, "LLM request completed.")
                         except Exception as exc:
-                            response = f"LLM request failed: {exc}"
-                            st.session_state["llm_status"] = "failed"
-                            st.session_state["llm_status_message"] = response
+                            response = describe_llm_exception(exc)
+                            set_llm_connection_result(False, response)
                         _set_llm_output(
                             "run_model_config_llm_output",
                             response,
@@ -1574,8 +1743,23 @@ def render_run_model_page():
         st.write(f"**Dataset readiness:** {_current_dataset_status(ds)}")
         st.write(f"**Config path:** `{config_path if config_path else 'Not configured'}`")
         st.write(f"**Workspace dir:** `{workspace_dir}`")
-        command = [sys.executable, "batteryml_web/core/run_batteryml_cli.py", "run", str(config_path) if config_path else "<missing-config>", "--workspace", str(workspace_dir), "--train", "--eval", "--device", st.session_state.get("selected_device", "cpu"), "--seed", str(st.session_state.get("run_seed", 0))]
-        st.code(" ".join(command), language="bash")
+        # Built by the one shared builder, so this route and the Agent
+        # Workflow cannot drift apart again. They had: this page spelled the
+        # argv out itself and omitted --metric, so the same config scored
+        # different metrics depending on which button was pressed.
+        command = build_run_command(
+            config_path=str(config_path) if config_path else "<missing-config>",
+            workspace=str(workspace_dir),
+            task=task_choice,
+            device=st.session_state.get("selected_device", "cpu"),
+            seed=st.session_state.get("run_seed", 0),
+        )
+        # Bounded above, not fixed: st.code scrolls horizontally rather
+        # than wrapping, so this command measured 54px at 1500px and the cap
+        # is a no-op there. It exists so the block cannot grow into a wall
+        # if a command or a viewport ever makes it wrap. The full command is
+        # untouched and Streamlit's copy control still copies all of it.
+        command_viewport().code(" ".join(command), language="bash")
         c1, c2 = st.columns([1, 2])
         with c1:
             if st.button("Explain this command", key="run_model_explain_command", use_container_width=True):
@@ -1595,10 +1779,14 @@ def render_run_model_page():
             st.warning("Processed dataset missing. Go to Prepare Data and run preprocessing first.")
         if config_path is None or not Path(str(config_path)).exists():
             st.warning("Config missing for the selected dataset/model combination.")
+        # Reserved outside the columns, so the run's progress spans the whole
+        # content area instead of inheriting c2's two-thirds. The buttons stay
+        # side by side; only what the run draws moves out from under them.
+        run_progress_host = st.container()
         with c2:
-            if st.button("Run BatteryML", disabled=not can_run, use_container_width=True, key="run_batteryml_btn"):
+            if st.button("Run BatteryML", type=PRIMARY_ROLE, disabled=not can_run, use_container_width=True, key="run_batteryml_btn"):
                 log_path = (_project_root() or Path("runs/web_projects/default")) / "logs" / "run_model.log"
-                result = run_command_with_progress(command=command, cwd=REPO_ROOT, log_path=log_path, steps=[(5, "Initialize"), (10, "Check dataset"), (20, "Load config"), (30, "Start BatteryML run"), (70, "Training/evaluation running"), (90, "Collect outputs"), (100, "Done")])
+                result = run_command_with_progress(command=command, cwd=REPO_ROOT, log_path=log_path, steps=[(5, "Initialize"), (10, "Check dataset"), (20, "Load config"), (30, "Start BatteryML run"), (70, "Training/evaluation running"), (90, "Collect outputs"), (100, "Done")], container=run_progress_host)
                 st.session_state["last_run_status"] = "success" if result["success"] else "failed"
                 st.session_state["last_run_time"] = result["elapsed"]
                 st.session_state["last_run_code"] = result["return_code"]
@@ -1612,7 +1800,7 @@ def render_run_model_page():
                         event_key=EVENT_RUN_COMPLETED,
                         signature=["run_model", str(workspace_dir), result["return_code"]],
                     )
-                    if st.button("Review Results →", use_container_width=True, key="run_go_results_after_run"):
+                    if st.button("Review Results →", type=NAV_ROLE, use_container_width=True, key="run_go_results_after_run"):
                         set_current_step("review_results")
         render_run_model_llm_output_panel("run_model_command_llm_output", "Command guidance", "Command guidance", "Command assistant")
         st.markdown("#### Output workspace")
@@ -1624,7 +1812,11 @@ def render_run_model_page():
         st.write(f"**Return code:** {st.session_state.get('last_run_code', 'N/A')}")
         st.write(f"**Log path:** {log_path if log_path else 'Not available yet'}")
         log_tail = _safe_read_log_tail(log_path) if log_path else ""
-        st.code(log_tail or "Not available yet", language="text")
+        # The element that actually grew without bound: 200 lines of log
+        # measured 4510px. Capped to a scrolling viewport; nothing is
+        # truncated, and this stays the Logs tab — the command preview and
+        # the progress display are separate surfaces and remain so.
+        log_viewport().code(log_tail or "Not available yet", language="text")
         if st.session_state.get("last_run_code") in [139, -11] or "segmentation fault" in log_tail.lower():
             st.error("Native dependency crash / segmentation fault detected. Possible causes: xgboost, libomp, numpy, sklearn, torch, or cache incompatibility.")
         error_summary = "No error detected." if st.session_state.get("last_run_status") == "success" else (log_tail[-500:] if log_tail else "No logs available.")
@@ -1662,24 +1854,185 @@ def render_run_model_page():
     render_bottom_step_navigation()
 
 
-def _selected_run_manifest():
-    """The run the user opened in Run History, or None.
+#: Session keys for the selected result. The identity key is stored *beside*
+#: every result-derived value, so a value computed for one run can never be
+#: displayed under another — see ``core/selected_result.py``.
+SELECTED_IDENTITY_KEY = "review_result_identity"
+EXPLANATION_IDENTITY_KEY = "review_llm_output_identity"
+ARTIFACT_CHOICE_KEY = "review_artifact_choice"
 
-    Returned to the Predictions and Files tabs so they describe *that run's*
-    artifacts rather than whatever the workspace glob happened to find. None
-    means nothing is selected — the tabs then fall back to the workspace and
-    say so, instead of silently showing a different run's files.
-    """
-    selected = st.session_state.get("run_history_selection")
-    if not selected:
-        return None
-    project = resolve_project(
+
+def _current_project():
+    """The project every part of Review Results is read against."""
+    return resolve_project(
         project_root=st.session_state.get("project_root"),
         project_name=st.session_state.get("project_name")
         or st.session_state.get("current_project"),
     )
+
+
+def _selected_run_manifest():
+    """The run the user opened in Run History, or None.
+
+    Looked up **inside the current project only**, so a selection left over
+    from a previous project resolves to None rather than reading that
+    project's directory. ``find_run`` searches ``project["root"]`` and
+    nothing above it.
+    """
+    selected = st.session_state.get("run_history_selection")
+    if not selected:
+        return None
+    project = _current_project()
     return find_run(
         project["root"], str(selected), live_run_ids=get_run_manager().live_run_ids()
+    )
+
+
+def _selected_result() -> SelectedResult:
+    """The one identity every section of Review Results derives from.
+
+    Built from the selected run's own manifest. Replaces the project-wide
+    ``find_result_files`` search that used to feed the Metrics, Summary and
+    Logs tabs and both LLM prompts: that search ``rglob``\\ed the whole
+    project, sorted by path, and took ``[0]`` — and because a run id starts
+    with a timestamp, ``[0]`` was the *oldest run in the project*. Selecting
+    a run changed none of those sections, which is why metrics and
+    predictions looked frozen and identical between runs.
+    """
+    project = _current_project()
+    manifest = _selected_run_manifest()
+    selected = resolve_selected_result(
+        project,
+        manifest,
+        chosen_artifact=st.session_state.get(ARTIFACT_CHOICE_KEY),
+        repo_root=REPO_ROOT,
+    )
+    _invalidate_stale_result_state(selected)
+    return selected
+
+
+def _invalidate_stale_result_state(selected: SelectedResult) -> None:
+    """Drop anything computed for a different result than this one.
+
+    Selecting run B must not leave run A's explanation on screen under B's
+    heading, and a slow explanation for A that lands after the user moved to
+    B must not be shown as B's. Both are handled the same way: every
+    result-derived value is stored with the identity it was computed for, and
+    anything that does not match the current identity is dropped here, before
+    the page draws.
+    """
+    identity = selected.identity_key()
+    previous = str(st.session_state.get(SELECTED_IDENTITY_KEY) or "")
+    if previous == identity:
+        return
+    st.session_state[SELECTED_IDENTITY_KEY] = identity
+    for key in (
+        "review_llm_output",
+        EXPLANATION_IDENTITY_KEY,
+        f"review_llm_output{SETTINGS_PROVENANCE_SUFFIX}",
+    ):
+        st.session_state.pop(key, None)
+
+
+def _selected_metrics_frame(selected: SelectedResult):
+    """The selected run's canonical metrics, as a frame, or None.
+
+    Read from that run's own manifest, which the run manager wrote from the
+    ``scores`` BatteryML itself saved. Nothing is recomputed here, and
+    nothing is read from another run: a selected run with no recorded
+    metrics returns None and the page says so for *that* run.
+    """
+    manifest = selected.manifest or {}
+    metrics = manifest.get("metrics")
+    if not isinstance(metrics, dict) or not metrics:
+        return None
+    return pd.DataFrame(
+        [{"Metric": name, "Value": value} for name, value in metrics.items()]
+    )
+
+
+def _selected_analysis_context(selected: SelectedResult) -> dict[str, Any]:
+    """The deterministic analysis facts for the currently selected result.
+
+    Built from this run's own manifest and its own selected artifact — the
+    same identity the rest of the page describes. Nothing here searches the
+    project for a "latest" artifact, which is the substitution STEP 1
+    removed.
+    """
+    manifest = dict(selected.manifest or {})
+    metrics = manifest.get("metrics")
+    result_context = {
+        "dataset": manifest.get("dataset"),
+        "task": manifest.get("task"),
+        "model": manifest.get("model_key"),
+        "config_path": manifest.get("config_path"),
+        "workspace": selected.run_dir,
+        "run_status": manifest.get("status"),
+        "success": str(manifest.get("status") or "") == rm.STATUS_COMPLETED,
+        "metrics": dict(metrics) if isinstance(metrics, dict) else {},
+        "warnings": [],
+    }
+    return build_analysis_context(
+        result_context,
+        manifest=manifest,
+        artifact_path=selected.predictions_file,
+        run_id=selected.run_id,
+        run_dir=selected.run_dir,
+        project_name=selected.project_name,
+        identity_key=selected.identity_key(),
+    )
+
+
+def render_benchmark_panel(analysis: dict[str, Any]) -> None:
+    """The compact published reference, beside the run's own number.
+
+    Deterministic: the registry decides what is shown and whether a
+    difference may be computed. The assistant never supplies a published
+    value, and this panel is drawn whether or not an explanation was ever
+    requested.
+
+    Deliberately four lines, not the 14x8 table. The full table is a
+    reference, not something to re-read on every result page; it lives in
+    the details expander below.
+    """
+    block = analysis.get("benchmark") or {}
+    record = block.get("record")
+    if record is None:
+        st.caption(f"Published BatteryML reference: none. {block.get('explanation', '')}")
+        return
+
+    st.markdown("**Published BatteryML reference**")
+    left, right = st.columns(2)
+    with left:
+        st.write(f"Model: {record['model_key']}")
+        st.write(f"Dataset: {record['dataset_subset']}")
+        st.write(f"Metric: {record['metric']} ({record['unit']})")
+    with right:
+        seeds = f" over {record['seeds']} seeds" if record["seeds"] > 1 else ""
+        st.write(f"Reference: {record['display']} {record['unit']}{seeds}")
+        run_value = block.get("run_value")
+        st.write(
+            f"Current run: {run_value!r} {record['unit']}"
+            if run_value is not None
+            else "Current run: no comparable metric saved"
+        )
+        if block.get("comparable"):
+            difference = block.get("difference")
+            st.write(f"Difference: {difference:+.1f} {record['unit']}")
+        else:
+            st.write("Comparison: not directly comparable")
+    st.caption(block.get("explanation", ""))
+    st.caption(f"Source: {record['source']}")
+
+
+def _render_selected_result_header(selected: SelectedResult) -> None:
+    """The compact identification block: which result is on screen.
+
+    Deliberately small — project, run id, model/dataset/task, run directory.
+    The exact artifact path lives in the details area below, not here.
+    """
+    st.dataframe(
+        selected.provenance_rows(), hide_index=True, use_container_width=True
     )
 
 
@@ -1719,18 +2072,31 @@ def render_review_results_page():
     )
 
     project_dir = _project_root() or Path("runs/native_matr_xgb_test")
-    session_workspace = Path(st.session_state.get("workspace_dir", "")) if st.session_state.get("workspace_dir") else None
-    fallback_workspace = Path("runs/native_matr_xgb_test")
-    searched_paths = [project_dir, project_dir / "workspace"]
-    if session_workspace:
-        searched_paths.append(session_workspace)
-    searched_paths.append(fallback_workspace)
-    files = find_result_files(project_dir, session_workspace or project_dir / "workspace")
-    metrics_df = load_metrics(files["metrics_files"])
-    if metrics_df is None or metrics_df.empty:
-        metrics_df = load_metrics_from_logs(files["log_files"])
-    preds_df = load_predictions(files["prediction_files"])
-    metrics_source = "metrics file" if files["metrics_files"] and metrics_df is not None else ("log file" if metrics_df is not None else "missing")
+
+    # Everything below describes exactly this result, or says it cannot.
+    # There is no project-wide artifact search here any more: the previous
+    # one returned every run's files sorted by path and the readers took
+    # [0], which is the oldest run in the project, whatever was selected.
+    selected = _selected_result()
+    metrics_df = _selected_metrics_frame(selected)
+    metrics_source = (
+        "run manifest" if metrics_df is not None and not metrics_df.empty else "missing"
+    )
+    # Scoped to the selected run's own directory. A run that wrote no logs
+    # says so rather than showing another run's.
+    run_files = (
+        find_result_files(Path(selected.run_dir), Path(selected.run_dir))
+        if selected.run_dir and Path(selected.run_dir).is_dir()
+        else {"log_files": [], "prediction_files": [], "metrics_files": []}
+    )
+
+    # Deterministic, and drawn whether or not anyone asks for an
+    # explanation: the published reference and whether it may be compared
+    # are backend facts, not the assistant's to decide. Reading the artifact
+    # for diagnostics happens once here and the same object is handed to the
+    # prompt, so the page and the model never see different evidence.
+    selected_analysis = _selected_analysis_context(selected)
+    render_benchmark_panel(selected_analysis)
 
     btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
     with btn_col1:
@@ -1748,132 +2114,148 @@ def render_review_results_page():
             set_llm_not_configured_message("review_llm_output")
             st.session_state["review_show_llm_settings"] = True
         else:
+            # Built from the selected result's own identity and manifest.
+            # It used to be built from the project-wide metrics table and
+            # st.session_state["workspace_dir"] — the last *manually* run
+            # workspace — so the explanation regularly described a different
+            # experiment from the one on screen.
             prompt = f'''
 You are assisting with a BatteryML result review.
 Summarize the available metrics, predictions, logs, and result files.
 Summarize run status, explain model performance briefly, mention missing files if any, and do not invent missing results or modify metrics.
-Project: {_current_project_name()}
-Workspace: {st.session_state.get("workspace_dir", "Not available")}
+Project: {selected.project_name or _current_project_name()}
+Run ID: {selected.run_id or "Not available"}
+Run directory: {selected.run_dir or "Not available"}
+Dataset: {(selected.manifest or {}).get("dataset", "Not available")}
+Task: {(selected.manifest or {}).get("task", "Not available")}
+Model: {(selected.manifest or {}).get("model_display") or (selected.manifest or {}).get("model_key") or "Not available"}
 Metrics table:
 {metrics_df.to_string() if metrics_df is not None else "No metrics available"}
-Predictions available: {'Yes' if preds_df is not None and not preds_df.empty else 'No'}
-Logs available: {'Yes' if files.get("log_files") else 'No'}
-Reports available: {'Yes' if files.get("report_files") else 'No'}
+Predictions artifact: {selected.predictions_file or selected.reason}
+Logs available: {'Yes' if run_files.get("log_files") else 'No'}
 '''
             try:
                 response = run_llm_prompt(
                     prompt,
-                    base_url=st.session_state["llm_base_url"],
-                    api_key=st.session_state["llm_api_key"],
-                    model=st.session_state["llm_model"],
+                    **llm_credentials(),
                     system_prompt="You are an assistant for a BatteryML web protocol platform. Provide suggestions only. Do not modify raw data, metrics, predictions, or config files.",
                 )
-                st.session_state["llm_status"] = "connected"
-                st.session_state["llm_status_message"] = "LLM request completed."
+                set_llm_connection_result(True, "LLM request completed.")
             except Exception as exc:
-                response = f"LLM request failed: {exc}"
-                st.session_state["llm_status"] = "failed"
-                st.session_state["llm_status_message"] = response
+                response = describe_llm_exception(exc)
+                set_llm_connection_result(False, response)
+            # Stored with the identity it was computed for. A slow reply for
+            # run A that lands after the user moved to run B fails the
+            # identity check and is dropped rather than shown under B.
             st.session_state["review_llm_output"] = response
+            st.session_state[EXPLANATION_IDENTITY_KEY] = selected.identity_key()
+            st.session_state[
+                f"review_llm_output{SETTINGS_PROVENANCE_SUFFIX}"
+            ] = llm_settings_fingerprint()
 
     if explain_clicked:
         if not is_llm_configured():
             set_llm_not_configured_message("review_llm_output")
             st.session_state["review_show_llm_settings"] = True
         else:
-            prompt = f'''
-Explain the following BatteryML evaluation metrics in plain language.
-Focus on what RMSE, MAE, and MAPE mean for RUL prediction, what lower or higher values mean, and whether metrics are available or missing.
-Do not recalculate or alter the metric values.
-Metrics:
-{metrics_df.to_string() if metrics_df is not None else "No metrics available"}
-'''
+            # The analysis path: deterministic facts first, then the prompt
+            # that asks for interpretation. It replaces an f-string that
+            # sent the metrics table and asked for "plain language",
+            # which is what made the answer a restatement.
+            analysis = selected_analysis
             try:
-                response = run_llm_prompt(
-                    prompt,
-                    base_url=st.session_state["llm_base_url"],
-                    api_key=st.session_state["llm_api_key"],
-                    model=st.session_state["llm_model"],
-                    system_prompt="You are an assistant for a BatteryML web protocol platform. Provide suggestions only. Do not modify raw data, metrics, predictions, or config files.",
+                parsed = explain_run_result(
+                    result_context_from_analysis(analysis),
+                    analysis_context=analysis,
+                    **llm_credentials(),
                 )
-                st.session_state["llm_status"] = "connected"
-                st.session_state["llm_status_message"] = "LLM request completed."
+                response = render_analysis_markdown(parsed)
+                set_llm_connection_result(True, "LLM request completed.")
             except Exception as exc:
-                response = f"LLM request failed: {exc}"
-                st.session_state["llm_status"] = "failed"
-                st.session_state["llm_status_message"] = response
+                response = describe_llm_exception(exc)
+                set_llm_connection_result(False, response)
+            # Stored with the identity it was computed for. A slow reply for
+            # run A that lands after the user moved to run B fails the
+            # identity check and is dropped rather than shown under B.
             st.session_state["review_llm_output"] = response
+            st.session_state[EXPLANATION_IDENTITY_KEY] = selected.identity_key()
+            st.session_state[
+                f"review_llm_output{SETTINGS_PROVENANCE_SUFFIX}"
+            ] = llm_settings_fingerprint()
 
     if st.session_state.get("review_show_llm_settings") or not is_llm_configured():
-        render_inline_llm_settings("review_results", expanded=st.session_state.get("review_show_llm_settings", False))
+        # A sentence, not a form. Pressing "Configure LLM" here used to open
+        # the full provider/URL/key/model block on this page, which is the
+        # "it asked me again" the user reported.
+        render_llm_availability_notice()
 
-    render_llm_output_panel("review_llm_output", "Result interpretation")
+    # Shown only when it was produced for the result now on screen. Anything
+    # else — a previous selection's answer, or a slow reply for a run the
+    # user has since left — is withheld rather than relabelled.
+    if cached_for(
+        st.session_state, "review_llm_output", EXPLANATION_IDENTITY_KEY, selected
+    ) is not None:
+        render_llm_output_panel("review_llm_output", "Result interpretation")
 
     tabs = st.tabs(["Summary", "Metrics", "Predictions", "Logs", "Files"])
 
     with tabs[0]:
-        st.write(f"**Project:** {_current_project_name()}")
-        st.write(f"**Project dir:** {project_dir}")
-        st.write(f"**Workspace dir:** {session_workspace or (project_dir / 'workspace')}")
-        st.write("**Searched result locations:**")
-        for p in searched_paths:
-            st.code(str(p), language="text")
-        st.write(f"**Last run:** {st.session_state.get('last_run_status', 'N/A')}")
+        _render_selected_result_header(selected)
+        if not selected.available:
+            st.info(selected.reason)
+        st.write(f"**Status:** {(selected.manifest or {}).get('status', 'Not available')}")
         st.write(f"**Metrics found:** {'Yes' if metrics_df is not None and not metrics_df.empty else 'No'}")
-        st.write(f"**Predictions found:** {'Yes' if files['prediction_files'] else 'No'}")
-        st.write(f"**Logs found:** {'Yes' if files['log_files'] else 'No'}")
+        st.write(f"**Predictions artifact:** {'Yes' if selected.available else 'No'}")
+        st.write(f"**Logs found:** {'Yes' if run_files.get('log_files') else 'No'}")
         st.write(f"**Metrics source:** {metrics_source}")
 
     with tabs[1]:
         if metrics_df is not None and not metrics_df.empty:
             st.dataframe(metrics_df, use_container_width=True, hide_index=True)
-            st.caption(f"Metrics source: {metrics_source}")
-        else:
-            st.info("Not available")
-            st.write("**Searched paths:**")
-            for p in searched_paths:
-                st.code(str(p), language="text")
-            st.write("**Next action:** Run training or inspect logs for RMSE / MAE / MAPE output.")
-
-    with tabs[2]:
-        # A selected run's predictions, described through the shared reader.
-        # The old branch below only understood a CSV with guessable column
-        # names and called every .pkl "parser not implemented" — which is
-        # almost every artifact this platform writes.
-        selected_manifest = _selected_run_manifest()
-        if selected_manifest is not None:
-            render_predictions_panel(selected_manifest)
-        elif preds_df is not None and not preds_df.empty:
-            st.dataframe(preds_df, use_container_width=True, hide_index=True)
-            cols = {c.lower(): c for c in preds_df.columns}
-            y_true_col = next((cols[c] for c in cols if c in {"y_true", "true", "gt", "label", "ground_truth"}), None)
-            y_pred_col = next((cols[c] for c in cols if c in {"y_pred", "pred", "prediction", "predictions"}), None)
-            if y_true_col and y_pred_col:
-                plot_df = preds_df[[y_true_col, y_pred_col]].rename(columns={y_true_col: "GT", y_pred_col: "Pred"})
-                st.scatter_chart(plot_df)
-                st.caption("GT vs Pred")
-            else:
-                st.info("Prediction file found but parser not implemented for this format.")
-                for p in files["prediction_files"]:
-                    st.code(str(p), language="text")
-        elif files["prediction_files"]:
-            # No run selected in history, but artifacts exist on disk: preview
-            # the first one through the same reader rather than declaring it
-            # unparseable.
-            render_predictions_panel(
-                {"artifacts": {"prediction_files": [str(p) for p in files["prediction_files"]]},
-                 "run_id": "workspace"}
+            st.caption(
+                f"Canonical metrics recorded by run {selected.run_id or 'unknown'}. "
+                "Read from that run's manifest; nothing is recomputed here."
+            )
+        elif selected.run_id:
+            st.info(
+                f"Run {selected.run_id} recorded no metrics. Another run's "
+                "metrics are never shown in their place."
             )
         else:
-            st.info("No predictions artifact was found.")
-            st.write("**Searched paths:**")
-            for p in searched_paths:
-                st.code(str(p), language="text")
-            st.write("**Next action:** Run training and re-open Review Results.")
+            st.info(selected.reason)
+
+    with tabs[2]:
+        # Exactly the selected run's artifact, through the shared CPU-safe
+        # reader. There is no "no run selected, so preview whatever is on
+        # disk" branch any more: that branch previewed the project-wide glob
+        # and is how another run's predictions appeared under this heading.
+        if selected.candidates and len(selected.candidates) > 1:
+            st.selectbox(
+                "Prediction artifact",
+                list(selected.candidates),
+                key=ARTIFACT_CHOICE_KEY,
+            )
+        if selected.available:
+            render_predictions_panel(
+                {
+                    "artifacts": {"prediction_files": [selected.predictions_file]},
+                    "run_id": selected.run_id,
+                }
+            )
+            # The "Artifact diagnostics" disclosure that stood here was a
+            # developer view: counts, finite/non-finite, distinct, constant,
+            # min/max at full precision. It answered a question a reader of
+            # a result does not ask, so the normal Results UI no longer
+            # offers it. The module behind it
+            # (batteryml_web.agent.prediction_diagnostics) is untouched and
+            # still feeds the deterministic context that LLM Result Analysis
+            # reads; see batteryml_web/agent/result_analysis.py.
+        else:
+            st.info(selected.reason)
 
     with tabs[3]:
-        if files["log_files"]:
-            for log_file in files["log_files"]:
+        if run_files.get("log_files"):
+            for log_file in run_files["log_files"]:
                 st.markdown(f"**{log_file.name}**")
                 try:
                     text = log_file.read_text(encoding="utf-8", errors="ignore")
@@ -1882,39 +2264,37 @@ Metrics:
                 lines = text.splitlines()
                 st.code("\n".join(lines[-120:]) if lines else "", language="text")
         else:
-            st.info("Not available")
-        render_llm_output_panel("review_llm_output", "Result interpretation")
+            st.info(
+                f"Run {selected.run_id or 'unknown'} recorded no log files."
+                if selected.run_id
+                else selected.reason
+            )
+        # Gated on identity, exactly as above: this panel must never repeat
+        # an explanation belonging to a different result.
+        if cached_for(
+            st.session_state, "review_llm_output", EXPLANATION_IDENTITY_KEY, selected
+        ) is not None:
+            render_llm_output_panel("review_llm_output", "Result interpretation")
 
     with tabs[4]:
-        selected_manifest = _selected_run_manifest()
-        if selected_manifest is not None:
+        if selected.manifest:
             # Where it wrote, then the files grouped by what they are.
-            render_run_location(selected_manifest)
-            run_dir = str(
-                selected_manifest.get("run_dir")
-                or selected_manifest.get("workspace")
-                or ""
-            )
-            if run_dir:
-                render_file_browser(run_dir)
+            render_run_location(dict(selected.manifest))
+            if selected.run_dir:
+                render_file_browser(selected.run_dir)
+            if selected.predictions_file:
+                st.caption("Prediction artifact read for this result:")
+                st.code(selected.predictions_file, language="text")
         else:
-            workspace = str(session_workspace or (project_dir / "workspace"))
-            st.markdown("**Where results are being read from**")
+            st.info(selected.reason)
             st.dataframe(
                 [
                     {"": "Project", "Path": _current_project_name()},
                     {"": "Project directory", "Path": str(project_dir)},
-                    {"": "Workspace", "Path": workspace},
                 ],
                 hide_index=True,
                 use_container_width=True,
             )
-            st.caption(
-                "Select a run in Run History above to browse that run's own "
-                "files, grouped by artifact type."
-            )
-            render_file_browser(workspace)
-        render_llm_output_panel("review_llm_output", "Result interpretation")
 
     render_bottom_step_navigation()
 
@@ -1923,6 +2303,10 @@ Metrics:
 # used to be defined here and shadowed the import, so the grouped navigation
 # in that module was dead code.
 render_sidebar_workflow()
+# Injected once per script run, beside the sidebar's own stylesheet. It is
+# its own module rather than an addition to ui/styles.py, which owns the
+# sidebar's tuned spacing and is deliberately left alone.
+render_surface_css()
 
 current_step = st.session_state.get("current_step", "home")
 
@@ -1934,16 +2318,33 @@ current_step = st.session_state.get("current_step", "home")
 # were. See ui/scroll.py.
 render_scroll_to_top(current_step)
 
-if current_step == "home":
-    render_home_page()
-elif current_step == "prepare_data":
-    render_prepare_data_page()
-elif current_step == "run_model":
-    render_run_model_page()
-elif current_step == "agent_workflow":
-    render_agent_workflow()
-elif current_step == "review_results":
-    render_review_results_page()
-else:
-    st.session_state["current_step"] = "home"
-    st.rerun()
+# The page body runs inside an error boundary. An application error renders
+# our own "Something went wrong" view with the details one click away and a
+# copy control of our own, instead of Streamlit's built-in traceback panel
+# with its Copy / Ask Google / Ask ChatGPT buttons — which shows a scientist a
+# developer's view and invites them to paste an internal traceback into a
+# search engine. Streamlit's panel is not touched: a genuinely uncaught
+# framework failure still reaches it, and st.rerun()/st.stop() pass straight
+# through. See ui/errors.py.
+with error_boundary(
+    key=f"page_{current_step}",
+    message=(
+        "This page could not be drawn. Your project, runs and data are "
+        "untouched — nothing was executed or written. Try the step again, or "
+        "move to another page from the sidebar."
+    ),
+    context={"page": current_step, "project": _current_project_name()},
+):
+    if current_step == "home":
+        render_home_page()
+    elif current_step == "prepare_data":
+        render_prepare_data_page()
+    elif current_step == "run_model":
+        render_run_model_page()
+    elif current_step == "agent_workflow":
+        render_agent_workflow()
+    elif current_step == "review_results":
+        render_review_results_page()
+    else:
+        st.session_state["current_step"] = "home"
+        st.rerun()

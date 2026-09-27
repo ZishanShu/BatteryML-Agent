@@ -20,9 +20,18 @@ _BATTERYLIFE_ROOT = _REPO_ROOT / "third_party" / "BatteryLife"
 _CPTRANSFORMER_SOURCE = _BATTERYLIFE_ROOT / "models" / "CPTransformer.py"
 
 if not _CPTRANSFORMER_SOURCE.is_file():
+    # Reached only when something imports this module directly. The normal
+    # path — batteryml_web.models.register_extension_models() — consults
+    # EXTERNAL_SOURCES first and skips this module when the vendored source
+    # is absent, so one un-vendored optional wrapper no longer stops the
+    # whole registry (and with it the CLI) on a fresh clone.
     raise FileNotFoundError(
         f"BatteryLife CPTransformer source not found: "
-        f"{_CPTRANSFORMER_SOURCE}"
+        f"{_CPTRANSFORMER_SOURCE}. This wrapper needs the BatteryLife "
+        f"repository vendored at third_party/BatteryLife (pinned commit in "
+        f"docs/EXTERNAL_MODEL_VERSIONS.txt); third_party/ is gitignored, so "
+        f"a fresh clone does not carry it. Every other model runs without "
+        f"it — CPTransformer alone is unavailable until it is vendored."
     )
 
 if str(_BATTERYLIFE_ROOT) not in sys.path:

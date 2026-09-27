@@ -14,9 +14,12 @@ second:
   contains every capability the two tabs had.
 * **`UX-10`** — the sidebar stylesheet adjusts spacing only, is scoped to
   the sidebar, hides nothing, relies on no generated class name, and keeps
-  the two values a browser run pinned down: the block gap at or above
-  `0.4rem` and a non-zero heading padding. Below those the sidebar heading,
-  which overflows its own container by ~16px, lands on top of its caption.
+  the values a browser run pinned down: the block gap at or above
+  `0.25rem`, a non-zero heading padding, and a brand margin that is pinned
+  and not negative. The sidebar heading overflows its own container by ~16px,
+  so the pin is what stops it landing on its caption; keeping the pin at or
+  above zero is what keeps the brand pair spaced like "Current project" over
+  its project name, the one label/caption pair Streamlit spaces itself.
 
 This check renders nothing, starts no server and writes nothing outside its
 own report.
@@ -65,10 +68,33 @@ ALLOWED_CSS_PROPERTIES = {
     "padding", "padding-top", "padding-bottom", "padding-left", "padding-right",
     "margin", "margin-top", "margin-bottom", "margin-left", "margin-right",
     "gap", "line-height", "height", "min-height",
+    # The sidebar's own width, admitted on the same reasoning as height: a
+    # narrower box still renders every control, still wraps and still
+    # scrolls. What stays out is what can make a control unreachable.
+    "width", "min-width",
+    # Type size, for the sidebar's grey secondary lines (UX-11). A size is
+    # not a disappearance: the text still renders, still wraps and is still
+    # selectable. Colour, display, visibility, content and overflow stay out
+    # — those are the properties that can remove a control.
+    "font-size",
 }
 
-#: Below this the sidebar heading overlaps its own caption. Measured, not guessed.
-MINIMUM_BLOCK_GAP_REM = 0.4
+#: The band UX-11 fixes the sidebar's secondary text to. A floor as well as a
+#: ceiling: below this it stops being readable, above it nothing was gained.
+SIDEBAR_CAPTION_REM = (0.80, 0.85)
+
+#: Rules the sidebar caption selector may never carry — the properties that
+#: clipped the second line of a wrapped caption behind the button beneath it.
+CAPTION_FORBIDDEN_ROOTS = {"margin", "padding", "height", "overflow"}
+
+#: The sidebar's whole vertical rhythm: measured in a browser, every
+#: top-level block is separated by this and nothing else. The floor is about
+#: legibility, not collision — below it the controls stop reading as separate
+#: rows. It used to be 0.4rem for a different reason: the heading's ~16px
+#: overflow had nothing else holding it back, so a smaller gap put the title
+#: on its own caption. The brand rule now pins that overflow at 0 whatever the
+#: gap is, so the two are independent; the pin is checked below.
+MINIMUM_BLOCK_GAP_REM = 0.25
 
 _GENERATED_CLASS = re.compile(r"\.(css|st-emotion)-[0-9a-z]{4,}")
 
@@ -100,6 +126,23 @@ def _strip_docstrings(node: ast.AST) -> str:
 
 
 def _tab_labels(page: ast.FunctionDef) -> list[str] | None:
+    """The Prepare Data tab labels, wherever the page keeps them.
+
+    They were a literal list inside ``st.tabs([...])`` and are now
+    ``ui/tab_navigation.PREPARE_TABS``, so that a navigation action can name
+    the tab it opens without a second copy of the names drifting from the
+    first. Both spellings are read; UX-09's requirement is the labels, not
+    where they are declared.
+    """
+    from batteryml_web.ui.tab_navigation import PREPARE_TABS
+
+    for node in ast.walk(page):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "render_prepare_tabs"
+        ):
+            return list(PREPARE_TABS)
     for node in ast.walk(page):
         if (
             isinstance(node, ast.Call)
@@ -275,7 +318,41 @@ def _check_sidebar_stylesheet(root: Path, errors: list[str], observed: dict) -> 
             if prop not in ALLOWED_CSS_PROPERTIES:
                 errors.append(
                     f"sidebar rule {selector!r} sets {prop!r}, which is not a "
-                    "spacing property. This stylesheet adjusts layout only (UX-10)."
+                    "spacing or type-size property. This stylesheet adjusts "
+                    "layout only (UX-10, UX-11)."
+                )
+
+    caption_rules = [
+        (selector, declarations)
+        for selector, declarations in rules
+        if "stCaptionContainer" in selector
+    ]
+    if not caption_rules:
+        errors.append(
+            "the sidebar stylesheet no longer sets the secondary text size "
+            "(UX-11)."
+        )
+    for selector, declarations in caption_rules:
+        for declaration in declarations.split(";"):
+            if ":" not in declaration:
+                continue
+            prop = declaration.split(":", 1)[0].strip()
+            # Matched on the property root, so "line-height" is read as type
+            # rather than as a "height".
+            if prop.split("-")[0] in CAPTION_FORBIDDEN_ROOTS:
+                errors.append(
+                    f"sidebar caption rule sets {prop!r}; a caption spacing "
+                    "rule clipped wrapped captions behind the next button "
+                    "(UX-11)."
+                )
+        sizes = re.findall(r"font-size:\s*([0-9.]+)rem", declarations)
+        observed["sidebar_caption_rem"] = sizes
+        low, high = SIDEBAR_CAPTION_REM
+        for size in sizes:
+            if not (low <= float(size) <= high):
+                errors.append(
+                    f"the sidebar secondary text is {size}rem, outside the "
+                    f"{low}-{high}rem band UX-11 fixes."
                 )
 
     gap = re.search(r"stVerticalBlock\"\]\s*\{[^}]*gap:\s*([0-9.]+)rem", SIDEBAR_COMPACT_CSS)
@@ -286,10 +363,32 @@ def _check_sidebar_stylesheet(root: Path, errors: list[str], observed: dict) -> 
         if float(gap.group(1)) < MINIMUM_BLOCK_GAP_REM:
             errors.append(
                 f"the sidebar block gap is {gap.group(1)}rem, below "
-                f"{MINIMUM_BLOCK_GAP_REM}rem. Streamlit's sidebar heading "
-                "overflows its container by ~16px, so a smaller gap puts the "
-                "title on top of its own caption (UX-10)."
+                f"{MINIMUM_BLOCK_GAP_REM}rem. This one value sets the spacing "
+                "between every block in the sidebar; below the floor the "
+                "controls stop reading as separate rows (UX-10)."
             )
+        brand = re.search(
+            r":has\(> h3\)\s*\{[^}]*margin-bottom:\s*(-?[0-9.]+)(?:rem)?",
+            SIDEBAR_COMPACT_CSS,
+        )
+        if brand is None:
+            errors.append(
+                "the sidebar brand heading no longer pins its bottom margin. "
+                "Streamlit's heading overflows its container by ~16px, and "
+                "that rule is what stops the title landing on its own caption "
+                "(UX-10, UX-11)."
+            )
+        else:
+            observed["brand_margin_rem"] = float(brand.group(1))
+            if float(brand.group(1)) < 0.0:
+                errors.append(
+                    f"the sidebar brand margin is {brand.group(1)}rem. A "
+                    "negative value spends the block gap, which spaces "
+                    "'BatteryML' over 'Protocol Navigator' more tightly than "
+                    "'Current project' over its project name — the one "
+                    "label/caption pair Streamlit spaces itself, and the one "
+                    "the brand is meant to match (UX-10, UX-11)."
+                )
 
     headings = re.search(r"stSidebar\"\]\s*h4\s*\{([^}]*)\}", SIDEBAR_COMPACT_CSS)
     if headings is None:

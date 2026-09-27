@@ -8,11 +8,28 @@ from batteryml.data.transformation.base import BaseDataTransformation
 
 
 class Dataset:
-    def __init__(self, feature: torch.Tensor, label: torch.Tensor):
+    def __init__(self,
+                 feature: torch.Tensor,
+                 label: torch.Tensor,
+                 sample_index=None):
+        """Features, labels, and optionally who each row belongs to.
+
+        ``sample_index`` is a
+        :class:`~batteryml.data.sample_index.SampleIndex` for a cycle-level
+        task, where one cell contributes many rows and the row number no
+        longer identifies anything. It is ``None`` for the original
+        one-sample-per-cell layout, which is unchanged.
+
+        It is not a tensor and never reaches a model: it stays out of the
+        numeric path so a cell id cannot be mistaken for a feature.
+        """
         assert len(feature) == len(label), (len(feature), len(label))
+        if sample_index is not None:
+            sample_index.check_matches(len(feature), 'Dataset')
 
         self.label = label
         self.feature = feature
+        self.sample_index = sample_index
 
     def __len__(self):
         return len(self.label)
@@ -40,7 +57,9 @@ class DataBundle:
                  test_feature: torch.Tensor,
                  test_label: torch.Tensor,
                  feature_transformation: BaseDataTransformation = None,
-                 label_transformation: BaseDataTransformation = None):
+                 label_transformation: BaseDataTransformation = None,
+                 train_sample_index=None,
+                 test_sample_index=None):
         # Convert the dtype
         train_feature = train_feature.float()
         train_label = train_label.float()
@@ -61,8 +80,8 @@ class DataBundle:
             test_label = self.label_transformation.transform(test_label)
 
         # Build datasets
-        self.train_data = Dataset(train_feature, train_label)
-        self.test_data = Dataset(test_feature, test_label)
+        self.train_data = Dataset(train_feature, train_label, train_sample_index)
+        self.test_data = Dataset(test_feature, test_label, test_sample_index)
 
     def to(self, device: str):
         self.train_data = self.train_data.to(device)

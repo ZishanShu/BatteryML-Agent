@@ -23,8 +23,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tests.test_readiness import (  # noqa: E402
-    REGISTRIES_AVAILABLE,
-    REGISTRY_SKIP_MESSAGE,
+    DEMO_ENVIRONMENT_AVAILABLE,
+    DEMO_ENVIRONMENT_SKIP_MESSAGE,
 )
 from batteryml_web.agent.execution import build_execution_plan  # noqa: E402
 from batteryml_web.agent.executor import execute_plan  # noqa: E402
@@ -209,7 +209,7 @@ class TestDeviceValidation(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     di.validate_device(bad)
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_the_planner_refuses_a_multi_gpu_device(self) -> None:
         with self.assertRaises(ValueError):
             build_execution_plan(
@@ -415,7 +415,7 @@ class TestFailureClassification(unittest.TestCase):
 class TestExecutorNeverRetries(unittest.TestCase):
     """A CUDA OOM must not be retried, on another GPU or otherwise."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_failed_run_calls_the_runner_exactly_once(self) -> None:
         plan = build_execution_plan(
             "MATR",
@@ -437,7 +437,7 @@ class TestExecutorNeverRetries(unittest.TestCase):
 class TestBatLiNetSmokePlan(unittest.TestCase):
     """The smoke plan uses the formal config and changes only --epochs."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_smoke_plan_is_epochs_one_on_the_formal_config(self) -> None:
         plan = build_execution_plan(
             "MATR",
@@ -462,7 +462,7 @@ class TestBatLiNetSmokePlan(unittest.TestCase):
         self.assertIn("--eval", command)
         self.assertEqual(command[command.index("--device") + 1], "cpu")
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_non_smoke_plan_keeps_the_config_schedule(self) -> None:
         plan = build_execution_plan(
             "MATR", "RUL prediction", "batlinet", device="cpu", epochs=None
@@ -470,7 +470,7 @@ class TestBatLiNetSmokePlan(unittest.TestCase):
         self.assertTrue(plan["can_execute"])
         self.assertNotIn("--epochs", plan["command"])
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_explicit_gpu_choice_is_honoured(self) -> None:
         plan = build_execution_plan(
             "MATR", "RUL prediction", "batlinet", device="cuda:3", epochs=1

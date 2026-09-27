@@ -13,6 +13,10 @@ from typing import Any
 
 from .llm_client import run_llm_prompt
 from .prompts import build_results_summary_prompt
+from .result_analysis import (
+    ANALYSIS_SYSTEM_PROMPT,
+    build_result_analysis_prompt,
+)
 from .results import build_result_interpretation_prompt
 
 RESULT_SYSTEM_PROMPT = (
@@ -130,6 +134,7 @@ def explain_run_result(
     model: str,
     timeout: int = 60,
     llm_call: Any | None = None,
+    analysis_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Explain a structured run result from :func:`results.build_result_context`.
 
@@ -147,11 +152,18 @@ def explain_run_result(
             unless ``llm_call`` is given.
         llm_call: injectable ``(prompt, *, system_prompt, **kwargs) -> str``
             boundary for tests.
+        analysis_context: the richer deterministic context from
+            :func:`~batteryml_web.agent.result_analysis.build_analysis_context`.
+            When present it selects the analysis prompt, which asks for
+            interpretation, diagnostics, a gated benchmark comparison and
+            next steps instead of a restatement of the configuration.
 
     Returns:
         A dict with the LLM's parsed reply plus ``result_context`` holding
         the caller's input object unchanged, so prose is never the source
-        of any number.
+        of any number. ``analysis_context`` is echoed back the same way when
+        one was supplied, so the benchmark the UI renders and the benchmark
+        the model was shown are the same object.
 
     Raises:
         ValueError: if ``result_context`` is empty or a failed run carries
@@ -170,7 +182,16 @@ def explain_run_result(
             "interpret fabricated values."
         )
 
-    prompt = build_result_interpretation_prompt(result_context)
+    # An enriched analysis context gets the analysis prompt; a bare result
+    # context keeps the interpretation prompt. Two shapes rather than two
+    # code paths: the caller decides how much evidence it can supply, and a
+    # caller that supplies none still works exactly as before.
+    if analysis_context:
+        prompt = build_result_analysis_prompt(analysis_context)
+        system_prompt = ANALYSIS_SYSTEM_PROMPT
+    else:
+        prompt = build_result_interpretation_prompt(result_context)
+        system_prompt = RESULT_SYSTEM_PROMPT
     caller = llm_call if llm_call is not None else run_llm_prompt
     try:
         content = caller(
@@ -178,15 +199,17 @@ def explain_run_result(
             base_url=base_url,
             api_key=api_key,
             model=model,
-            system_prompt=RESULT_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             timeout=timeout,
         )
     except TypeError:
-        content = caller(prompt, system_prompt=RESULT_SYSTEM_PROMPT)
+        content = caller(prompt, system_prompt=system_prompt)
     parsed = _extract_json(content, source="explain_run_result")
 
     # The caller's context wins unconditionally: whatever the model echoed
     # back under these keys is discarded.
     parsed["metrics"] = metrics
     parsed["result_context"] = result_context
+    if analysis_context:
+        parsed["analysis_context"] = analysis_context
     return parsed

@@ -26,11 +26,28 @@ JSON-serializable dicts as the run progresses::
      "current": int | None,
      "total": int | None,
      "fraction": float | None,
-     "message": str}
+     "message": str,
+     "heartbeat": bool,
+     "indeterminate": bool}
 
 ``fraction`` is filled in **only** when the run itself printed a counter.
 Where no machine-readable progress exists the event carries ``None`` and the
 caller shows a stage and an elapsed time instead of an invented percentage.
+
+``heartbeat`` marks the periodic tick emitted while the run is quiet. It
+repeats the last observed stage and counter and advances neither, so a
+caller can refresh an elapsed time without anything being invented — and a
+caller that keeps a log must skip it, or the log fills with identical lines.
+
+``indeterminate`` says the current stage is one the run never puts a counter
+on, so a caller can draw a spinner immediately rather than waiting for a bar
+that is not coming.
+
+The stages are named after the tqdm bars BatteryML actually prints
+(``batteryml/task.py``, ``batteryml/models/nn_model.py``) plus two boundaries
+inferred from the CLI's own call order; see
+:meth:`_ProgressState._stage_after_completed_counter` for exactly which two
+and why each follows from the code.
 
 Streamlit independence: the reader threads never call the callback. They
 only decode bytes into a queue; ``on_event`` is invoked from the thread that
@@ -55,8 +72,19 @@ from .executor import _empty_artifacts, _repo_root, discover_artifacts, validate
 EventCallback = Callable[[Dict[str, Any]], None]
 
 #: Stage names the UI may display. Ordered as the run reaches them.
+#:
+#: The four data stages are named after the tqdm bars BatteryML actually
+#: prints, rather than collapsed into one "Loading data". A run that spends a
+#: minute reading cells and a minute expanding them into cycle samples was
+#: reporting the same three words for both, which told the user nothing about
+#: which half they were waiting on.
 STAGE_VALIDATING = "Validating plan"
+STAGE_PREPARING = "Preparing"
 STAGE_LOADING = "Loading data"
+STAGE_READING_TRAIN = "Reading train data"
+STAGE_READING_TEST = "Reading test data"
+STAGE_EXTRACTING_TRAIN = "Extracting train samples"
+STAGE_EXTRACTING_TEST = "Extracting test samples"
 STAGE_TRAINING = "Training"
 STAGE_EVALUATING = "Evaluating"
 STAGE_READING = "Reading results"
@@ -65,11 +93,26 @@ STAGE_FAILED = "Failed"
 
 STAGES: Tuple[str, ...] = (
     STAGE_VALIDATING,
+    STAGE_PREPARING,
     STAGE_LOADING,
+    STAGE_READING_TRAIN,
+    STAGE_READING_TEST,
+    STAGE_EXTRACTING_TRAIN,
+    STAGE_EXTRACTING_TEST,
     STAGE_TRAINING,
     STAGE_EVALUATING,
     STAGE_READING,
     STAGE_COMPLETE,
+)
+
+#: Stages that never carry a counter, so a caller knows to draw a spinner and
+#: an elapsed time rather than waiting for a bar that will not arrive.
+INDETERMINATE_STAGES: Tuple[str, ...] = (
+    STAGE_VALIDATING,
+    STAGE_PREPARING,
+    STAGE_LOADING,
+    STAGE_EVALUATING,
+    STAGE_READING,
 )
 
 #: A tqdm line: "<desc>:  10%|#         | 1/10 [00:06<00:54,  6.80s/it]".
@@ -84,12 +127,26 @@ _TQDM_RE = re.compile(
 #: extension models in ``batteryml_web/models/`` emit.
 _TRAINING_DESC_PREFIXES: Tuple[str, ...] = ("training", "traning")
 
-#: Lines BatteryML really prints while it is building the dataset.
-#: ``batteryml/task.py`` emits the two tqdm bars; ``batteryml/pipeline.py``
-#: prints the seed line and the cache line.
+#: tqdm description -> stage, for the bars BatteryML actually prints. Each key
+#: is the literal ``desc=`` argument at the cited line, lowercased; matching is
+#: by prefix so a description the pipeline extends keeps resolving.
+#:
+#: * ``batteryml/task.py:79``  ``desc='Reading train data'``
+#: * ``batteryml/task.py:81``  ``desc='Reading test data'``
+#: * ``batteryml/task.py:150`` ``desc=f'Extracting {split_name} cycle samples'``
+#:
+#: Longest key first, so "extracting train" is tested before any shorter key
+#: that could also prefix-match it.
+_DESC_STAGES: Tuple[Tuple[str, str], ...] = (
+    ("extracting train cycle samples", STAGE_EXTRACTING_TRAIN),
+    ("extracting test cycle samples", STAGE_EXTRACTING_TEST),
+    ("reading train data", STAGE_READING_TRAIN),
+    ("reading test data", STAGE_READING_TEST),
+)
+
+#: Prose lines ``batteryml/pipeline.py`` prints around dataset construction.
+#: These carry no counter, so they place the run in an indeterminate stage.
 _LOADING_MARKERS: Tuple[str, ...] = (
-    "reading train data",
-    "reading test data",
     "load datasets from cache",
     "seed is set to",
 )
@@ -103,6 +160,15 @@ HEARTBEAT_MESSAGE = "Running."
 
 #: How long the event loop waits for output before emitting a heartbeat.
 _HEARTBEAT_INTERVAL_S = 0.2
+
+#: How long the loop keeps reading after the child has exited and gone quiet
+#: before it stops waiting for EOF. Generous on purpose: a healthy run EOFs
+#: within milliseconds of exiting, so this window is only ever spent in the
+#: pathological case where something the child spawned still holds the pipes.
+#: Measured from the last byte received, not from the exit, so a large
+#: buffered tail still arriving keeps pushing the deadline out and is never
+#: truncated.
+POST_EXIT_DRAIN_S = 5.0
 
 #: Segments longer than this are truncated in the *event* only; the stored
 #: stdout/stderr keep every byte.
@@ -139,6 +205,23 @@ def is_training_progress(desc: str) -> bool:
     return any(lowered.startswith(prefix) for prefix in _TRAINING_DESC_PREFIXES)
 
 
+def stage_for_description(desc: str) -> Optional[str]:
+    """The stage a tqdm description names, or None for an unknown one.
+
+    Training is checked first because its descriptions are open-ended
+    (``Training BatLiNet``), then the four fixed data-stage descriptions.
+    """
+    lowered = str(desc or "").strip().lower()
+    if not lowered:
+        return None
+    if is_training_progress(lowered):
+        return STAGE_TRAINING
+    for prefix, stage in _DESC_STAGES:
+        if lowered.startswith(prefix):
+            return stage
+    return None
+
+
 def classify_stage(line: str) -> Optional[str]:
     """The stage one output segment proves the run has reached, or None.
 
@@ -150,11 +233,22 @@ def classify_stage(line: str) -> Optional[str]:
     if not text:
         return None
     progress = parse_progress_line(line)
-    if progress is not None and is_training_progress(progress["desc"]):
-        return STAGE_TRAINING
+    if progress is not None:
+        stage = stage_for_description(progress["desc"])
+        if stage is not None:
+            return stage
     if any(marker in text for marker in _LOADING_MARKERS):
         return STAGE_LOADING
     return None
+
+
+def is_indeterminate_stage(stage: str) -> bool:
+    """Whether a stage is one the run never puts a counter on.
+
+    A caller uses this to decide between a progress bar and a spinner
+    *before* a counter arrives, instead of waiting for one that never will.
+    """
+    return str(stage or "") in INDETERMINATE_STAGES
 
 
 def _decode_pump(
@@ -213,6 +307,32 @@ def _decode_pump(
         events.put(("eof", channel, ""))
 
 
+#: Stages a run only ever passes through once, in this order. Used solely to
+#: refuse a *backwards* stage transition — a late "Reading test data" bar
+#: emitted during evaluation must not drag the display back to loading. A
+#: stage absent from this tuple (Complete, Failed) is set explicitly and is
+#: not subject to the ordering rule.
+_STAGE_ORDER: Tuple[str, ...] = (
+    STAGE_VALIDATING,
+    STAGE_PREPARING,
+    STAGE_LOADING,
+    STAGE_READING_TRAIN,
+    STAGE_READING_TEST,
+    STAGE_EXTRACTING_TRAIN,
+    STAGE_EXTRACTING_TEST,
+    STAGE_TRAINING,
+    STAGE_EVALUATING,
+    STAGE_READING,
+)
+
+
+def _stage_rank(stage: str) -> Optional[int]:
+    try:
+        return _STAGE_ORDER.index(str(stage))
+    except ValueError:
+        return None
+
+
 class _ProgressState:
     """The last progress the run actually reported. Never extrapolated."""
 
@@ -222,47 +342,116 @@ class _ProgressState:
         self.total: Optional[int] = None
         self.fraction: Optional[float] = None
         self.training_started: bool = False
+        #: The stage that printed the counter just observed, which is not
+        #: always :attr:`stage`: a *full* counter both belongs to the stage
+        #: that printed it and proves the run has moved past that stage. The
+        #: event for that line must be attributed to the stage that earned
+        #: it, or a finished 42/42 extraction would be drawn as a training
+        #: bar sitting at 100% before training had begun.
+        self.counter_stage: Optional[str] = None
 
-    def observe(self, segment: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
-        """Fold one segment in. Returns ``(stage_changed, progress or None)``."""
+    def _clear_counter(self) -> None:
+        self.current = None
+        self.total = None
+        self.fraction = None
+
+    def _advance_to(self, stage: str) -> bool:
+        """Move to ``stage`` unless that would walk backwards.
+
+        Returns whether the stage changed. The counter is cleared on a real
+        change, because a counter belongs to the stage that printed it: a
+        41/41 left over from reading is not 41/41 of extracting.
+        """
+        if stage == self.stage:
+            return False
+        here, there = _stage_rank(self.stage), _stage_rank(stage)
+        if here is not None and there is not None and there < here:
+            return False
+        self.stage = stage
+        self._clear_counter()
+        return True
+
+    def observe(
+        self, segment: str
+    ) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:
+        """Fold one segment in.
+
+        Returns ``(stage_changed, progress or None, entered or None)``, where
+        ``entered`` is a stage the run is *inferred* to have begun because a
+        counter finished — see
+        :meth:`_stage_after_completed_counter`. The caller announces it as
+        its own event, because nothing in the output announces it and a stage
+        the display never reports is a stage the user never sees.
+        """
         progress = parse_progress_line(segment)
-        stage = classify_stage(segment)
         changed = False
+        self.counter_stage = None
 
-        if progress is not None and is_training_progress(progress["desc"]):
-            self.training_started = True
+        if progress is not None:
+            stage = stage_for_description(progress["desc"])
+            if stage is None:
+                # A counter whose description we do not recognise. It is not
+                # evidence about where the run is, so it moves no stage — and
+                # it is reported without its numbers, because a counter
+                # attributed to a stage that did not print it is worse than
+                # no counter.
+                return False, progress, None
+            changed = self._advance_to(stage)
+            if not changed and stage != self.stage:
+                # The advance was refused as backwards: a bar from an earlier
+                # phase printed late. Its counter describes neither the stage
+                # it names nor the stage the run is in, so it is not
+                # attributed to either.
+                return False, progress, None
+            if stage == STAGE_TRAINING:
+                self.training_started = True
+            # Retained on the state, not only on the event, so the
+            # heartbeats between two counter updates keep reporting the
+            # last real counter instead of blanking the bar every 0.2s.
             self.current = progress["current"]
             self.total = progress["total"]
             self.fraction = progress["fraction"]
-            if self.stage != STAGE_TRAINING:
-                self.stage = STAGE_TRAINING
-                changed = True
-            elif (
-                progress["total"] > 0
-                and progress["current"] >= progress["total"]
-            ):
-                # The CLI always runs --train then --eval (CLAUDE.md §5), so
-                # once the training counter is full the remaining work before
-                # exit is evaluation. Inferred from the command contract, not
-                # from a printed marker: BatteryML prints nothing when
-                # evaluation begins.
-                self.stage = STAGE_EVALUATING
-                self.current = None
-                self.total = None
-                self.fraction = None
-                changed = True
-            return changed, progress
+            self.counter_stage = stage
+            entered = None
+            if progress["total"] > 0 and progress["current"] >= progress["total"]:
+                finished = self._stage_after_completed_counter(stage)
+                if finished is not None and self._advance_to(finished):
+                    changed = True
+                    entered = finished
+            return changed, progress, entered
 
-        if stage is not None and stage != self.stage:
-            # Never walk backwards: a late "Reading test data" bar during
-            # evaluation must not reset the stage to Loading data.
-            if not (stage == STAGE_LOADING and self.training_started):
-                self.stage = stage
-                self.current = None
-                self.total = None
-                self.fraction = None
-                changed = True
-        return changed, progress
+        stage = classify_stage(segment)
+        if stage is not None:
+            changed = self._advance_to(stage)
+        return changed, progress, None
+
+    @staticmethod
+    def _stage_after_completed_counter(stage: str) -> Optional[str]:
+        """What a *full* counter proves the run has moved on to, if anything.
+
+        Both entries are inferred from the command contract rather than from
+        a printed marker, because BatteryML prints nothing at either
+        boundary. They are the only two inferences in this module, and each
+        follows from code that cannot reorder without this being updated:
+
+        * ``bin/batteryml.py:115 run()`` calls ``pipeline.train()`` and then
+          ``pipeline.evaluate()``, and the wrapper always passes both
+          ``--train`` and ``--eval`` (CLAUDE.md §5). So a full training
+          counter means evaluation is what remains.
+        * ``Task.build`` (``batteryml/task.py:70``) reads train cells, reads
+          test cells, extracts train samples, then extracts test samples —
+          and returns. ``Pipeline.train`` then calls ``model.fit``. So a full
+          *test extraction* counter means the dataset is built and fitting is
+          what remains. This is what keeps a one-shot sklearn fit — Ridge,
+          Lasso, Elastic Net, Random Forest, XGBoost — from sitting on
+          "Extracting test samples" for its whole duration: those models emit
+          no training counter at all, and none is waited for.
+        """
+        if stage == STAGE_TRAINING:
+            return STAGE_EVALUATING
+        if stage == STAGE_EXTRACTING_TEST:
+            return STAGE_TRAINING
+        return None
 
 
 def _event(
@@ -273,14 +462,31 @@ def _event(
     current: Optional[int] = None,
     total: Optional[int] = None,
     fraction: Optional[float] = None,
+    heartbeat: bool = False,
+    stage: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """One structured progress event.
+
+    ``heartbeat`` marks the periodic "still alive" tick. It is a flag rather
+    than a message a consumer has to recognise by its text: a log that
+    appended every heartbeat filled with hundreds of identical
+    ``"Running."`` lines and pushed the run's real output out of view. A
+    consumer that keeps a log skips these; one that draws an elapsed time
+    uses them.
+
+    ``stage`` overrides the state's current stage for this one event, and is
+    used only to attribute a counter to the stage that printed it.
+    """
+    effective = stage or state.stage
     return {
         "type": event_type,
-        "stage": state.stage,
+        "stage": effective,
         "current": current,
         "total": total,
         "fraction": fraction,
         "message": message[:_EVENT_MESSAGE_CHARS],
+        "heartbeat": bool(heartbeat),
+        "indeterminate": is_indeterminate_stage(effective),
     }
 
 
@@ -355,7 +561,10 @@ def execute_plan_streaming(
     argv: List[str] = checked["argv"]
     launcher = popen if popen is not None else subprocess.Popen
     started_at = time.monotonic()
-    state.stage = STAGE_LOADING
+    # "Preparing", not "Loading data": between the spawn and the first tqdm
+    # bar the child is importing torch and building the config, which is not
+    # reading any data. The first real bar moves it on.
+    state.stage = STAGE_PREPARING
     _emit(on_event, _event("stage", state, "Starting the BatteryML wrapper."))
 
     try:
@@ -397,10 +606,36 @@ def execute_plan_streaming(
 
     open_streams = len(threads)
     timed_out = False
+    abandoned_streams = False
+    #: When the child was first observed to have exited. The loop below ends
+    #: on EOF from both pipes, which is the normal and complete ending — but
+    #: it must not *depend* on it. A pipe is closed when the last holder of
+    #: the write end closes it, and the child is not always the last holder:
+    #: anything it spawned that inherited its stdout or stderr keeps the pipe
+    #: open after the child itself has exited. This loop would then wait for
+    #: an EOF that is not coming, with no timeout (RunManager passes none),
+    #: so the run stayed RUNNING for the lifetime of the server process and
+    #: the page polled a job that had already finished. Reproduced: a child
+    #: that spawns a sleeper and exits leaves both streams open indefinitely.
+    #: Last time anything at all arrived from either pipe. The drain window
+    #: is measured from *activity*, not from the exit, so a child that exits
+    #: while a large buffered tail is still being read is never truncated:
+    #: every segment that arrives pushes the deadline out again.
+    last_activity = time.monotonic()
     while open_streams > 0:
         if timeout is not None and (time.monotonic() - started_at) > timeout and not timed_out:
             timed_out = True
             proc.kill()
+        if (
+            proc.poll() is not None
+            and (time.monotonic() - last_activity) > POST_EXIT_DRAIN_S
+        ):
+            # The child is gone and its output has been quiet for the whole
+            # drain window; whatever still holds these pipes is not the run.
+            # Stop waiting and let the terminal status be decided by the
+            # return code, which is already available.
+            abandoned_streams = True
+            break
         try:
             kind, channel, payload = events.get(timeout=_HEARTBEAT_INTERVAL_S)
         except queue.Empty:
@@ -415,44 +650,61 @@ def execute_plan_streaming(
                     current=state.current,
                     total=state.total,
                     fraction=state.fraction,
+                    heartbeat=True,
                 ),
             )
             continue
+        last_activity = time.monotonic()
         if kind == "eof":
             open_streams -= 1
             continue
-        changed, progress = state.observe(payload)
-        if progress is not None and is_training_progress(progress["desc"]):
+        changed, progress, entered = state.observe(payload)
+        if progress is not None and state.counter_stage is not None:
+            # Attributed to the stage that printed this counter, which is not
+            # always the stage the run is now in: a full counter is both the
+            # end of its own stage and the proof the next one has begun.
             _emit(
                 on_event,
                 _event(
-                    "training_progress",
+                    "training_progress"
+                    if is_training_progress(progress["desc"])
+                    else "stage",
                     state,
                     payload,
                     current=progress["current"],
                     total=progress["total"],
                     fraction=progress["fraction"],
+                    stage=state.counter_stage,
                 ),
             )
         elif progress is not None:
-            _emit(
-                on_event,
-                _event(
-                    "stage",
-                    state,
-                    payload,
-                    current=progress["current"],
-                    total=progress["total"],
-                    fraction=progress["fraction"],
-                ),
-            )
+            # An unrecognised bar: its text is kept, its numbers are not
+            # attached to a stage that did not produce them.
+            _emit(on_event, _event("output", state, payload))
         elif changed:
             _emit(on_event, _event("stage", state, payload))
         else:
             _emit(on_event, _event("output", state, payload))
+        if entered is not None:
+            # The inferred boundary, announced in its own event and carrying
+            # no counter. Without this the run would enter Training (or
+            # Evaluating) silently, and the display would keep showing the
+            # completed bar of the stage before it until the next heartbeat.
+            _emit(
+                on_event,
+                _event("stage", state, f"{entered} (inferred from the CLI's call order)."),
+            )
 
-    for thread in threads:
-        thread.join(timeout=5)
+    if not abandoned_streams:
+        # Only when EOF really arrived. If the loop gave up on the pipes, the
+        # pumps are blocked on a read nothing will end, and joining them —
+        # even with a timeout — would spend that timeout per thread for
+        # nothing. They are daemons, so they cost nothing to leave.
+        for thread in threads:
+            thread.join(timeout=5)
+    # The child has already exited in every path that reaches here (the loop
+    # ends on EOF, on the abandoned-streams break, or after a kill), so this
+    # reaps it rather than waiting on it.
     returncode = proc.wait()
     elapsed = time.monotonic() - started_at
 
@@ -462,6 +714,17 @@ def execute_plan_streaming(
     base["stderr"] = "".join(stderr_parts)
     base["elapsed_s"] = elapsed
     base["success"] = (returncode == 0) and not timed_out
+
+    if abandoned_streams:
+        # Said plainly, because the captured output may be short of whatever
+        # the other holder of the pipe wrote afterwards. The run's own
+        # outcome is not in doubt: the return code below is the child's.
+        base["stream_note"] = (
+            f"The run exited with code {returncode}, but something it "
+            f"started kept its output pipes open for more than "
+            f"{POST_EXIT_DRAIN_S:.0f}s. The run was recorded from its exit "
+            "code; any output written after that point is not captured."
+        )
 
     if timed_out:
         base["error"] = f"execution timed out after {timeout}s; nothing retried."

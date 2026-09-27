@@ -544,3 +544,129 @@ def _tile_divider(x: float, theme: Theme):
         color=theme.gridline,
         linewidth=HAIRLINE_PT,
     )
+
+
+def soh_vs_cycle_figure(
+    cell_ids: list[str],
+    cycle_indices: np.ndarray,
+    observed: np.ndarray,
+    predicted: np.ndarray,
+    *,
+    theme: Theme,
+    title: str,
+    subtitle: str | None = None,
+    unit_label: str = "SOH (ratio)",
+    max_cells: int = 6,
+    dpi: float = 300.0,
+) -> Figure:
+    """Observed and estimated SOH across the cycles of each test cell.
+
+    **This is not a trajectory forecast.** Every point plotted is an estimate
+    *at an observed cycle*, made from information available at that cycle. The
+    line joining them is a reading aid across many independent estimates, not
+    a prediction of what happens next. Calling it a forecast would claim a
+    task this route does not perform.
+
+    Each cell gets one hue from the sequential ramp: observed as a solid line,
+    estimated as markers on top of it, so agreement reads as markers sitting
+    on the line. Only ``max_cells`` cells are drawn — with more, the panel
+    turns into a thicket and nothing is legible — and the subtitle says how
+    many of how many are shown, so a reader is never left to assume it is all
+    of them.
+
+    Args:
+        cell_ids: the cell each point belongs to, aligned to the arrays.
+        cycle_indices: the observed cycle each point was estimated at.
+        observed: measured SOH, on the canonical ratio scale.
+        predicted: estimated SOH, same scale.
+        theme: colours.
+        title: headline.
+        subtitle: provenance line; the cell count is appended to it.
+        unit_label: axis unit. A ratio, not a percentage.
+        max_cells: how many cells to draw.
+        dpi: raster resolution.
+
+    Returns:
+        The figure. Never written to disk here.
+
+    Raises:
+        VizFigureError: if the four inputs disagree in length or are empty.
+    """
+    cycle_arr = np.asarray(cycle_indices, dtype=float).reshape(-1)
+    observed_arr = np.asarray(observed, dtype=float).reshape(-1)
+    predicted_arr = np.asarray(predicted, dtype=float).reshape(-1)
+    lengths = {len(cell_ids), cycle_arr.size, observed_arr.size, predicted_arr.size}
+    if len(lengths) != 1:
+        raise VizFigureError(
+            "soh_vs_cycle_figure needs cell_ids, cycle_indices, observed and "
+            f"predicted to be the same length; got {len(cell_ids)}, "
+            f"{cycle_arr.size}, {observed_arr.size}, {predicted_arr.size}. "
+            "Each point must name the cell and cycle it was estimated at."
+        )
+    if observed_arr.size == 0:
+        raise VizFigureError(
+            "soh_vs_cycle_figure received no samples. A cycle-level artifact "
+            "is required; a whole-cell run has no cycle to plot against."
+        )
+
+    grouped: dict[str, list[int]] = {}
+    for position, cell_id in enumerate(cell_ids):
+        grouped.setdefault(str(cell_id), []).append(position)
+    # Most-sampled cells first, so the drawn subset is the informative one
+    # rather than whichever happened to sort first.
+    order = sorted(grouped, key=lambda key: (-len(grouped[key]), key))
+    shown = order[: max(1, int(max_cells))]
+
+    fig = _new_figure(theme, (6.4, 4.2), dpi)
+    ax = fig.add_subplot(111)
+    fig.subplots_adjust(left=0.10, right=0.80, top=0.855, bottom=0.135)
+    style_axes(ax, theme)
+
+    for rank, cell_id in enumerate(shown):
+        positions = sorted(grouped[cell_id], key=lambda i: cycle_arr[i])
+        x = cycle_arr[positions]
+        y_true = observed_arr[positions]
+        y_pred = predicted_arr[positions]
+        color = sequential_color(
+            theme, rank / max(1, len(shown) - 1) if len(shown) > 1 else 0.5
+        )
+        ax.plot(
+            x, y_true,
+            color=color,
+            linewidth=LINE_WIDTH_PT,
+            zorder=2,
+            label=str(cell_id),
+        )
+        ax.scatter(
+            x, y_pred,
+            s=MARKER_AREA_PT2 * 0.6,
+            color=color,
+            edgecolors=theme.surface,
+            linewidths=MARKER_RING_WIDTH_PT,
+            zorder=3,
+        )
+
+    ax.set_xlabel("Observed cycle", color=theme.text_secondary, fontsize=LABEL_SIZE_PT)
+    ax.set_ylabel(unit_label, color=theme.text_secondary, fontsize=LABEL_SIZE_PT)
+
+    detail = f"{len(shown)} of {len(order)} test cell(s); line = measured, markers = estimated"
+    add_titles(
+        ax, theme,
+        title=title,
+        subtitle=f"{subtitle} · {detail}" if subtitle else detail,
+    )
+
+    legend = ax.legend(
+        loc="center left",
+        bbox_to_anchor=(1.01, 0.5),
+        frameon=False,
+        fontsize=ANNOTATION_SIZE_PT,
+        handlelength=1.6,
+        title="Cell",
+    )
+    for text in legend.get_texts():
+        text.set_color(theme.text_secondary)
+    if legend.get_title() is not None:
+        legend.get_title().set_color(theme.text_secondary)
+        legend.get_title().set_fontsize(ANNOTATION_SIZE_PT)
+    return fig

@@ -90,6 +90,18 @@ class RunModelPageTestCase(unittest.TestCase):
                 count = spec if isinstance(spec, int) else len(spec)
                 return [_ContextCol(self) for _ in range(count)]
 
+            def container(self, **kwargs):
+                """A reserved slot, recorded so its position can be checked.
+
+                Run Model reserves one outside its button columns so the run's
+                progress bar spans the content area instead of inheriting a
+                column's width. A stand-in that draws into the page directly
+                is enough here: nothing in this file asserts on where the
+                progress *goes*, only that the page renders.
+                """
+                self.rec.setdefault("containers", []).append(len(self.rec["markdown"]))
+                return _ContextCol(self)
+
             def number_input(self, label, value=0, **kwargs):
                 self.rec.setdefault("number_inputs", []).append(str(label))
                 key = kwargs.get("key")

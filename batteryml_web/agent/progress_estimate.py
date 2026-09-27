@@ -53,11 +53,34 @@ class EpochTimer:
         self._last_current: Optional[int] = None
         self._last_elapsed: float = 0.0
         self._durations: List[float] = []
+        self._stage: Optional[str] = None
         self.total: Optional[int] = None
         self.current: Optional[int] = None
 
-    def observe(self, current: Any, total: Any, elapsed_s: float) -> None:
-        """Record one progress report from the run."""
+    def reset(self) -> None:
+        """Forget every observation, keeping no counter and no rate."""
+        self._last_current = None
+        self._last_elapsed = 0.0
+        self._durations = []
+        self.total = None
+        self.current = None
+
+    def observe(self, current: Any, total: Any, elapsed_s: float,
+                stage: Any = None) -> None:
+        """Record one progress report from the run.
+
+        ``stage`` is optional and, when given, scopes the timing to it:
+        arriving in a new stage discards the previous stage's per-unit
+        durations. Reading 41 cells and extracting samples from 41 cells are
+        not the same unit of work, so an ETA for the second computed from the
+        rate of the first would be a number with nothing behind it. Omitting
+        ``stage`` keeps the original whole-run behaviour.
+        """
+        if stage is not None:
+            stage_text = str(stage)
+            if self._stage is not None and stage_text != self._stage:
+                self.reset()
+            self._stage = stage_text
         if not isinstance(current, int) or isinstance(current, bool):
             return
         if not isinstance(total, int) or isinstance(total, bool) or total <= 0:

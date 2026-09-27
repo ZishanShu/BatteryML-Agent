@@ -74,14 +74,28 @@ def build_workflow_guidance_prompt(
     user_request: str,
     workflow_context: Dict[str, Any],
 ) -> str:
-    """Assemble the user prompt: original request plus authoritative context."""
+    """Assemble the user prompt: original request plus authoritative context.
+
+    This runs **before** execution, so the closing instruction is about what
+    the run will test and what to look at afterwards — never about how it
+    performed. A published benchmark may be mentioned only as something to
+    compare against later, and only if the protocol matches; quoting one
+    here would read as a result this run has already achieved.
+    """
     return (
         f"User request:\n{user_request.strip()}\n\n"
         f"{_render_context_block(workflow_context)}\n\n"
-        "Respond with workflow guidance: explain the dataset readiness, "
-        "recommend among runnable_models only, explain blocked_models without "
-        "offering them as executable, and restate the relevant "
-        "recommended_next_steps. Copy any validated_config value exactly."
+        "Respond with workflow guidance for a run that has NOT happened yet. "
+        "Explain why this dataset, task and model were resolved, and whether "
+        "the model is READY. Say what the run will test and what its main "
+        "limitations are. Name the metric to inspect afterwards. Recommend "
+        "among runnable_models only, explain blocked_models without offering "
+        "them as executable, and restate the relevant recommended_next_steps. "
+        "Copy any validated_config value exactly.\n"
+        "Report no result, metric or performance of any kind: none exists "
+        "yet. Do not quote a published benchmark value. You may note that a "
+        "published reference exists for later comparison only if this run "
+        "uses the same protocol."
     )
 
 
@@ -134,7 +148,9 @@ def guide_workflow(
             "guidance": intent["message"],
         }
 
-    workflow_context = build_agent_workflow_context(dataset, task, repo_root=repo_root)
+    workflow_context = build_agent_workflow_context(
+        dataset, task, repo_root=repo_root, split_hint=user_request
+    )
     prompt = build_workflow_guidance_prompt(user_request, workflow_context)
     prompt_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -191,7 +207,9 @@ def workflow_guidance_preview(
             ],
             "guidance": None,
         }
-    workflow_context = build_agent_workflow_context(dataset, task, repo_root=repo_root)
+    workflow_context = build_agent_workflow_context(
+        dataset, task, repo_root=repo_root, split_hint=user_request
+    )
     prompt = build_workflow_guidance_prompt(user_request, workflow_context)
     return {
         "dataset": dataset,

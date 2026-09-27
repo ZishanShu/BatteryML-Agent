@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -113,12 +114,8 @@ from ..core.project_context import (
     resolve_project,
 )
 from .formatting import metric_display
-from .settings_panel import (
-    clear_llm_configuration_request,
-    llm_configuration_requested,
-    render_llm_configuration_prompt,
-    request_llm_configuration,
-)
+from .settings_panel import render_configure_in_settings_notice
+from .errors import format_details, render_copy_control, render_error
 from .feedback import (
     EVENT_EXPLANATION_READY,
     EVENT_PLAN_READY,
@@ -128,12 +125,22 @@ from .feedback import (
     notify_success,
     plan_signature,
 )
-from .llm_state import is_llm_configured
+from ..agent.result_analysis import (
+    build_analysis_context,
+    render_analysis_markdown,
+)
+from .llm_state import is_llm_configured, llm_credentials, llm_settings_fingerprint
 from .progress_utils import get_safe_runtime_env
+from .surfaces import PRIMARY_ROLE
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 RUN_BUTTON_LABEL = "Run"
+#: The same control after this page has executed something. Running a second
+#: time is a normal, expected act — a fresh run id, a fresh directory, the
+#: earlier run untouched in history — so the button says so instead of
+#: looking like the first run all over again.
+RUN_AGAIN_BUTTON_LABEL = "Run again"
 #: Offered for any run that is executing, whatever the model. Stopping is
 #: independent of whether that model can later be resumed — conflating them
 #: would hide Stop from exactly the long runs that need it. The backend state
@@ -145,9 +152,30 @@ CANCEL_BUTTON_LABEL = "Stop run"
 #: about to create, and consumed when Run is pressed. Nothing is written to
 #: disk until then: a reservation that is never used names no execution.
 PENDING_RUN_ID_KEY = "agent_pending_run_id"
+#: The plan the reserved id belongs to. Paired with PENDING_RUN_ID_KEY and
+#: only ever written or cleared together with it; see clear_pending_run.
+PENDING_RUN_SUBJECT_KEY = "agent_pending_run_subject"
 
 #: Session key holding the id of the run this page is currently watching.
+#: Set when Run is pressed and cleared the moment the run reaches a terminal
+#: state — before the results are read, so a failure to read them cannot
+#: leave the page believing a finished run is still in flight.
 ACTIVE_RUN_KEY = "agent_active_run_id"
+
+#: Session key holding why a *finished* run's results could not be read. The
+#: run still happened and its files are on disk; this says the reading
+#: failed, which is a different claim from the run failing.
+RESULT_ERROR_KEY = "agent_result_error"
+
+#: Session key recording that this page has launched at least one run, which
+#: is what turns "Run" into "Run again". Independent of whether that run
+#: succeeded: a failed or cancelled run is still a run that happened.
+EXECUTED_KEY = "agent_has_executed"
+
+#: Session key holding the signature of the plan the last Run executed, used
+#: to drop results that no longer describe the plan on screen. See
+#: :func:`executed_plan_signature` for why it is not the argv.
+RUN_SIGNATURE_KEY = "agent_run_signature"
 
 #: How often the progress fragment re-draws while a run is in flight. A
 #: polled refresh, not a rerun loop: the script is not re-executed whole.
@@ -164,6 +192,19 @@ USE_TEMPLATE_LABEL = "Use template"
 #: Session key holding the canonical request text. One key, written by
 #: typing and by accepting the suggestion alike (milestone section 6).
 REQUEST_STATE_KEY = "agent_original_request"
+
+#: The request text the workflow explanation would be about, recorded by
+#: Analyze so the Explain button has a subject. Holding it is not asking for
+#: it: no call is made until the button is pressed.
+GUIDANCE_REQUEST_KEY = "agent_guidance_request"
+
+#: The button that asks the assistant to narrate the resolved workflow.
+EXPLAIN_WORKFLOW_LABEL = "Explain this workflow"
+
+#: Set when the user pressed an Explain button with nothing configured, so
+#: the page can say where to configure one. It is a note to self, not a
+#: second settings screen.
+NEEDS_CONFIGURATION_KEY = "agent_llm_configuration_needed"
 
 #: The request text area's own widget key. Named because accepting the
 #: suggestion has to write it before the widget is instantiated.
@@ -186,6 +227,9 @@ ERROR_TAIL_CHARS = 20000
 PROGRESS_REDRAW_INTERVAL_S = 0.25
 #: How many trailing output lines the live log shows while a run is going.
 LIVE_LOG_LINES = 12
+#: Label of the disclosure the raw stdout/stderr lives behind. The primary
+#: view is one structured state; the untouched output stays one click away.
+TECHNICAL_LOG_LABEL = "Technical log (raw output)"
 #: The two compute modes, as the user picks them.
 COMPUTE_MODES: tuple[str, str] = ("CPU", "GPU")
 COMPUTE_LABEL = "Compute device"
@@ -624,6 +668,87 @@ def progress_caption(
     )
 
 
+def is_heartbeat(event: dict[str, Any]) -> bool:
+    """Whether one progress event is the periodic "still alive" tick.
+
+    The ``heartbeat`` flag is authoritative. The message is checked as a
+    fallback because a snapshot can outlive the code that produced it: the
+    RunManager stores whatever event it was handed, so an event written
+    before the flag existed — by a run still in flight across a restart —
+    would otherwise be redrawn as a real stage change and logged as output.
+    """
+    if event.get("heartbeat"):
+        return True
+    return str(event.get("message") or "") == HEARTBEAT_MESSAGE
+
+
+def progress_view(
+    event: dict[str, Any],
+    elapsed_s: float,
+    timer: EpochTimer,
+) -> dict[str, Any]:
+    """What the progress UI should draw for one event. Pure; no Streamlit.
+
+    Separated from the drawing so the decision — bar or spinner, which
+    percentage, which ETA — can be tested without a browser, and so the two
+    places that draw progress (the in-page live run and the polled fragment)
+    cannot drift apart.
+
+    Returns:
+        ``caption`` — the one-line status;
+        ``fraction`` — ``current / total`` when the run printed a counter,
+        else ``None``. A bar is drawn only for a float, and the value is
+        always the parsed counter, never a stand-in for "something is
+        happening";
+        ``determinate`` — whether a bar should be drawn at all;
+        ``counter`` — ``(current, total)`` or ``None``.
+
+    The counter is read from the event and nothing else. A stage with no
+    denominator produces ``fraction=None`` and the caller shows a spinner and
+    an elapsed time, which is the honest rendering of "no idea how much is
+    left".
+    """
+    stage = str(event.get("stage") or "")
+    current = event.get("current")
+    total = event.get("total")
+    has_counter = (
+        isinstance(current, int)
+        and not isinstance(current, bool)
+        and isinstance(total, int)
+        and not isinstance(total, bool)
+        and total > 0
+    )
+    timer.observe(current, total, elapsed_s, stage=stage)
+    eta = timer.eta_seconds() if has_counter else None
+
+    fraction = event.get("fraction")
+    # bool is an int subclass; True must never be read as 100%.
+    if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+        fraction = None
+    elif not has_counter:
+        # A fraction with no counter behind it would be a percentage the run
+        # did not report. Refused rather than displayed.
+        fraction = None
+    else:
+        fraction = min(max(float(fraction), 0.0), 1.0)
+
+    return {
+        "caption": progress_caption(
+            stage,
+            current if has_counter else None,
+            total if has_counter else None,
+            elapsed_s,
+            eta_s=eta,
+            # A counter exists but has not produced enough completed units to
+            # time yet: say so instead of guessing.
+            estimating=has_counter and eta is None,
+        ),
+        "fraction": fraction,
+        "determinate": fraction is not None,
+        "counter": (current, total) if has_counter else None,
+    }
+
+
 class _LiveProgress:
     """Renders backend progress events into three Streamlit placeholders.
 
@@ -648,7 +773,14 @@ class _LiveProgress:
 
     def on_event(self, event: dict[str, Any]) -> None:
         message = str(event.get("message") or "")
-        if event.get("type") in ("output", "training_progress") and message:
+        # A heartbeat repeats the last state and adds nothing to a log; only
+        # its timing matters, and that is read from the clock below.
+        heartbeat = is_heartbeat(event)
+        if (
+            not heartbeat
+            and event.get("type") in ("output", "training_progress")
+            and message
+        ):
             self._lines.append(message)
             del self._lines[:-LIVE_LOG_LINES]
 
@@ -656,7 +788,7 @@ class _LiveProgress:
         now = time.monotonic()
         forced = (
             event.get("type") == "completed"
-            or (stage and stage != self._stage and message != HEARTBEAT_MESSAGE)
+            or (stage and stage != self._stage and not heartbeat)
         )
         if not forced and (now - self._last_draw) < PROGRESS_REDRAW_INTERVAL_S:
             return
@@ -666,31 +798,19 @@ class _LiveProgress:
 
     def _draw(self, event: dict[str, Any]) -> None:
         elapsed = time.monotonic() - self._started
-        self._timer.observe(event.get("current"), event.get("total"), elapsed)
-        eta = self._timer.eta_seconds()
-        has_counter = isinstance(event.get("current"), int) and isinstance(
-            event.get("total"), int
-        )
-        caption = progress_caption(
-            str(event.get("stage") or ""),
-            event.get("current"),
-            event.get("total"),
-            elapsed,
-            eta_s=eta,
-            # A counter exists but has not produced enough completed units to
-            # time yet: say so instead of guessing.
-            estimating=has_counter and eta is None,
-        )
+        view = progress_view(event, elapsed, self._timer)
         if event.get("stage") == STAGE_FAILED:
-            self._status.error(caption)
+            self._status.error(view["caption"])
         else:
-            self._status.info(caption)
-        fraction = event.get("fraction")
-        # bool is an int subclass; True must never be read as 100%.
-        if isinstance(fraction, (int, float)) and not isinstance(fraction, bool):
-            self._bar.progress(min(max(float(fraction), 0.0), 1.0))
+            self._status.info(view["caption"])
+        if view["determinate"]:
+            self._bar.progress(view["fraction"])
         if self._lines:
-            self._log.code("\n".join(self._lines), language="text")
+            # Behind a disclosure: the structured line above is the primary
+            # view, and the raw output stays available without being it.
+            with self._log.container():
+                with st.expander(TECHNICAL_LOG_LABEL, expanded=False):
+                    st.code("\n".join(self._lines), language="text")
 
 
 def _render_execution_status(
@@ -739,24 +859,109 @@ def _render_execution_status(
             st.code(" ".join(str(part) for part in command), language="bash")
         if result.get("error"):
             st.caption("Executor error")
-            st.text(str(result["error"]))
+            st.text(redact(str(result["error"])))
         st.caption("stdout")
-        st.text(result.get("stdout") or "No stdout captured.")
+        st.text(redact(result.get("stdout") or "No stdout captured."))
         st.caption("stderr (full traceback, as produced by the run)")
-        st.text(result.get("stderr") or "No stderr captured.")
+        st.text(redact(result.get("stderr") or "No stderr captured."))
+        # One copy affordance for the whole block, with the same transient
+        # confirmation every other copy in the app uses. Redacted before it
+        # reaches the clipboard, not only before it reaches the screen.
+        st.caption(
+            "Redacted: API keys and other credentials are removed before this "
+            "is shown or copied."
+        )
+        render_copy_control(
+            _run_failure_details(
+                result,
+                run_id=str(st.session_state.get(ACTIVE_RUN_KEY) or ""),
+                config_path=str(
+                    (st.session_state.get("agent_execution_plan") or {}).get(
+                        "config_path"
+                    )
+                    or ""
+                ),
+                status=str(st.session_state.get("last_run_status") or ""),
+            ),
+            key="agent_run_failure_copy",
+        )
+
+
+def _run_failure_details(
+    result: dict[str, Any],
+    *,
+    run_id: str = "",
+    config_path: str = "",
+    status: str = "",
+) -> str:
+    """The failed run's technical block as one redacted, copyable text.
+
+    Carries what someone diagnosing the failure has to ask for otherwise:
+    which run it was, which config it ran, where it ran, how it ended, and
+    the output. Pasted into an issue or a message, this is enough to place
+    the failure without a second round trip.
+    """
+    command = result.get("command")
+    sections = [
+        f"run id: {run_id or '(not recorded)'}",
+        f"final status: {status or '(not recorded)'}",
+        f"returncode: {result.get('returncode', 'N/A')}",
+        f"config: {config_path or '(not recorded)'}",
+        f"workspace: {result.get('workspace') or '(not recorded)'}",
+        # The run's working directory is the repository root by contract —
+        # the CLI wrapper's relative path in the argv only resolves there.
+        f"cwd: {REPO_ROOT}",
+        "",
+        "command:",
+        " ".join(str(part) for part in command) if command else "(not recorded)",
+        "",
+        "error:",
+        str(result.get("error") or "(none)"),
+    ]
+    if result.get("stream_note"):
+        # Only present when the loop stopped waiting on pipes something
+        # outlived the run was still holding; it explains a short capture.
+        sections += ["", "output capture:", str(result["stream_note"])]
+    sections += [
+        "",
+        "stdout:",
+        str(result.get("stdout") or "(empty)"),
+        "",
+        "stderr:",
+        str(result.get("stderr") or "(empty)"),
+    ]
+    return redact("\n".join(sections))
 
 
 def _explain_result(result_context: dict[str, Any]) -> None:
-    """Call the existing explanation path. Never called by opening a form."""
+    """Call the existing explanation path. Never called by opening a form.
+
+    The run's own manifest and its own prediction artifact are assembled
+    into the deterministic analysis context first, so the assistant reasons
+    from diagnostics and a gated benchmark reference rather than restating
+    the configuration back. The artifact is the one this run wrote; nothing
+    here searches for another.
+    """
+    run_context = st.session_state.get("agent_run_context")
+    manifest = run_context.get("manifest") if isinstance(run_context, dict) else None
+    analysis = build_analysis_context(
+        result_context,
+        manifest=manifest if isinstance(manifest, dict) else None,
+        artifact_path=result_context.get("predictions_file"),
+        run_id=str((manifest or {}).get("run_id") or ""),
+        run_dir=str(result_context.get("workspace") or ""),
+    )
     try:
         parsed = explain_run_result(
-            result_context,
-            base_url=st.session_state["llm_base_url"],
-            api_key=st.session_state["llm_api_key"],
-            model=st.session_state["llm_model"],
+            result_context, analysis_context=analysis, **llm_credentials()
         )
         st.session_state.pop("agent_explanation_failure", None)
-        st.session_state["agent_explanation"] = explanation_text(parsed)
+        st.session_state["agent_explanation"] = render_analysis_markdown(parsed)
+        st.session_state["agent_benchmark"] = analysis.get("benchmark")
+        # Which configuration produced this text. Stored so a later provider
+        # or model change cannot leave an old answer labelled as the new
+        # model's work; the panel shows the label it was generated under.
+        st.session_state["agent_explanation_settings"] = llm_settings_fingerprint()
         st.session_state["agent_explanation_serial"] = (
             int(st.session_state.get("agent_explanation_serial", 0)) + 1
         )
@@ -834,11 +1039,7 @@ def _resolve_intent(trimmed: str, catalog: dict[str, Any]) -> dict[str, Any]:
     """
     if is_llm_configured():
         return resolve_workflow_intent_with_llm(
-            trimmed,
-            base_url=st.session_state["llm_base_url"],
-            api_key=st.session_state["llm_api_key"],
-            model=st.session_state["llm_model"],
-            catalog=catalog,
+            trimmed, catalog=catalog, **llm_credentials()
         )
     return resolve_workflow_intent_with_llm(trimmed, catalog=catalog)
 
@@ -858,16 +1059,28 @@ def _analyze_request(trimmed: str) -> None:
         "agent_result_context",
         "agent_explanation",
         "agent_explanation_failure",
-        "agent_run_signature",
+        "agent_explanation_settings",
+        # A new request is a new subject for the explanation too. Without
+        # this, an unresolvable request would leave the previous one's text
+        # behind the Explain button, which would then narrate a workflow the
+        # page is no longer showing.
+        GUIDANCE_REQUEST_KEY,
+        NEEDS_CONFIGURATION_KEY,
+        RUN_SIGNATURE_KEY,
+        RESULT_ERROR_KEY,
+        # A new request is a new subject, so the control reads "Run" again
+        # rather than offering to repeat an experiment nobody asked for.
+        EXECUTED_KEY,
         "agent_model_request",
         "agent_suggestions",
         # C5: a new request must not leave the previous run's identity or
         # provenance on screen beside a fresh selection.
         "agent_run_context",
-        PENDING_RUN_ID_KEY,
-        "agent_pending_run_subject",
     ):
         st.session_state.pop(key, None)
+    # The reservation belongs to the previous request. Released through the
+    # one helper, so the id and its subject go together.
+    clear_pending_run(st.session_state)
     if st.session_state.get("agent_model_choice") is not None:
         st.session_state.pop("agent_model_choice", None)
 
@@ -888,7 +1101,7 @@ def _analyze_request(trimmed: str) -> None:
         return
 
     context = build_agent_workflow_context(
-        str(resolution["dataset"]), str(resolution["task"])
+        str(resolution["dataset"]), str(resolution["task"]), split_hint=trimmed
     )
     _store_json_state("agent_workflow_context", context)
 
@@ -910,18 +1123,36 @@ def _analyze_request(trimmed: str) -> None:
         signature=[trimmed, context.get("dataset"), context.get("task")],
     )
 
-    if not is_llm_configured():
-        return
+    # No LLM call here, deliberately. Analyze used to finish by asking the
+    # assistant to narrate what it had just resolved, so a configured user
+    # was billed for an explanation on every Analyze press whether or not
+    # they wanted one — and the explanation then opened by itself. Analysis
+    # is deterministic and complete without it; the request text is kept so
+    # the Explain button below has something to send.
+    st.session_state[GUIDANCE_REQUEST_KEY] = trimmed
+
+
+def _explain_workflow(request_text: str) -> None:
+    """Ask the assistant to narrate the resolved workflow. Button-only.
+
+    Uses the same shared client and the same store as every other LLM call
+    on the site; nothing here reads a form or builds a client of its own.
+    """
     try:
-        guidance = guide_workflow(
-            trimmed,
-            base_url=st.session_state["llm_base_url"],
-            api_key=st.session_state["llm_api_key"],
-            model=st.session_state["llm_model"],
-        )
+        guidance = guide_workflow(request_text, **llm_credentials())
+        st.session_state.pop("agent_explanation_failure", None)
         st.session_state["agent_explanation"] = str(guidance.get("guidance") or "")
-    except Exception as exc:
-        st.session_state["agent_explanation"] = f"LLM guidance failed: {exc}"
+        st.session_state["agent_explanation_settings"] = llm_settings_fingerprint()
+        st.session_state["agent_explanation_serial"] = (
+            int(st.session_state.get("agent_explanation_serial", 0)) + 1
+        )
+    except Exception as exc:  # noqa: BLE001 - reported, never escalated
+        # The deterministic resolution above stands: it came from the
+        # backend catalog and the readiness check, not from the assistant.
+        st.session_state["agent_explanation_failure"] = classify_llm_failure(
+            exc, configured=is_llm_configured()
+        )
+        st.session_state.pop("agent_explanation", None)
 
 
 def request_template() -> str:
@@ -961,7 +1192,85 @@ def accept_template(template: str, current_request: str) -> bool:
     return bool(str(template or "").strip()) and not str(current_request or "").strip()
 
 
-def _reserved_run_id(
+def pending_run_subject(
+    *,
+    dataset: str,
+    model: str,
+    seed: Any,
+    device: str,
+    smoke: bool,
+) -> str:
+    """What makes this plan *this* plan, as a comparable string.
+
+    Pure, so the invalidation rule is testable without Streamlit. Two plans
+    with the same subject are the same experiment and may share a reserved
+    id; any difference means a different run.
+    """
+    return json.dumps(
+        [dataset, model, str(seed), device, bool(smoke)], sort_keys=True
+    )
+
+
+def _has_executed(session_state) -> bool:
+    """Whether this page has already launched a run in this session."""
+    return bool(session_state.get(EXECUTED_KEY))
+
+
+def executed_plan_signature(
+    plan: dict[str, Any] | None,
+    *,
+    device: Any,
+    seed: Any,
+    smoke: bool,
+) -> str:
+    """Identify *which experiment* a plan describes, run identity excluded.
+
+    Deliberately not the plan's argv. The argv carries
+    ``--workspace <agent workspace>/<run_id>``, and the reserved run id is
+    re-minted on the very next script run after a launch (the reservation is
+    spent by pressing Run). A signature taken from the argv therefore
+    differs from the stored one on every rerun that follows a run, for a
+    plan nobody touched — so the staleness guard fired unconditionally and
+    deleted the finished run's results before the page could draw them.
+
+    What makes two runs the same experiment is the dataset, the task, the
+    model, the validated config, the epoch override, the device and the
+    seed. Those are compared here; the run's own identity is not part of the
+    question.
+    """
+    if not isinstance(plan, dict):
+        return ""
+    return json.dumps(
+        [
+            plan.get("dataset"),
+            plan.get("task"),
+            plan.get("model"),
+            plan.get("config_path"),
+            plan.get("epochs"),
+            str(device),
+            str(seed),
+            bool(smoke),
+        ],
+        sort_keys=True,
+        default=str,
+    )
+
+
+def clear_pending_run(session_state) -> None:
+    """Release the reservation — **both** keys, always together.
+
+    The id and the subject are one value in two slots: the subject is the
+    cache key for the id. Clearing one without the other leaves the pair
+    inconsistent, and that is exactly what crashed the page — see
+    :func:`reserved_run_id`. Every release goes through here so the pair
+    cannot drift apart again.
+    """
+    for key in (PENDING_RUN_ID_KEY, PENDING_RUN_SUBJECT_KEY):
+        session_state.pop(key, None)
+
+
+def reserved_run_id(
+    session_state,
     *,
     dataset: str,
     model: str,
@@ -975,16 +1284,50 @@ def _reserved_run_id(
     renumber the run on every rerun, and re-minted when any part of the plan
     that identifies the experiment changes. Reserving is not creating: no
     directory and no manifest exist until Run is pressed.
+
+    **Re-mints when the id is missing, even if the subject still matches.**
+    That is the repaired case: pressing Run used to pop the id alone, so the
+    next rerun of the same plan matched the stale subject, skipped minting,
+    and then read a key that was no longer there —
+
+        KeyError: st.session_state has no key "agent_pending_run_id"
+
+    — taking the whole page down with Streamlit's native traceback. The
+    condition below is an ``or`` rather than a lone subject comparison so
+    that a half-cleared pair heals itself instead of raising.
+
+    Reads through ``.get`` and returns the local value, never a second
+    lookup, and never stringifies ``None``: a missing id is falsy and mints a
+    real one rather than becoming the literal ``"None"``.
     """
-    subject = json.dumps(
-        [dataset, model, str(seed), device, bool(smoke)], sort_keys=True
+    subject = pending_run_subject(
+        dataset=dataset, model=model, seed=seed, device=device, smoke=smoke
     )
-    if st.session_state.get("agent_pending_run_subject") != subject:
-        st.session_state["agent_pending_run_subject"] = subject
-        st.session_state[PENDING_RUN_ID_KEY] = new_run_id(
-            dataset=dataset, model=model, seed=seed
-        )
-    return str(st.session_state[PENDING_RUN_ID_KEY])
+    reserved = str(session_state.get(PENDING_RUN_ID_KEY) or "").strip()
+    if not reserved or session_state.get(PENDING_RUN_SUBJECT_KEY) != subject:
+        reserved = str(new_run_id(dataset=dataset, model=model, seed=seed))
+        session_state[PENDING_RUN_SUBJECT_KEY] = subject
+        session_state[PENDING_RUN_ID_KEY] = reserved
+    return reserved
+
+
+def _reserved_run_id(
+    *,
+    dataset: str,
+    model: str,
+    seed: Any,
+    device: str,
+    smoke: bool,
+) -> str:
+    """:func:`reserved_run_id` against the live Streamlit session."""
+    return reserved_run_id(
+        st.session_state,
+        dataset=dataset,
+        model=model,
+        seed=seed,
+        device=device,
+        smoke=smoke,
+    )
 
 
 def _launch_run(
@@ -1083,44 +1426,108 @@ def _finish_active_run(run_id: str, snapshot: dict[str, Any], *, smoke: bool) ->
     A result context is built **only** for a run that completed. A cancelled
     or failed run has measured nothing, so none is built and no metric is
     offered for it.
+
+    **The run is released before any work that can fail.** This ordering is
+    the fix for "it runs once and then never again": reading the artifacts
+    used to come first, and ``ACTIVE_RUN_KEY`` was cleared at the very end.
+    Anything that raised in between — a result context the artifact loader
+    rejects, a value the state serializer will not take — reached the page
+    error boundary with the key still set, so the next script run re-entered
+    the same failing branch, and the Run button, which is drawn only when no
+    run is active, never came back. A terminal run is terminal whatever
+    happens to its results, so the lifecycle is settled first and the
+    reporting is fallible afterwards.
     """
     manager = get_run_manager()
     handle = manager.get(run_id)
+    # Read from the handle *before* dropping it; both are cheap and neither
+    # can raise. ``result`` is published together with the terminal status
+    # under the handle's lock, so a finished snapshot implies a real result.
     result = dict(getattr(handle, "result", None) or {})
+    run_dir = getattr(handle, "run_dir", None)
     status = str(snapshot.get("status") or "")
-    result_context = None
-    if status == rm.STATUS_COMPLETED and result.get("success"):
-        workspace = result.get("workspace")
-        plan = st.session_state.get("agent_execution_plan") or {}
-        if workspace:
-            result_context = build_result_context(
-                workspace,
-                dataset=plan.get("dataset"),
-                task=plan.get("task"),
-                model=plan.get("model"),
-                config_path=plan.get("config_path"),
-                run_status="SUCCESS",
-                execution_result=result,
-                smoke_run=smoke,
-            )
-            metrics = (result_context or {}).get("metrics") or {}
-            if metrics:
-                try:
-                    rm.update_manifest(
-                        handle.run_dir, {"metrics": dict(metrics)},
-                        enforce_transition=False,
-                    )
-                except (FileNotFoundError, ValueError):
-                    pass
-    _store_json_state("agent_execution_result", _compact_execution_output(result))
-    _store_json_state("agent_result_context", result_context)
+
+    # --- release first. Nothing below this point can wedge the page. ---
+    st.session_state.pop(ACTIVE_RUN_KEY, None)
+    st.session_state.pop(f"cancelling_{run_id}", None)
+    manager.forget(run_id)
+    # The ETA estimator exists only while its run does; keeping it would let
+    # a later run of the same id inherit another run's timing history.
+    timers = st.session_state.get("_agent_progress_timers")
+    if isinstance(timers, dict):
+        timers.pop(run_id, None)
     st.session_state["agent_run_serial"] = (
         int(st.session_state.get("agent_run_serial", 0)) + 1
     )
     st.session_state["last_run_status"] = status.lower()
     st.session_state["last_run_code"] = result.get("returncode")
-    st.session_state.pop(ACTIVE_RUN_KEY, None)
-    manager.forget(run_id)
+    st.session_state.pop(RESULT_ERROR_KEY, None)
+
+    # --- then report. A failure here costs the results, not the page. ---
+    try:
+        _store_json_state(
+            "agent_execution_result", _compact_execution_output(result)
+        )
+        _store_json_state(
+            "agent_result_context",
+            _result_context_for(
+                status, result, run_dir=run_dir, smoke=smoke
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+        # Loud, and named: the run itself finished and its files are on disk,
+        # so the honest message says the reading failed, not the run.
+        traceback.print_exc()
+        st.session_state.pop("agent_result_context", None)
+        st.session_state[RESULT_ERROR_KEY] = format_details(
+            exc,
+            context={
+                "run_id": run_id,
+                "run_status": status,
+                "workspace": result.get("workspace"),
+            },
+        )
+
+
+def _result_context_for(
+    status: str,
+    result: dict[str, Any],
+    *,
+    run_dir: Any,
+    smoke: bool,
+) -> dict[str, Any] | None:
+    """The backend result context for a finished run, or None.
+
+    Split out of :func:`_finish_active_run` so the fallible part is one
+    function with no session-state lifecycle in it. Returns None — rather
+    than raising — for a run that has nothing to report: cancelled, failed,
+    or completed without a workspace.
+    """
+    if status != rm.STATUS_COMPLETED or not result.get("success"):
+        return None
+    workspace = result.get("workspace")
+    if not workspace:
+        return None
+    plan = st.session_state.get("agent_execution_plan") or {}
+    context = build_result_context(
+        workspace,
+        dataset=plan.get("dataset"),
+        task=plan.get("task"),
+        model=plan.get("model"),
+        config_path=plan.get("config_path"),
+        run_status="SUCCESS",
+        execution_result=result,
+        smoke_run=smoke,
+    )
+    metrics = (context or {}).get("metrics") or {}
+    if metrics and run_dir is not None:
+        try:
+            rm.update_manifest(
+                run_dir, {"metrics": dict(metrics)}, enforce_transition=False,
+            )
+        except (FileNotFoundError, ValueError):
+            pass
+    return context
 
 
 def _render_active_run(
@@ -1129,12 +1536,18 @@ def _render_active_run(
     plan: dict[str, Any],
     smoke: bool,
     device: str,
-) -> None:
+) -> bool:
     """Status, live progress and a working Cancel for the run in flight.
 
     The refresh is a fragment on a timer, not a rerun loop: only this block
     re-executes, on a fixed interval, so the rest of the page (and the user's
     typing) is untouched and the server is not spun.
+
+    Returns whether a run is **still in flight**. False means this call
+    released the run, and the caller must draw the Run button on this same
+    script run: returning without either progress or a Run button is what
+    left the page with no execution control at all until the user happened
+    to click something else.
     """
     manager = get_run_manager()
     snapshot = manager.snapshot(run_id)
@@ -1147,12 +1560,16 @@ def _render_active_run(
             "recorded state is in Run History below."
         )
         st.session_state.pop(ACTIVE_RUN_KEY, None)
-        return
+        st.session_state.pop(f"cancelling_{run_id}", None)
+        return False
 
     if snapshot.get("finished"):
         _finish_active_run(run_id, snapshot, smoke=smoke)
+        # A full rerun so the results below are drawn from the state just
+        # stored. The lifecycle is already settled, so even if this rerun
+        # never happened the page would offer Run again.
         st.rerun()
-        return
+        return False
 
     st.caption(f"Run {run_id} is executing (started by an explicit user action).")
 
@@ -1160,33 +1577,42 @@ def _render_active_run(
     def _live() -> None:
         current = manager.snapshot(run_id)
         if current is None:
+            # The run vanished from the manager under us. A full-app rerun
+            # lets the outer branch above reconcile and offer Run again,
+            # rather than this fragment polling a run nobody tracks.
+            st.rerun()
             return
         event = current.get("event") or {}
         elapsed = float(current.get("elapsed_s") or 0.0)
-        timer = _progress_timer(run_id)
-        timer.observe(event.get("current"), event.get("total"), elapsed)
-        eta = timer.eta_seconds()
-        has_counter = isinstance(event.get("current"), int) and isinstance(
-            event.get("total"), int
-        )
-        st.caption(
-            progress_caption(
-                str(event.get("stage") or ""),
-                event.get("current"),
-                event.get("total"),
-                elapsed,
-                eta_s=eta,
-                estimating=has_counter and eta is None,
-            )
-        )
-        fraction = event.get("fraction")
-        if isinstance(fraction, (int, float)):
-            # Drawn only when the run itself reported a counter.
-            st.progress(min(max(float(fraction), 0.0), 1.0))
+        view = progress_view(event, elapsed, _progress_timer(run_id))
+        if view["determinate"]:
+            # A real bar, drawn only from the counter the run printed. The
+            # caption carries the same counter as "current / total", so the
+            # bar's position is always checkable against a number.
+            st.progress(view["fraction"], text=view["caption"])
+        else:
+            # No denominator exists for this stage, so there is nothing to
+            # fill. A status with a spinner says "working" without implying
+            # an amount; st.progress would have to be given a number, and any
+            # number here would be invented.
+            st.status(view["caption"], state="running", expanded=False)
         tail = current.get("tail") or []
         if tail:
-            st.code("\n".join(str(line) for line in tail[-LIVE_LOG_LINES:]), language="text")
+            # One click away, never the primary display. The manager already
+            # keeps heartbeats out of the tail, so this is the run's own
+            # output rather than hundreds of repetitions of "Running.".
+            with st.expander(TECHNICAL_LOG_LABEL, expanded=False):
+                st.code(
+                    "\n".join(str(line) for line in tail[-LIVE_LOG_LINES:]),
+                    language="text",
+                )
         if current.get("finished"):
+            # A full-app rerun (the default scope), not a fragment-scoped
+            # one: the outer branch has to see the terminal snapshot to
+            # release the run. This poll is the *only* thing that detects
+            # the end of a run that reports no progress events at all — an
+            # sklearn fit such as Ridge emits none — so terminal detection
+            # deliberately reads the status, never the event stream.
             st.rerun()
 
     _live()
@@ -1202,6 +1628,9 @@ def _render_active_run(
         # Terminates this run's process group and nothing else.
         manager.cancel(run_id)
         st.rerun()
+
+    # Still executing: the caller must not draw Run beside a live Stop.
+    return True
 
 
 def _progress_timer(run_id: str) -> EpochTimer:
@@ -1225,10 +1654,18 @@ def _render_result_figures(result_context: dict[str, Any] | None) -> None:
     predictions_file = result_context.get("predictions_file")
     if not predictions_file:
         return
-    from ..agent.result_views import RUL_SCHEMA, TRAJECTORY_SCHEMA, load_view
+    from ..agent.result_views import (
+        RUL_CYCLEWISE_SCHEMA,
+        SCALAR_SCHEMAS,
+        SOH_SCHEMA,
+        TRAJECTORY_SCHEMA,
+        load_view,
+    )
     from .run_history import (
         render_prediction_table,
+        render_rul_cycle_figure,
         render_rul_figures,
+        render_soh_figures,
         render_trajectory_figure,
     )
 
@@ -1241,9 +1678,21 @@ def _render_result_figures(result_context: dict[str, Any] | None) -> None:
             "metrics above are unaffected."
         )
         return
-    if views["schema"] == RUL_SCHEMA:
+    if views["schema"] in SCALAR_SCHEMAS:
         render_rul_figures(views["rul"])
+        # Only when the artifact genuinely holds per-cell, per-cycle
+        # remaining-life estimates. A scalar per-cell result gets no
+        # cycle-wise heading at all, rather than a disclosure explaining the
+        # absence of a view it was never going to have.
+        if views["schema"] == RUL_CYCLEWISE_SCHEMA:
+            render_rul_cycle_figure(views["rul_cycles"])
         render_prediction_table(views["rul"])
+    elif views["schema"] == SOH_SCHEMA:
+        # A cycle-level result: per-cell curves and the range diagnostic, and
+        # a table whose rows name the cell and the cycle rather than a
+        # position in an array.
+        render_soh_figures(views["soh"])
+        render_prediction_table(views["soh"])
     elif views["schema"] == TRAJECTORY_SCHEMA:
         render_trajectory_figure(views["trajectory"])
 
@@ -1304,7 +1753,7 @@ def render_agent_workflow() -> None:
             # it does: no analysis, no LLM call, no plan, no execution.
             st.session_state[USE_TEMPLATE_KEY] = True
             st.rerun()
-    if st.button("Analyze", key="agent_analyze", use_container_width=True):
+    if st.button("Analyze", type=PRIMARY_ROLE, key="agent_analyze", use_container_width=True):
         if not str(request or "").strip():
             st.error("Enter a workflow request before analyzing.")
         else:
@@ -1321,6 +1770,26 @@ def render_agent_workflow() -> None:
 
     _render_intent(st.session_state.get("agent_intent"))
     _render_context(context)
+
+    # The workflow narration Analyze used to produce on its own. It is a
+    # button now, for the reason the whole step exists: a page that renders
+    # must not spend an API call, and an explanation nobody asked for is a
+    # call nobody asked for.
+    guidance_request = st.session_state.get(GUIDANCE_REQUEST_KEY)
+    if guidance_request:
+        if st.button(
+            EXPLAIN_WORKFLOW_LABEL,
+            key="agent_explain_workflow",
+            use_container_width=True,
+        ):
+            if is_llm_configured():
+                _explain_workflow(str(guidance_request))
+                st.rerun()
+            else:
+                st.session_state[NEEDS_CONFIGURATION_KEY] = True
+                st.rerun()
+        if st.session_state.get(NEEDS_CONFIGURATION_KEY) and not is_llm_configured():
+            render_configure_in_settings_notice()
 
     presentation = build_model_presentation(
         resolution=st.session_state.get("agent_intent"),
@@ -1442,6 +1911,49 @@ def render_agent_workflow() -> None:
         if device_value is not None:
             device = str(device_value)
             st.session_state["agent_device"] = device
+            # Several distinct evaluation protocols may be registered for one
+            # model (MATR+CNN: clo / matr_1 / matr_2). The backend never
+            # picks one silently; when the request named none, the user
+            # chooses here from validated configs only. An explicit request
+            # ("matr_1", "primary test split") arrives pre-resolved and the
+            # control opens on that config.
+            runnable_entry = next(
+                (
+                    item
+                    for item in (context.get("runnable_models") or [])
+                    if str(item.get("model")) == str(selected_key)
+                ),
+                None,
+            )
+            entry_choices = list(((runnable_entry or {}).get("config_choices") or []))
+            entry_resolved = str(((runnable_entry or {}).get("validated_config") or ""))
+            explicit_config: str | None = None
+            if len(entry_choices) > 1 and not entry_resolved:
+                config_options = [NO_SELECTION] + entry_choices
+                chosen_config = st.selectbox(
+                    "Config — evaluation protocol (validated only)",
+                    config_options,
+                    index=0,
+                    format_func=lambda path: (
+                        "— select a config —"
+                        if path == NO_SELECTION
+                        else Path(path).name
+                    ),
+                    key=f"agent_config_choice_{selected_key}",
+                )
+                if not chosen_config or chosen_config == NO_SELECTION:
+                    st.session_state.pop("agent_selected_config", None)
+                    st.info(
+                        "Several evaluation protocols can run for this model. "
+                        "Select one of the validated configs above to build an "
+                        "execution plan — none is chosen for you."
+                    )
+                else:
+                    explicit_config = str(chosen_config)
+                    st.session_state["agent_selected_config"] = explicit_config
+            elif entry_resolved:
+                explicit_config = None
+                st.session_state["agent_selected_config"] = entry_resolved
             # The run this page is about to create. Reserved (not created):
             # minting happens once a runnable plan exists so the id can be
             # shown before Run, and the directory and manifest appear only
@@ -1472,6 +1984,10 @@ def render_agent_workflow() -> None:
                     smoke=smoke,
                 ),
                 epochs=smoke_epochs_value(smoke),
+                # The user's explicit protocol choice, if they made one; the
+                # planner validates it against the runnable candidates and
+                # refuses anything outside them.
+                config_path=explicit_config,
             )
             _store_json_state("agent_execution_plan", plan)
             run_context = build_run_context(
@@ -1507,22 +2023,38 @@ def render_agent_workflow() -> None:
     result_context = st.session_state.get("agent_result_context")
 
     if options and plan is not None:
-        current_signature = json.dumps(plan.get("command") or [], sort_keys=True, default=str)
-        stored_signature = st.session_state.get("agent_run_signature")
+        # Compared on the experiment, not on the argv: the argv's --workspace
+        # carries the reserved run id, which is re-minted after every launch,
+        # so an argv comparison never matched again and erased the results of
+        # the run that had just finished. See executed_plan_signature.
+        current_signature = executed_plan_signature(
+            plan, device=device, seed=seed, smoke=smoke
+        )
+        stored_signature = st.session_state.get(RUN_SIGNATURE_KEY)
         if stored_signature is not None and stored_signature != current_signature:
             # The plan changed since the last execution: results shown would
             # be stale, so they are dropped until an explicit new Run.
             st.session_state.pop("agent_execution_result", None)
             st.session_state.pop("agent_result_context", None)
+            st.session_state.pop(RESULT_ERROR_KEY, None)
             execution_result = None
             result_context = None
-        active_run_id = st.session_state.get(ACTIVE_RUN_KEY)
+        active_run_id = str(st.session_state.get(ACTIVE_RUN_KEY) or "")
+        run_in_flight = False
         if active_run_id:
             # A run this page started is in flight (or has just ended). The
             # script is not blocked on it, so Cancel below is a live control.
-            _render_active_run(str(active_run_id), plan=plan, smoke=smoke, device=device)
-        elif st.button(
-            RUN_BUTTON_LABEL,
+            run_in_flight = _render_active_run(
+                active_run_id, plan=plan, smoke=smoke, device=device
+            )
+        if not run_in_flight and st.button(
+            # Drawn whenever no run is in flight, including on the very run
+            # that released a finished one: a terminal run never withholds
+            # the control that starts the next one. The label says "Run
+            # again" once this page has executed something, so a second run
+            # is visibly offered rather than looking like the first.
+            RUN_AGAIN_BUTTON_LABEL if _has_executed(st.session_state) else RUN_BUTTON_LABEL,
+            type=PRIMARY_ROLE,
             disabled=not run_is_enabled(plan),
             use_container_width=True,
             key="agent_run",
@@ -1536,9 +2068,25 @@ def render_agent_workflow() -> None:
                 run_context=st.session_state.get("agent_run_context") or {},
             )
             # The reservation is spent: a repeat of this plan is a new run.
-            st.session_state.pop(PENDING_RUN_ID_KEY, None)
-            st.session_state["agent_run_signature"] = current_signature
+            # Both keys, or the next rerun of this same plan would match the
+            # stale subject, skip minting and read an id that is gone.
+            clear_pending_run(st.session_state)
+            st.session_state[RUN_SIGNATURE_KEY] = current_signature
+            st.session_state[EXECUTED_KEY] = True
             st.rerun()
+
+    result_error = st.session_state.get(RESULT_ERROR_KEY)
+    if result_error:
+        # The run itself reached a terminal state and its files are on disk;
+        # what failed is reading them back. Said in those words, because
+        # "the run failed" would be a different and false claim.
+        render_error(
+            "The run finished, but its results could not be read back into "
+            "this page. The run directory is intact — open it in Run History "
+            "below to inspect the artifacts directly.",
+            key="agent_result_read_failure",
+            details=str(result_error),
+        )
 
     serial = st.session_state.get("agent_run_serial", 0)
     if isinstance(execution_result, dict) and execution_result.get("success"):
@@ -1573,8 +2121,9 @@ def render_agent_workflow() -> None:
         # saved artifact and through the same reader the history view uses.
         _render_result_figures(result_context)
 
-        # Always clickable. When the assistant is not configured the click
-        # opens the configuration form instead of doing nothing.
+        # Always clickable, and the only thing on this page that can send a
+        # result to the assistant. When nothing is configured the click says
+        # where to configure one; it does not grow a form here.
         if st.button(
             EXPLAIN_BUTTON_LABEL,
             use_container_width=True,
@@ -1584,20 +2133,11 @@ def render_agent_workflow() -> None:
                 _explain_result(result_context)
                 st.rerun()
             else:
-                request_llm_configuration("explain")
+                st.session_state[NEEDS_CONFIGURATION_KEY] = True
                 st.rerun()
 
-        if llm_configuration_requested():
-            action = render_llm_configuration_prompt()
-            if action in ("save", "connect"):
-                # Settings are stored (and, for Connect, tested). Close the
-                # form and stay on the result: Explain is now usable, and the
-                # user presses it again if they want an explanation. Nothing
-                # is sent to the LLM on their behalf.
-                clear_llm_configuration_request()
-                st.rerun()
-            # "connect_failed" leaves the form open with its error showing,
-            # so the endpoint can be corrected without reopening anything.
+        if st.session_state.get(NEEDS_CONFIGURATION_KEY) and not is_llm_configured():
+            render_configure_in_settings_notice()
 
     explanation_failure = st.session_state.get("agent_explanation_failure")
     if isinstance(explanation_failure, dict) and isinstance(context, dict):
@@ -1623,6 +2163,20 @@ def render_agent_workflow() -> None:
                 event_key=EVENT_EXPLANATION_READY,
                 signature=explanation_serial,
             )
-        with st.expander("Agent explanation", expanded=True):
+        # Collapsed. An explanation is commentary on a result that is already
+        # fully rendered above it, so it opens when the reader asks for it
+        # rather than pushing the metrics off the first screen. Opening it
+        # sends nothing: the text is already in session state.
+        with st.expander("Agent explanation", expanded=False):
             st.caption("Explanation only — never a source of metrics or execution.")
+            settings_label = st.session_state.get("agent_explanation_settings")
+            if settings_label and settings_label != llm_settings_fingerprint():
+                # The configuration changed after this text was produced.
+                # Saying so is cheaper than re-running it, and far better
+                # than letting the current model's name imply authorship.
+                st.caption(
+                    "Generated with the LLM configuration in effect at the "
+                    "time; the current configuration differs. Press "
+                    f"'{EXPLAIN_BUTTON_LABEL}' again to regenerate."
+                )
             st.write(st.session_state["agent_explanation"])

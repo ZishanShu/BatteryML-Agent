@@ -169,3 +169,146 @@ The module was already neutral — no Streamlit, no `batteryml_web` import,
 
 **No scientific semantics changed.** This patch moves a file and deletes an
 import.
+
+
+---
+
+## UP-04 — cycle-level samples: many rows per cell, each with an identity
+
+| Field | Value |
+| --- | --- |
+| Files | `batteryml/data/sample_index.py` (new), `batteryml/data/databundle.py`, `batteryml/feature/base.py`, `batteryml/label/base.py`, `batteryml/label/soh.py`, `batteryml/task.py` |
+| Milestone | SOH route, commit 1 |
+| Basis | `[VERIFIED]` — `tests/test_soh_core.py` (33 tests) and the full suite (789 tests) |
+
+### Why it could not go in `batteryml_web/`
+
+SOH estimation is a cycle-level task: one cell yields one sample per observed
+cycle. Every layer of the pipeline assumed one sample per cell —
+`feature/base.py` and `label/base.py` both `torch.stack` a single row per
+cell, `task.py` pairs them positionally, and `Dataset` holds two tensors with
+no identity, so the row index *is* the cell.
+
+Expanding cells into cycle rows inside `batteryml_web/` would have meant a
+second execution path for SOH runs: a different assembler, a different
+dataset object and a different route into the model. That is the parallel
+system `CLAUDE.md` §3 and the milestone brief both rule out. The extension
+belongs where the assembly already happens.
+
+### The diff, in words
+
+* **`SampleIndex`** (new) records `(cell_id, cycle_index)` per row, with the
+  length checked against the tensors it describes. It is not a tensor and
+  never reaches a model, so a cell id cannot be mistaken for a feature.
+  `WHOLE_CELL_CYCLE = -1` marks a whole-cell sample such as RUL.
+* **`BaseCycleLabelAnnotator`** and **`BaseCycleFeatureExtractor`** are new
+  subclasses of the existing bases. The annotator owns which cycles are
+  sampled and the extractor is asked for exactly those, in that order — one
+  owner, so feature rows and label rows align by construction rather than by
+  two components agreeing independently.
+* **`Task.build`** switches to the cycle-level path when its label annotator
+  is a `BaseCycleLabelAnnotator`, concatenating per-cell blocks instead of
+  stacking per-cell rows, and filtering the sample index by the same NaN mask
+  as the tensors. Pairing a cycle-level annotator with a whole-cell extractor
+  raises, naming both.
+* **`assert_disjoint_cells`** is called in `Task.build` on the loaded train
+  and test cells, before any expansion. The split was already by cell; this
+  checks the result rather than trusting the ordering to stay correct.
+* **`Dataset` / `DataBundle`** take an optional sample index. Omitted, they
+  behave exactly as before.
+
+### What was deliberately not changed
+
+* **every existing RUL workflow is untouched**: `BaseLabelAnnotator` and
+  `BaseFeatureExtractor` keep their contract and their code, the whole-cell
+  path in `Task.build` is the original three lines, and no existing config,
+  extractor or annotator was modified;
+* no model changed. `SklearnModel` was audited and has no task-specific
+  assumption, so a cycle-level dataset reaches it as an ordinary tabular one;
+* no metric, transformation or splitter changed.
+
+**No scientific semantics changed for RUL.** With a whole-cell annotator the
+pipeline is the previous behaviour plus an identity record that nothing reads.
+
+---
+
+## UP-05 — SOH labels: one reference-capacity convention per run
+
+| Field | Value |
+| --- | --- |
+| File | `batteryml/label/soh.py` |
+| Milestone | SOH route, commit 1 |
+| Basis | `[VERIFIED]` — `tests/test_soh_core.py::TestReferenceCapacity`, exact ratios on synthetic cells |
+
+### The defect this removes
+
+The original annotator chose the reference capacity **per cell**: nominal
+capacity when the cell carried one, otherwise that cell's first-cycle
+discharge capacity. Two cells in the same dataset could therefore be labelled
+under two different definitions of SOH, with nothing recording which — and the
+labels differ by whatever ratio nominal and first-cycle capacity happen to
+have (a factor of two in the test fixture).
+
+### The diff, in words
+
+* `reference_capacity_mode` is explicit, validated against
+  `REFERENCE_CAPACITY_MODES`, and applies to every cell in the run. The
+  default is `first_valid_discharge_capacity`. There is no fallback between
+  modes: a cell that cannot satisfy the configured mode is **excluded and
+  counted**, never relabelled under another.
+* `mode='absolute'` is gone. It returned capacity in Ah while the same
+  parameter's other value returned a ratio. Canonical SOH is a ratio.
+* `CycleSOHLabelAnnotator` (new) is the canonical annotator:
+  `SOH(cell, t) = Q_discharge(t) / Q_ref(cell)` for each cycle the sample
+  policy accepts. Invalid cycles are dropped and counted, never interpolated;
+  ratios above 1.0 are kept, never clipped.
+* The sample policy (`min_cycle`, `max_cycle`, `cycle_stride`) is
+  configuration, reported by `sample_policy()` for provenance.
+
+### What was deliberately not changed
+
+* `SOHLabelAnnotator` still exists and still produces one label per cell, for
+  the `configs/soh/dummy/*` examples, which are now marked legacy in-file;
+* the `soh_filepath` path still reads a supplied label file — but a missing
+  file now raises instead of silently falling back to computed labels, which
+  would have been two different label sources under one config.
+
+---
+
+## UP-06 — the prediction artifact carries sample identity and label conventions
+
+| Field | Value |
+| --- | --- |
+| File | `batteryml/pipeline.py` (`Pipeline.evaluate`, `_task_metadata`) |
+| Milestone | SOH route, commit 2 |
+| Basis | `[VERIFIED]` — `tests/test_soh_pipeline.py::TestSOHTrainEvaluateArtifact` reads the written `.pkl` back |
+
+### Why it could not go in `batteryml_web/`
+
+`Pipeline.evaluate` is what writes `predictions_seed_*.pkl`. For a cycle-level
+task the row index identifies nothing — one cell contributed many rows — so a
+prediction could not be traced to the cell and cycle it was made for, and
+"SOH vs cycle" could not be drawn at all. The information exists only inside
+`evaluate`, at the moment the artifact is assembled.
+
+### The diff, in words
+
+* when the evaluated `Dataset` carries a `sample_index` (UP-04), the artifact
+  gains `sample_index`: one `{cell_id, cycle_index}` per prediction, in row
+  order;
+* it also gains `task_metadata`: the label annotator, the reference-capacity
+  mode and sample policy as configured, and the feature extractor. An SOH
+  number is meaningless without the reference capacity it is a ratio of, so
+  the convention travels with the predictions rather than living only in a
+  config file that may be edited afterwards;
+* `_task_metadata` reads the config as configured. Nothing is inferred and
+  nothing is defaulted, so the artifact cannot claim a convention the run did
+  not use.
+
+### What was deliberately not changed
+
+* a whole-cell task writes exactly the previous four keys — `sample_index` is
+  absent, not `None`, because there row order *is* the cell order and nothing
+  was lost;
+* the existing keys, the filename and the pickle format are untouched, so
+  every existing reader keeps working.

@@ -33,8 +33,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tests.test_readiness import (  # noqa: E402
-    REGISTRIES_AVAILABLE,
-    REGISTRY_SKIP_MESSAGE,
+    DEMO_ENVIRONMENT_AVAILABLE,
+    DEMO_ENVIRONMENT_SKIP_MESSAGE,
 )
 from batteryml_web.agent.results import SMOKE_RUN_WARNING  # noqa: E402
 from batteryml_web.agent.run_policy import SMOKE_NOTICE  # noqa: E402
@@ -215,6 +215,11 @@ class _Slot:
 
     def progress(self, value=0.0, **kwargs):
         self._rec["progress"].append(float(value))
+        if kwargs.get("text") is not None:
+            self._rec["captions"].append(str(kwargs["text"]))
+
+    def container(self, **kwargs):
+        return _Ctx()
 
 
 class FakeStreamlit:
@@ -248,9 +253,11 @@ class FakeStreamlit:
             "buttons": [],
             "selectboxes": [],
             "progress": [],
+            "statuses": [],
             "tabs": [],
             "toasts": [],
             "expanders": [],
+            "expander_states": [],
             "expander_writes": [],
             "multiselects": [],
             "headings": [],
@@ -276,7 +283,11 @@ class FakeStreamlit:
         self.rec["captions"].append(str(text))
 
     def code(self, text, **kwargs):
-        self.rec["codes"].append(str(text))
+        # Routed like write(): a code block inside a disclosure is not in the
+        # primary view, and "is the raw log the main display?" is exactly the
+        # question this fake has to be able to answer.
+        bucket = "expander_writes" if self.in_expander else "codes"
+        self.rec[bucket].append(str(text))
 
     def text(self, text, **kwargs):
         self.rec["writes"].append(str(text))
@@ -387,9 +398,26 @@ class FakeStreamlit:
 
     def expander(self, label, **kwargs):
         self.rec["expanders"].append(str(label))
+        # Recorded separately from the label list, which other tests compare
+        # against plain strings. "Does this panel open by itself?" is a
+        # question about ``expanded``, and it had no answer here before.
+        self.rec["expander_states"].append(
+            (str(label), bool(kwargs.get("expanded", False)))
+        )
         return _ExpanderCtx(self)
 
     def spinner(self, label, **kwargs):
+        return _Ctx()
+
+    def status(self, label, **kwargs):
+        """st.status: the indeterminate counterpart of st.progress.
+
+        Recorded with its state so a test can tell "working, amount unknown"
+        from a bar. Its label goes into the same caption stream as
+        st.progress's ``text``, because to a reader it is the same line.
+        """
+        self.rec["statuses"].append((str(label), str(kwargs.get("state", "running"))))
+        self.rec["captions"].append(str(label))
         return _Ctx()
 
     def empty(self):
@@ -397,6 +425,8 @@ class FakeStreamlit:
 
     def progress(self, value=0.0, **kwargs):
         self.rec["progress"].append(float(value))
+        if kwargs.get("text") is not None:
+            self.rec["captions"].append(str(kwargs["text"]))
         return _Slot(self.rec)
 
     def rerun(self):
@@ -1800,6 +1830,212 @@ class TestRequestAreaIsOneControl(unittest.TestCase):
         self.assertNotIn("press Tab", rendered)
 
 
+class TestStructuredProgressIsThePrimaryView(unittest.TestCase):
+    """Milestone B: one structured state, and the raw log one click away.
+
+    The failure this replaces: the run page's main area was a code box
+    filling with hundreds of identical ``Running.`` lines — the heartbeat,
+    logged as if it were output — above a caption that said "Loading data"
+    for every one of the four data stages.
+    """
+
+    def _snapshot(self, event: dict, tail: list[str] | None = None,
+                  elapsed: float = 5.0) -> dict:
+        return {
+            "run_id": "run_1",
+            "status": "RUNNING",
+            "finished": False,
+            "elapsed_s": elapsed,
+            "event": event,
+            "tail": list(tail or []),
+        }
+
+    def _render_active(self, snapshot: dict) -> FakeStreamlit:
+        manager = _FakeRunManager({"run_1": snapshot})
+        real_manager = ui.get_run_manager
+        ui.get_run_manager = lambda: manager
+        try:
+            fake = FakeStreamlit({})
+            with _fake_streamlit(fake):
+                ui._render_active_run("run_1", plan={}, smoke=False, device="cpu")
+            return fake
+        finally:
+            ui.get_run_manager = real_manager
+
+    def test_a_real_counter_draws_a_bar_at_the_parsed_fraction(self) -> None:
+        fake = self._render_active(self._snapshot({
+            "type": "stage",
+            "stage": "Extracting train samples",
+            "current": 20, "total": 41, "fraction": 20 / 41,
+            "heartbeat": False, "indeterminate": False,
+            "message": "Extracting train cycle samples:  49%|####| 20/41",
+        }))
+        self.assertEqual(len(fake.rec["progress"]), 1)
+        self.assertAlmostEqual(fake.rec["progress"][0], 20 / 41)
+        captions = " ".join(fake.rec["captions"])
+        self.assertIn("Extracting train samples", captions)
+        self.assertIn("20 / 41", captions)
+        # A bar, not a spinner: the denominator is real.
+        self.assertEqual(fake.rec["statuses"], [])
+
+    def test_an_indeterminate_stage_gets_a_spinner_and_no_percentage(self) -> None:
+        fake = self._render_active(self._snapshot({
+            "type": "stage", "stage": "Evaluating",
+            "current": None, "total": None, "fraction": None,
+            "heartbeat": False, "indeterminate": True,
+            "message": "Evaluating",
+        }, elapsed=4.0))
+        self.assertEqual(
+            fake.rec["progress"], [],
+            "a bar was drawn for a stage with no denominator",
+        )
+        self.assertTrue(fake.rec["statuses"])
+        label, state = fake.rec["statuses"][0]
+        self.assertIn("Evaluating", label)
+        self.assertIn("elapsed 00:04", label)
+        self.assertEqual(state, "running")
+        self.assertNotIn("%", label)
+        self.assertNotIn("ETA", label)
+
+    def test_repeated_running_lines_are_not_the_primary_display(self) -> None:
+        """The regression test for the ``Running.`` spam.
+
+        Even if a tail somehow still contained heartbeat lines, they may only
+        appear inside the technical-log disclosure — never as the page's own
+        status, and never as a bare code block in the main area.
+        """
+        spam = [ui.HEARTBEAT_MESSAGE] * 40
+        fake = self._render_active(self._snapshot(
+            {
+                "type": "stage", "stage": "Training",
+                "current": None, "total": None, "fraction": None,
+                "heartbeat": True, "indeterminate": False,
+                "message": ui.HEARTBEAT_MESSAGE,
+            },
+            tail=spam,
+        ))
+        status_labels = " ".join(label for label, _ in fake.rec["statuses"])
+        self.assertNotIn(ui.HEARTBEAT_MESSAGE, status_labels)
+        self.assertNotIn(ui.HEARTBEAT_MESSAGE, " ".join(fake.rec["captions"]))
+        # The raw text is behind the disclosure, and only there.
+        self.assertIn(ui.TECHNICAL_LOG_LABEL, fake.rec["expanders"])
+        outside = [
+            text for text in fake.rec["codes"]
+            if ui.HEARTBEAT_MESSAGE in text
+        ]
+        self.assertEqual(
+            outside, [],
+            "heartbeat text was drawn as a code block outside the disclosure",
+        )
+
+    def test_the_raw_log_is_still_reachable(self) -> None:
+        """Hidden by default, removed never."""
+        fake = self._render_active(self._snapshot(
+            {
+                "type": "stage", "stage": "Training",
+                "current": None, "total": None, "fraction": None,
+                "heartbeat": False, "indeterminate": False,
+                "message": "Traning:   4%|#| 4/100",
+            },
+            tail=["Seed is set to 0.", "Traning:   4%|#| 4/100"],
+        ))
+        self.assertIn(ui.TECHNICAL_LOG_LABEL, fake.rec["expanders"])
+        self.assertTrue(
+            any("Traning" in text for text in fake.rec["expander_writes"] + fake.rec["codes"]),
+            "the run's real output is no longer reachable at all",
+        )
+
+    def test_the_run_manager_never_logs_a_heartbeat(self) -> None:
+        """Cut off at the source, not filtered at the display.
+
+        The tail and run.log are what a failed run is diagnosed from; a
+        heartbeat in either is noise that pushes real output out of the
+        window the tail keeps.
+        """
+        from batteryml_web.core import run_manager as rm_module
+
+        source = Path(rm_module.__file__).read_text(encoding="utf-8")
+        self.assertIn('event.get("heartbeat")', source)
+
+    def test_a_heartbeat_is_recognised_by_its_flag_and_by_its_text(self) -> None:
+        """The flag is authoritative; the text is the compatibility fallback.
+
+        A RunManager snapshot can outlive the code that wrote it — a run in
+        flight across a restart — so an event with no flag but the heartbeat
+        message must still not be redrawn as a real stage change.
+        """
+        self.assertTrue(ui.is_heartbeat({"heartbeat": True, "message": "anything"}))
+        self.assertTrue(ui.is_heartbeat({"message": ui.HEARTBEAT_MESSAGE}))
+        self.assertFalse(ui.is_heartbeat({"message": "Reading train data: 20/41"}))
+        self.assertFalse(ui.is_heartbeat({}))
+
+    def test_an_unflagged_heartbeat_does_not_reach_the_live_log(self) -> None:
+        fake = FakeStreamlit({})
+        progress = ui._LiveProgress(fake.empty(), fake.empty(), fake.empty())
+        progress.on_event({
+            "type": "output", "stage": "Training", "current": None,
+            "total": None, "fraction": None, "message": ui.HEARTBEAT_MESSAGE,
+        })
+        drawn = fake.rec["codes"] + fake.rec["expander_writes"]
+        self.assertEqual(
+            [text for text in drawn if ui.HEARTBEAT_MESSAGE in text], [],
+            "an unflagged heartbeat was appended to the live log",
+        )
+
+    def test_no_percentage_is_drawn_without_a_counter(self) -> None:
+        """A fraction with no counter behind it is refused, not displayed."""
+        timer = ui.EpochTimer()
+        view = ui.progress_view(
+            {"stage": "Evaluating", "current": None, "total": None,
+             "fraction": 0.7, "message": "Evaluating"},
+            elapsed_s=3.0,
+            timer=timer,
+        )
+        self.assertIsNone(view["fraction"])
+        self.assertFalse(view["determinate"])
+        self.assertNotIn("%", view["caption"])
+
+    def test_a_true_fraction_is_never_read_as_one_hundred_percent(self) -> None:
+        timer = ui.EpochTimer()
+        view = ui.progress_view(
+            {"stage": "Training", "current": True, "total": True,
+             "fraction": True, "message": "x"},
+            elapsed_s=1.0,
+            timer=timer,
+        )
+        self.assertIsNone(view["fraction"])
+        self.assertIsNone(view["counter"])
+
+    def test_an_eta_appears_only_after_enough_of_a_counter(self) -> None:
+        timer = ui.EpochTimer()
+        first = ui.progress_view(
+            {"stage": "Reading train data", "current": 1, "total": 41,
+             "fraction": 1 / 41, "message": "x"}, 1.0, timer)
+        self.assertIn("estimating", first["caption"])
+        self.assertNotIn("ETA", first["caption"])
+        for step in range(2, 6):
+            view = ui.progress_view(
+                {"stage": "Reading train data", "current": step, "total": 41,
+                 "fraction": step / 41, "message": "x"}, float(step), timer)
+        self.assertIn("ETA", view["caption"])
+        self.assertNotIn("estimating", view["caption"])
+
+    def test_a_new_stage_does_not_inherit_the_previous_stages_rate(self) -> None:
+        """Reading 41 cells and extracting from 41 cells are different work."""
+        timer = ui.EpochTimer()
+        for step in range(1, 12):
+            ui.progress_view(
+                {"stage": "Reading train data", "current": step, "total": 41,
+                 "fraction": step / 41, "message": "x"}, float(step), timer)
+        moved = ui.progress_view(
+            {"stage": "Extracting train samples", "current": 1, "total": 41,
+             "fraction": 1 / 41, "message": "x"}, 12.0, timer)
+        self.assertIn(
+            "estimating", moved["caption"],
+            "the new stage inherited an ETA measured on the previous one",
+        )
+
+
 class TestTheFakeCoversTheRealSurface(unittest.TestCase):
     """The fake must offer exactly what the page actually calls.
 
@@ -2245,19 +2481,34 @@ class TestExplainOpensConfigurationInsteadOfDeadEnding(unittest.TestCase):
         self.assertTrue(buttons)
         self.assertFalse(any(b["disabled"] for b in buttons))
 
-    def test_clicking_without_configuration_opens_the_form_and_calls_nothing(
+    def test_clicking_without_configuration_points_at_settings_and_calls_nothing(
         self,
     ) -> None:
+        """The click is never a dead end, and never a second settings screen.
+
+        It used to open the full provider / Base URL / API key / model form
+        in a dialog here. That form wrote the same store as the sidebar's,
+        so nothing ever diverged — but being asked for an API key on the
+        page you came to read a result on is what made the app feel like it
+        had forgotten, which is the complaint this replaces. One sentence
+        naming where the setting lives, and still no call.
+        """
         ui.is_llm_configured = lambda: False
         session = self._session()
-        _render(
+        fake = _render(
             session,
             clicked={ui.EXPLAIN_BUTTON_LABEL},
             radio_values={ui.COMPUTE_LABEL: "CPU"},
         )
         self.assertEqual(self.explain_calls, [])
-        self.assertTrue(session.get(ui_settings.FORM_OPEN_KEY))
-        self.assertEqual(session.get(ui_settings.PENDING_ACTION_KEY), "explain")
+        self.assertTrue(session.get(ui.NEEDS_CONFIGURATION_KEY))
+        # The click reruns, so the notice is drawn on the following run.
+        fake = _render(
+            session, radio_values={ui.COMPUTE_LABEL: "CPU"}
+        )
+        self.assertIn(
+            ui_settings.CONFIGURE_IN_SETTINGS_MESSAGE, fake.rec["captions"]
+        )
 
     def test_clicking_with_configuration_explains_directly(self) -> None:
         ui.is_llm_configured = lambda: True
@@ -2406,32 +2657,31 @@ class TestExplainOpensConfigurationInsteadOfDeadEnding(unittest.TestCase):
         self.assertNotIn("sk-secret", signature)
         self.assertIn("key", signature)
 
-    def test_connecting_from_the_explain_prompt_does_not_auto_explain(self) -> None:
-        """Explicit control: Connect enables Explain, it does not press it."""
+    def test_the_agent_page_renders_no_credential_fields(self) -> None:
+        """Whatever the state, this page never asks for the credentials.
+
+        Asserted against what was actually drawn rather than against the
+        source, because the form used to arrive here indirectly — the page
+        called a helper, which opened a dialog, which rendered it. A check
+        on the rendered widgets cannot be satisfied by moving the call.
+        """
         ui.is_llm_configured = lambda: False
-        real = ui_settings.test_llm_connection
-        ui_settings.test_llm_connection = lambda **kw: (True, "ok")
-        try:
-            session = self._session()
-            session[ui_settings.FORM_OPEN_KEY] = True
-            session[ui_settings.PENDING_ACTION_KEY] = "explain"
-            session.update(
-                {
-                    "dialog_llm_base_url": "u",
-                    "dialog_llm_api_key": "k",
-                    "dialog_llm_model": "m",
-                }
-            )
-            _render(
-                session,
-                clicked={ui_settings.CONNECT_LABEL},
-                radio_values={ui.COMPUTE_LABEL: "CPU"},
-            )
-        finally:
-            ui_settings.test_llm_connection = real
-        self.assertEqual(self.explain_calls, [], "Connect must not send the result")
-        # The prompt closed, so the page is back on the result workflow.
-        self.assertNotIn(ui_settings.FORM_OPEN_KEY, session)
+        session = self._session()
+        session[ui.NEEDS_CONFIGURATION_KEY] = True
+        fake = _render(
+            session,
+            clicked={ui.EXPLAIN_BUTTON_LABEL},
+            radio_values={ui.COMPUTE_LABEL: "CPU"},
+        )
+        labels = [
+            str(entry.get("label", ""))
+            for entry in fake.rec.get("text_inputs", [])
+        ]
+        for field in ui_settings.FIELD_LABELS.values():
+            self.assertNotIn(field, labels)
+        button_labels = [str(b["label"]) for b in fake.rec["buttons"]]
+        self.assertNotIn(ui_settings.SAVE_LABEL, button_labels)
+        self.assertNotIn(ui_settings.CONNECT_LABEL, button_labels)
 
     def test_one_configuration_source_backs_both_entry_points(self) -> None:
         source = Path(ui_settings.__file__).read_text(encoding="utf-8")
@@ -2557,26 +2807,26 @@ class TestNoFrontendDuplication(unittest.TestCase):
 class TestBackendPlanContractsUsedByTheUI(unittest.TestCase):
     """Registry-backed checks that the UI gate (can_execute) is correct."""
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_ready_models_produce_executable_plans(self) -> None:
         plan = self._plan("MATR", "RUL prediction", "cptransformer")
         self.assertTrue(ui.run_is_enabled(plan), plan.get("reason"))
         self.assertEqual(plan["model"], "cptransformer")
         self.assertTrue(plan["config_path"].endswith("configs/external/cptransformer/matr_1.yaml"))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_blocked_pbt_plan_disabled(self) -> None:
         plan = self._plan("MATR", "RUL prediction", "PBT")
         self.assertFalse(ui.run_is_enabled(plan))
         self.assertTrue(plan["command"] in (None, []))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_trajectory_batterymformer_never_rul_executable(self) -> None:
         plan = self._plan("MATR", "Degradation trajectory forecasting", "BatteryMFormer")
         self.assertFalse(ui.run_is_enabled(plan))
         self.assertTrue(plan["command"] in (None, []))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_mich_raw_only_plan_disabled_and_without_command(self) -> None:
         plan = self._plan("MICH", "RUL prediction", "cptransformer")
         self.assertEqual(plan["dataset_status"], "RAW_ONLY")
@@ -2584,7 +2834,7 @@ class TestBackendPlanContractsUsedByTheUI(unittest.TestCase):
         self.assertIsNone(plan["command"])
         self.assertNotIn("data/raw/MICH", str(plan))
 
-    @unittest.skipUnless(REGISTRIES_AVAILABLE, REGISTRY_SKIP_MESSAGE)
+    @unittest.skipUnless(DEMO_ENVIRONMENT_AVAILABLE, DEMO_ENVIRONMENT_SKIP_MESSAGE)
     def test_smoke_plan_command_carries_only_epochs_override(self) -> None:
         plan = self._plan("MATR", "RUL prediction", "cptransformer", epochs=1)
         self.assertTrue(ui.run_is_enabled(plan))

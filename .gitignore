@@ -38,7 +38,11 @@ __pycache__/
 build/
 cache/
 checkpoints/
-data
+# Repository-root datasets only. This MUST stay anchored with a leading
+# slash: a bare `data` matches any path component named data at any depth,
+# which silently ignored the package source directory batteryml/data/ and
+# kept batteryml/data/sample_index.py out of a commit that imported it.
+/data/
 data/processed/
 data/raw/
 develop-eggs/
