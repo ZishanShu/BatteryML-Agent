@@ -218,6 +218,11 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 | 在**有** GPU 的机器上最后是 `… True` | 正确。可以使用 GPU。 |
 | 在**有** GPU 的机器上最后是 `… False` | 你的 NVIDIA 驱动比 PyTorch 编译时用的 CUDA 版本旧。见下文。 |
 
+版本号那一行**上方**可能会先出现两行：
+`UserWarning: Failed to initialize NumPy: No module named 'numpy'` 和
+`cpu = _conversion_method_template(device=torch.device("cpu"))`。在这一步这是正常的——
+numpy 要到 §6 才会安装。忽略即可，做完 §6 后就不会再出现。
+
 **仅当你有 GPU 却打印了 `False` 时：** 比较第二个数字（PyTorch 编译所用的 CUDA 版本，例如 `13.0`）
 和 §1 中 `nvidia-smi` 显示的 `CUDA Version`。如果 `nvidia-smi` 显示的数字更小，
 要么更新 NVIDIA 驱动，要么换成对应你 CUDA 版本的 PyTorch。

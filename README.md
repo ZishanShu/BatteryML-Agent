@@ -227,6 +227,12 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 | `… True` on a machine **with** a GPU | Correct. The GPU can be used. |
 | `… False` on a machine **with** a GPU | Your NVIDIA driver is older than the CUDA version PyTorch was built for. See below. |
 
+Two lines may appear **above** the version line:
+`UserWarning: Failed to initialize NumPy: No module named 'numpy'` and
+`cpu = _conversion_method_template(device=torch.device("cpu"))`. This is
+expected at this point — numpy is installed in §6. Ignore it; it disappears
+after §6.
+
 **Only if you have a GPU and it printed `False`:** compare the second number
 (the CUDA version PyTorch was built for, e.g. `13.0`) with the `CUDA Version`
 that `nvidia-smi` showed in §1. If `nvidia-smi` shows a lower number, either
