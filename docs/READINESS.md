@@ -37,7 +37,14 @@ assess_dataset("CALCE").to_dict()
 `list_dataset_readiness()` reports the union of the declared platform datasets
 (`PLATFORM_DATASETS`) and everything found under `data/raw` / `data/processed`,
 so nothing on disk is silently left out; `_`-prefixed internal directories are
-ignored.
+ignored, and so are the folders that *hold* datasets rather than being one —
+`BatteryLife` and `BatteryLife_Raw` (`RAW_CONTAINER_DIRS`, spec `ACQ-02`).
+Listing them produced a `BatteryLife MISSING` row on every fresh clone that no
+action could clear, because `tools/sync_data_and_config_manifests.py` created
+an empty `data/raw/BatteryLife/v12` whenever it was imported (it no longer
+does). The datasets inside the BatteryLife distribution are still assessed by
+name, and `list_dataset_readiness(["BatteryLife"])` still assesses the folder
+when asked explicitly.
 
 Readiness is **not cached**. It is recomputed from the filesystem on every
 call, so a dataset downloaded while the app is running shows its new status on

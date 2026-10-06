@@ -310,10 +310,14 @@ python batteryml_web/core/run_batteryml_cli.py download MATR data/raw/MATR
 
 这会从 `data.matr.io` 下载四个很大的 `.mat` 文件，耗时较长，请让它一直运行。
 
-如果它以一长串报错结束，且最后一行包含 `ConnectionError`、`ProxyError`、
-`Max retries exceeded` 或 `403 Forbidden`，说明这台机器连不上 `data.matr.io`。
+如果这台机器连不上 `data.matr.io`，命令会停下并打印一行以
+`error: Could not download data/raw/MATR/MATR_batch_….mat` 开头、包含 `ProxyError`、
+`ConnectionError` 或 `403 Forbidden` 的信息，并且这个文件**什么都不会写入**。
 先解决网络问题（在同一台机器的浏览器里打开 <https://data.matr.io> 试试；
-学校或公司的代理可能会拦截它），然后按下面方框里的步骤操作。
+学校或公司的代理可能会拦截它），然后再运行一次同样的命令。
+
+再次运行这条命令总是安全的：已经完整的文件会被跳过
+（`[INFO] … already exists and is complete (… bytes). Skip it.`）；缺失、为空或不完整的文件会重新下载。
 
 > 始终通过 `batteryml_web/core/run_batteryml_cli.py` 启动 BatteryML。
 > 直接运行 `python bin/batteryml.py` 会报错
@@ -331,15 +335,19 @@ find data/raw/MATR -type f -size 0
 `MATR_batch_20180412.mat`、`MATR_batch_20190124.mat`。
 第二条命令必须**什么都不打印**。
 
-> **如果下载中断、报错，或者第二条命令打印出了文件名：** 删除整个文件夹后重新下载。
+> **如果缺少某个文件，或者第二条命令打印出了文件名：** 再运行一次上面的下载命令，
+> 它会替换为空或不完整的文件。只有当它停下并提示
+> `… already exists (… bytes), but whether it is complete cannot be checked`
+> （连不上服务器，无法比较文件大小）时，才删除整个文件夹后重新下载：
 >
 > ```bash
 > rm -rf data/raw/MATR
 > python batteryml_web/core/run_batteryml_cli.py download MATR data/raw/MATR
 > ```
 >
-> 必须这样做，因为 BatteryML 会在下载**之前**就先创建文件。中断之后，不完整的文件留在磁盘上，
-> 再次运行下载命令只会打印 `[INFO] data/raw/MATR/…mat already exists. Skip it.`，并保留那个损坏的文件。
+> 用本仓库旧版本下载的文件夹里，仍可能有空的或不完整的文件：旧版本会在下载**之前**
+> 就先创建文件，下次运行时又会跳过它。现在的下载命令先写入一个临时的 `.part` 文件，
+> 只有下载完整后才改成正式文件名，所以不会再留下损坏的文件。
 
 其他数据集：
 
@@ -370,8 +378,8 @@ ls data/processed/MATR | wc -l
 说明 §8 的下载不完整：重新做 §8，然后再运行这一步。
 
 如果报错 `OSError: Unable to synchronously open file (file signature not found)`，
-说明某个 `.mat` 文件是空的或不完整（下载失败）：执行 §8 方框里的 `rm -rf data/raw/MATR`
-那一段，然后再运行这一步。
+说明某个 `.mat` 文件是空的或不完整——这是旧版下载命令留下的文件（见 §8 的方框）。
+再运行一次 §8 的下载命令（它会替换这类文件），然后再运行这一步。
 
 预处理失败后会留下一个**空的** `data/processed/MATR` 文件夹。所以之后 §10 会显示
 `INCOMPLETE_PROCESSED`，运行模型会报 `KeyError: 'b1c1'`。只要重新成功运行这一步，两者都会消失。
@@ -429,11 +437,9 @@ python -m streamlit run batteryml_web/app.py
 网站会一直运行，直到你在这个终端里按 `Ctrl+C`（会打印 `Stopping...`）。关闭这个终端也会让网站停止。
 
 使用网站时，这个终端会打印一些以日期开头的行，例如
-``Please replace `use_container_width` with `width`.``、
-``Please replace `st.components.v1.html` with `st.iframe`.``，或者
-`The widget with key "agent_request_input" was created with a default value but also had its value set via the Session State API.`
-后面跟着一段 `Stack (most recent call last):`。这些是 Streamlit 的警告，不是错误，网站照常工作。
-真正需要处理的错误会显示在网页上。
+``Please replace `use_container_width` with `width`.`` 或
+``Please replace `st.components.v1.html` with `st.iframe`.``。这些是 Streamlit 的弃用警告，
+不是错误，网站照常工作。真正需要处理的错误会显示在网页上。
 
 ### 如果代码运行在远程服务器上
 
@@ -478,7 +484,9 @@ ssh -L 8501:localhost:8501 user@server
 
 ### 12.3 训练并评估一个模型
 
-使用 **Agent Workflow** 页：在这里发起的运行会出现在 **Review Results** 页。
+使用 **Agent Workflow** 页：它会实时显示进度，并有 **Stop run** 按钮。
+在这里发起的运行会出现在 **Review Results** 页（Run Model 页和 Home 页 **Run MATR Demo**
+发起的运行也会出现，见 §12.5）。
 它**不需要** API key——请求是按固定规则解析的。
 
 1. 在侧边栏点击 **Agent Workflow**。
@@ -522,8 +530,10 @@ ssh -L 8501:localhost:8501 user@server
 **Dataset Readiness**、**Command & Run**（显示完整命令，然后点击 **Run BatteryML**）
 以及 **Logs / Debug**。
 
-在这里发起的运行会保存到磁盘（§14）并显示在该页面上，但**不会出现在 Review Results 中**。
-想在 Review Results 中查看结果，请使用 **Agent Workflow**（§12.3）。
+在这里发起的每次运行都有自己的文件夹（§14），并会像 Agent Workflow 的运行一样列在
+**Review Results** 中。点击 **Run BatteryML** 之前显示的 **Workspace dir** 和命令里，
+已经包含了这次运行的文件夹 `runs/web_projects/<project>/run_model/<run_id>`。
+与 Agent Workflow 不同，这个页面没有 **Stop run** 按钮：运行会在 BatteryML 结束时结束。
 
 ---
 
@@ -580,16 +590,28 @@ runs/web_projects/<project>/agent_<dataset>_<model>/<run_id>/
 （`run.json` 记录命令、状态、seed、设备、git commit 和分数；三个日志文件包含运行时打印的全部内容；
 `config_<timestamp>.yaml` 是 BatteryML 实际使用的配置；`.pkl` 文件保存预测结果和分数。）
 
-**来自 Run Model 页、Home 页的 Run MATR Demo 按钮，或命令行 `--workspace <folder>` 的运行**（§12.5、§13）：
+**来自 Run Model 页或 Home 页 Run MATR Demo 按钮的运行**（§12.5）：
+
+```
+runs/web_projects/<project>/run_model/<run_id>/    Run Model page
+runs/web_projects/<project>/quickstart/<run_id>/   Run MATR Demo
+├── run.json                                  run record: command, status, seed, device, git commit, scores
+├── output.log                                everything the run printed
+├── config_<timestamp>.yaml                   the config as BatteryML used it
+└── predictions_seed_<seed>_<timestamp>.pkl   predictions and scores
+```
+
+（第一行是 Run Model 页的运行，第二行是 Run MATR Demo 的运行；`output.log` 包含运行时打印的全部内容，
+其余文件的含义同上。）这两个页面仍然会写 `runs/web_projects/<project>/logs/run_model.log`（Run Model）
+和 `runs/web_projects/<project>/logs/matr_demo.log`（演示），里面是最近一次运行的输出。
+
+**来自命令行 `--workspace <folder>` 的运行**（§13）：
 
 ```
 <folder>/
 ├── config_<timestamp>.yaml
 └── predictions_seed_<seed>_<timestamp>.pkl
 ```
-
-对于 Run Model 页，`<folder>` 是 `runs/web_projects/<project>/workspace/`，
-日志是 `runs/web_projects/<project>/logs/run_model.log`。
 
 打印某个 `.pkl` 文件里保存的分数（在 `BatteryML-Agent` 文件夹中运行；把路径换成你的文件）：
 
@@ -666,10 +688,11 @@ python -m scripts.verify.run_all
 | `ModuleNotFoundError: … 'batteryml' is not a package` | 直接运行了 `python bin/batteryml.py`。 | 改用 `python batteryml_web/core/run_batteryml_cli.py …` |
 | `ModuleNotFoundError: No module named 'batteryml_web'` | 命令不是在 `BatteryML-Agent` 文件夹里运行的。 | `cd ~/BatteryML-Agent` 后重新运行。 |
 | 有 GPU 的机器上 `torch.cuda.is_available()` 打印 `False` | NVIDIA 驱动比 PyTorch 的 CUDA 版本旧。 | 见 §5 最后一部分。 |
-| 下载失败后出现 `[INFO] data/raw/MATR/… already exists. Skip it.` | 留下了不完整的文件。 | `rm -rf data/raw/MATR`，然后重做 §8。 |
-| §8 中出现 `ConnectionError` / `ProxyError` / `403 Forbidden` | 这台机器连不上下载服务器。 | 先解决网络问题，然后 `rm -rf data/raw/MATR` 并重做 §8。 |
+| 出现 `[INFO] data/raw/MATR/… already exists. Skip it.`（没有 `and is complete`） | 文件夹是用旧版本下载的，旧版本会跳过损坏的文件。 | 先更新（§17），再重做 §8。 |
+| §8 中出现 `error: Could not download …`，并带有 `ProxyError`、`ConnectionError` 或 `403 Forbidden` | 这台机器连不上下载服务器。没有写入任何文件。 | 先解决网络问题，再重做 §8。 |
+| `error: … already exists (… bytes), but whether it is complete cannot be checked` | 连不上服务器，无法比较文件大小。 | 如果之前的下载没有报错就结束了，文件是完整的：直接做 §9。否则先解决网络问题，再重做 §8。 |
 | `FileNotFoundError: Batch file not found: data/raw/MATR/…` | 下载不完整。 | 重做 §8，再做 §9。 |
-| §9 中出现 `OSError: Unable to synchronously open file (file signature not found)` | 某个 `.mat` 文件是空的或不完整。 | `rm -rf data/raw/MATR`，重做 §8，再做 §9。 |
+| §9 中出现 `OSError: Unable to synchronously open file (file signature not found)` | 某个 `.mat` 文件是空的或不完整（旧版下载命令留下的）。 | 重做 §8，再做 §9。 |
 | MATR 显示 `INCOMPLETE_PROCESSED` | 预处理失败或被中断。 | 重做 §9。 |
 | 运行模型时报 `AssertionError: data/processed/MATR` | 没有执行 §9。 | 执行 §9。 |
 | 运行模型时报 `KeyError: 'b1c1'` | `data/processed/MATR` 存在但是空的——§9 失败了。 | 解决 §9 报错的原因，重新执行 §9。 |
@@ -678,7 +701,7 @@ python -m scripts.verify.run_all
 | 健康检查出现 `[FAIL] REG-01 …` 且退出码为 1 | 上游缺口，属预期。 | 无需处理。见 §7。 |
 | 健康检查出现 `[FAIL] DATA-01 … processed directory/directories exist but contain no *.pkl file: MATR` | §9 失败，留下了一个空的 `data/processed/MATR`。 | 解决 §9 报错的原因，重新执行 §9。 |
 | 网页显示 **No datasets are available yet.** | 网站还没有重新读取数据文件夹。 | **Prepare Data → Refresh datasets**。 |
-| 网页显示 **No run is selected. Choose one in Run History above.** | 这个项目里还没有 Agent Workflow 的运行，或者运行是从 Run Model 页发起的。 | 从 **Agent Workflow** 运行一个模型（§12.3）。 |
+| 网页显示 **No run is selected. Choose one in Run History above.** | 这个项目里还没有发起过任何运行。 | 运行一个模型（§12.3 或 §12.5），然后重新打开 **Review Results**。 |
 | 在自己电脑上打不开 `localhost:8501` | 网站运行在远程服务器上。 | 使用 §11 中的 SSH 隧道。 |
 | `CUDA out of memory` | 模型放不进 GPU 显存。 | 选择 **CPU** / `--device cpu`。 |
 
@@ -699,9 +722,7 @@ conda env remove -n batteryml -y
   没有它时，只有这一个模型不可用，其他所有模型都正常。健康检查（`VAL-01`）会提到它。
 - BatteryLife 系列数据集（`MICH`、`MICH_EXP`、`SDU`、`Stanford_2`、`Tongji`、`XJTU`、`ISU_ILCC`）
   没有 BatteryML 预处理器。它们能被识别（`RAW_ONLY`），但无法在这里预处理。
-- 点击 **Refresh datasets** 之后，就绪状态列表（§10）里还会多出一行 `BatteryLife  MISSING`。
-  它来自刷新时创建的 `data/raw/BatteryLife/` 文件夹，并不是一个数据集，可以忽略。
-- 在 **Run Model** 页发起的运行不会列在 **Review Results** 中（§12.5）。
+- 在 **Run Model** 页或用 **Run MATR Demo** 发起的运行无法在网站上停止；只有 **Agent Workflow** 有 **Stop run**。
 - 每次运行只能用一个设备：CPU，或一张 GPU。网站不支持多卡训练。
 - 并非所有「数据集 × 模型 × 任务」的组合都有配置文件。网站只会提供实际存在的组合。
 - 只在 Linux 上测试过。
@@ -732,10 +753,10 @@ conda env remove -n batteryml -y
 | 步骤 | 情况 |
 | --- | --- |
 | §1 `git`/`curl` 检查，§2 Miniconda（下载、安装、`conda init`、重开终端、服务条款），§3 克隆，§4 环境，§5 `pip install torch` 及检查（CPU），§6 依赖与导入检查，§7 健康检查（`10 passed, 1 failed, 2 skipped`） | 完全按文中命令执行，共两遍：第二遍是把本文件中每个命令块原样复制到一个全新的终端（空的 home 目录）中执行。 |
-| §8 下载命令 | 已执行；测试机器的网络策略拒绝了到 `data.matr.io` 的连接（`403 Forbidden`），所以没有下载到数据。它留下的 0 字节文件、`find … -size 0` 检查和恢复命令都是用这次失败复现出来的。 |
-| §9 预处理、§10 就绪状态 | 在无数据情况下执行：观察到了缺少原始文件时的报错（`FileNotFoundError`）、原始文件为空时的报错（`OSError … file signature not found`），以及 `INCOMPLETE_PROCESSED` 状态。数量 `180` 和 `MATR READY` 来自另一台存有 MATR 预处理数据的服务器。 |
+| §8 下载命令 | 已执行；测试机器的网络策略拒绝了到 `data.matr.io` 的连接（`403 Forbidden`），所以没有下载到数据。在现在的下载命令下，这种失败只会打印一行 `error:` 并让文件夹保持为空；旧版本留下的空文件会被删除并重新下载。此处无法完成一次成功的下载。 |
+| §9 预处理、§10 就绪状态 | 在无数据情况下执行：观察到了缺少原始文件时的报错（`FileNotFoundError`）、原始文件为空时的报错（`OSError … file signature not found`），以及 `INCOMPLETE_PROCESSED` 状态（`OSError` 是用旧版下载命令留下的 0 字节文件观察到的）。数量 `180` 和 `MATR READY` 来自另一台存有 MATR 预处理数据的服务器。 |
 | §11 启动网站、§12.1 创建项目、§12.2 Refresh datasets、§12 中的页面与按钮名称 | 在浏览器中针对这次安装实际执行过。 |
-| §12.3–12.4 在网站中运行并查看结果，§13 一次完整的运行 | 此处未执行（没有数据）。§12.3 的第 1–3 步（请求、**Use template**、**Analyze** 以及无数据时的提示）在浏览器中执行过；第 4–8 步中的名称取自代码。§13 的命令行检查到数据步骤为止：该文件夹不存在时报 `AssertionError: data/processed/MATR`，存在但为空时报 `KeyError: 'b1c1'`。一次 1 个 epoch 的 MATR CNN 运行在另一台服务器上完成过。 |
+| §12.3–12.4 在网站中运行并查看结果，§13 一次完整的运行 | 此处未执行（没有数据）。§12.3 的第 1–3 步（请求、**Use template**、**Analyze** 以及无数据时的提示）在浏览器中执行过；第 4–8 步中的名称取自代码。§13 的命令行检查到数据步骤为止：该文件夹不存在时报 `AssertionError: data/processed/MATR`，存在但为空时报 `KeyError: 'b1c1'`。一次 1 个 epoch 的 MATR CNN 运行在另一台服务器上完成过。Run Model 和 **Run MATR Demo** 的运行会列在 Review Results 中（§12.5）这一点只有单元测试覆盖；此处无法发起这样的运行。 |
 | §5 的 GPU 情形、`--index-url` 命令、`nvidia-smi` | 未执行（测试机器没有 GPU；`download.pytorch.org` 被拦截）。 |
 | §15 LLM 助手 | 在浏览器中核对了字段、按钮和六个服务商预设；没有实际建立连接。 |
 | §16 再次使用、§17 更新、§18「从头再来」 | 完全按文中命令执行（网站启动后用 `Ctrl+C` 停止；`git pull` 快进更新；`conda env remove` 之后只剩 `base`）。 |

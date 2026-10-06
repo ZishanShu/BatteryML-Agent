@@ -133,3 +133,23 @@ only, and it does not claim to know whether a process is alive — liveness
 lives in the server process that started the run. Run it while the server is
 up and a listed run may simply be in flight; run it after that server has
 stopped and a listed run is one that will never report.
+
+## Runs started from Run Model or Home's MATR demo
+
+These two buttons run BatteryML synchronously in the page (no run manager, no
+Cancel), but they record the run the same way (spec `LIFE-11`,
+`batteryml_web/core/direct_runs.py`):
+
+| Step | When | `run.json` status |
+| --- | --- | --- |
+| `begin_direct_run` | before BatteryML starts | `PLANNED` → `RUNNING` |
+| `finish_direct_run`, return code 0 | after it exits | `COMPLETED`, with `artifacts` and the saved `metrics` |
+| `finish_direct_run`, any other code | after it exits | `FAILED`, no metrics, `failure.message` names `output.log` |
+| nothing (tab closed, server killed mid-run) | — | stays `RUNNING` on disk; reported `INTERRUPTED` by `reconcile_status` |
+
+Each run has its own folder — `runs/web_projects/<project>/run_model/<run_id>/`
+or `runs/web_projects/<project>/quickstart/<run_id>/` — which is also the
+`--workspace` BatteryML writes into, and `output.log` there holds the run's
+combined stdout and stderr. Review Results finds these runs the same way it
+finds Agent Workflow runs: by the `run.json` files under the project.
+

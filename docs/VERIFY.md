@@ -58,7 +58,7 @@ preprocessing).
 | ID | Name | What it establishes | Artifacts |
 | --- | --- | --- | --- |
 | `ENV-01` | `environment` | Python version against the minimum; every distribution declared in `requirements.txt`, installed or not, with the installed version; `batteryml` importable; GPU visible via torch and `nvidia-smi`. | `environment_check.json`, `package_versions.txt` |
-| `CLI-01` | `cli_contract` | That `run_batteryml_cli.py run` still takes the config **positionally** and still offers `--train --eval --device --seed --workspace`, and offers no `--config`. Inspects `--help` only. | — |
+| `CLI-01` | `cli_contract` | That `run_batteryml_cli.py run` still takes the config **positionally** and still offers `--train --eval --device --seed --workspace`, and offers no `--config`. Inspects `--help` only. Also, read from source with `ast`: the wrapper calls `install_safe_download()` before `runpy.run_path`, and `safe_download.download_file` takes upstream's parameters (spec `ACQ-01`). | — |
 | `DATA-01` | `dataset_status` | Per dataset: raw present, file count and size; processed present and non-empty; processed older than raw. | `dataset_status.csv`, `dataset_status.json` |
 | `CFG-01` | `config_validity` | Every config under `configs/` parses, declares `model` / `train_test_split` / `feature` / `label` each with a `name`, and names only registered implementations. Declared `cell_data_path`s are checked for existence. | `config_validity.json` |
 | `VAL-01` | `validator_contract` | Runs the real `config_validator.validate_config` over every run config and reports which the execution gate would refuse. Structure only (`require_data=False`), so it needs no data and writes nothing. | `validator_contract.json` |
