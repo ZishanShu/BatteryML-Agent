@@ -234,6 +234,47 @@ class TestManifestToolUsesThisCheckout(unittest.TestCase):
                 else:
                     os.environ["BATTERYML_ROOT"] = saved
 
+    def _run_in(self, tmp: str) -> dict:
+        import os
+        import runpy
+
+        saved = os.environ.get("BATTERYML_ROOT")
+        os.environ["BATTERYML_ROOT"] = tmp
+        try:
+            return runpy.run_path(str(MANIFEST_TOOL), run_name="__not_main__")
+        finally:
+            if saved is None:
+                os.environ.pop("BATTERYML_ROOT", None)
+            else:
+                os.environ["BATTERYML_ROOT"] = saved
+
+    def test_loading_the_tool_creates_no_batterylife_folder(self) -> None:
+        """The empty data/raw/BatteryLife/v12 became a phantom dataset row."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run_in(tmp)
+            self.assertFalse((Path(tmp) / "data" / "raw" / "BatteryLife").exists())
+            self.assertTrue((Path(tmp) / "data" / "metadata").is_dir())
+
+    def test_the_dataset_manifest_builds_without_a_batterylife_folder(self) -> None:
+        import contextlib
+        import io
+        import json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            namespace = self._run_in(tmp)
+            with contextlib.redirect_stdout(io.StringIO()):
+                namespace["build_dataset_manifest"]()
+            manifest = json.loads(
+                (Path(tmp) / "data" / "metadata" / "dataset_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertFalse(any(e.get("source") == "BatteryLife/v12" for e in manifest))
+            self.assertFalse((Path(tmp) / "data" / "raw" / "BatteryLife").exists())
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

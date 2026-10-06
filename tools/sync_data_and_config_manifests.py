@@ -21,7 +21,10 @@ RAW = ROOT / "data" / "raw"
 V12 = RAW / "BatteryLife" / "v12"
 META = ROOT / "data" / "metadata"
 
-V12.mkdir(parents=True, exist_ok=True)
+# V12 is *not* created here. It used to be, unconditionally and at import, so
+# every clone grew an empty data/raw/BatteryLife/v12 that dataset readiness
+# then listed as a "BatteryLife MISSING" row. safe_link() creates it when it
+# actually links a BatteryLife dataset into it.
 META.mkdir(parents=True, exist_ok=True)
 
 
@@ -280,7 +283,7 @@ def build_dataset_manifest():
         "ISU_ILCC": "Li-ion",
     }
 
-    for p in sorted(V12.iterdir()):
+    for p in sorted(V12.iterdir()) if V12.is_dir() else []:
         if p.name.startswith("."):
             continue
         if p.is_dir() or p.is_symlink():
