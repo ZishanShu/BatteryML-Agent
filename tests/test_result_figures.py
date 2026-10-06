@@ -194,6 +194,30 @@ class TestTargetSemantics(unittest.TestCase):
         labels = rf._labels({"quantity": "SOH", "unit": "ratio", "kind": "soh"})
         self.assertEqual(labels["y"], "Estimated SOH (ratio)")
 
+    def test_rul_stays_rul_in_rendered_and_exported_labels(self) -> None:
+        """Regression: generic lower-casing once turned "RUL" into "rUL"."""
+        payload = fx._payload(
+            prediction=[500.0, 700.0], observed=[520.0, 680.0],
+            sample_index=fx._records([("synthetic_a", fx.WHOLE_CELL_CYCLE),
+                                      ("synthetic_b", fx.WHOLE_CELL_CYCLE)]),
+            task_metadata={"task": "RUL prediction"},
+        )
+        view = rv.build_rul_view(payload)
+        self.assertEqual(view["target"]["quantity"], "RUL/lifetime target")
+        axes = rf.build_panels(view, include_zoom=False)["parity"]["figure"].axes[0]
+        rendered = [axes.get_xlabel(), axes.get_ylabel(), axes.get_title(loc="left")]
+        self.assertEqual(rendered[0], "Observed RUL/lifetime target (cycles)")
+        self.assertEqual(rendered[1], "Predicted RUL/lifetime target (cycles)")
+        for text in rendered:
+            self.assertIn("RUL", text)
+            self.assertNotIn("rUL", text)
+        with tempfile.TemporaryDirectory(prefix="synthetic_rul_label_") as tmp:
+            artifact = Path(tmp) / "predictions_seed_0_1.pkl"
+            artifact.write_bytes(pickle.dumps(payload))
+            notes = build_export(artifact, dpi=60).files["figure_notes.md"].decode("utf-8")
+        self.assertIn("**RUL/lifetime target**", notes)
+        self.assertNotIn("rUL", notes)
+
     def test_soh_residual_note_says_percentage_points(self) -> None:
         target = rv.build_soh_view(fx.soh_cyclewise_payload())["target"]
         self.assertIn("percentage points", target["residual_note"])
@@ -504,6 +528,78 @@ class TestExport(unittest.TestCase):
         trajectory.write_bytes(pickle.dumps(fx.trajectory_payload()))
         with self.assertRaises(ExportError):
             build_export(trajectory, dpi=60)
+
+    def test_website_export_records_structured_provenance_not_a_command(self) -> None:
+        """Regression: the website once wrote '(website export) <path>', then a
+        CLI line rebuilt with a placeholder output directory. Neither ran."""
+        run_command = ["python", "batteryml_web/core/run_batteryml_cli.py", "run",
+                       "configs/soh/ridge/matr.yaml", "--workspace", "runs/x",
+                       "--train", "--eval", "--device", "cpu", "--seed", "0"]
+        (self.soh.parent / "run.json").write_text(json.dumps(
+            {"run_id": "run_x", "command": run_command}))
+        invocation = {"interface": "website", "action": "Prepare figure package",
+                      "artifact": str(self.soh), "cell_id": None, "dpi": 60.0}
+        result = build_export(self.soh, dpi=60, invocation=invocation)
+        sources = json.loads(result.files["figure_sources.json"])
+        self.assertEqual(sources["export"]["command"], [])
+        self.assertEqual(sources["export"]["invocation"], invocation)
+        self.assertEqual(sources["execution_provenance"],
+                         {"source": "run.json", "command": run_command})
+        notes = result.files["figure_notes.md"].decode("utf-8")
+        self.assertIn(" ".join(run_command), notes)
+        self.assertIn('"interface": "website"', notes)
+        for fabricated in ("(website export)", "<NEW_DIRECTORY>", "scripts.export_result_figures"):
+            self.assertNotIn(fabricated, notes)
+            self.assertNotIn(fabricated, json.dumps(sources["export"]))
+
+    def test_without_run_json_the_execution_command_is_not_recorded(self) -> None:
+        result = build_export(self.soh, dpi=60,
+                              invocation={"interface": "website", "artifact": str(self.soh)})
+        sources = json.loads(result.files["figure_sources.json"])
+        self.assertEqual(sources["execution_provenance"],
+                         {"source": "not recorded", "command": None})
+        self.assertIn("Command that produced the artifact: not recorded",
+                      result.files["figure_notes.md"].decode("utf-8"))
+
+    def test_the_website_button_passes_no_command(self) -> None:
+        from batteryml_web.ui import run_history as rh
+        from batteryml_web.viz import result_export as rx
+
+        calls: List[Dict[str, Any]] = []
+        real = rx.build_export
+
+        def capture(path, **kwargs):
+            calls.append(kwargs)
+            return real(path, **kwargs)
+
+        class _ClickSt(_RecordingSt):
+            def button(self, *_a, **_k):
+                return True
+
+        saved_st, rx.build_export = rh.st, capture
+        rh.st = _ClickSt()
+        try:
+            rh._render_export_action({"artifact_path": str(self.soh)}, "scope", cell_id=None)
+        finally:
+            rh.st, rx.build_export = saved_st, real
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("command", calls[0])
+        self.assertEqual(calls[0]["invocation"]["interface"], "website")
+        self.assertEqual(calls[0]["invocation"]["artifact"], str(self.soh))
+
+    def test_a_cli_export_records_its_literal_argv(self) -> None:
+        import contextlib
+
+        from scripts import export_result_figures as cli
+
+        out = self.tmp / "cli_argv"
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(["--artifact", str(self.soh), "--output", str(out),
+                                       "--dpi", "60"]), 0)
+        export = json.loads((out / "figure_sources.json").read_text())["export"]
+        self.assertEqual(export["command"][:3], ["python", "-m", "scripts.export_result_figures"])
+        self.assertIn(str(out), export["command"])
+        self.assertEqual(export["invocation"]["interface"], "cli")
 
     def test_the_cli_writes_into_a_new_directory_only(self) -> None:
         import contextlib

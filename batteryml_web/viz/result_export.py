@@ -176,8 +176,14 @@ def build_export(
     cell_id: Optional[str] = None,
     dpi: float = 300.0,
     command: Optional[List[str]] = None,
+    invocation: Optional[Dict[str, Any]] = None,
 ) -> ExportResult:
     """Every export file for ``artifact``, as bytes, plus the provenance dict.
+
+    ``command`` is the literal argv of a CLI export, recorded as given.
+    ``invocation`` is a structured record of an export that ran no command
+    (the website's button); it is serialized as is and never turned into a
+    command line.
 
     Raises:
         ExportError: unreadable or unsupported artifact, unknown ``cell_id``.
@@ -324,7 +330,18 @@ def build_export(
                        "test rows). Shown verbatim; not recomputed here."),
         },
         "per_cell_diagnostic": per_cell,
-        "export": {"command": command or [], "code": _git_state(),
+        # How the artifact was produced: only what run.json beside it
+        # records, never a command rebuilt from defaults.
+        "execution_provenance": {
+            "source": "run.json" if provenance.get("command") not in (None, "not recorded") else "not recorded",
+            "command": (provenance.get("command")
+                        if provenance.get("command") not in (None, "not recorded") else None),
+        },
+        "export": {"command": command or [],
+                   "invocation": (dict(invocation) if invocation is not None
+                                  else {"interface": "cli", "argv": list(command)} if command
+                                  else {"interface": "not recorded"}),
+                   "code": _git_state(),
                    "versions": _versions(), "dpi": dpi,
                    "figure_style": "batteryml_web.viz light theme, DejaVu Sans"},
         "notes": list(provenance.get("notes") or []),
@@ -398,7 +415,25 @@ def _notes(sources: Dict[str, Any], panels: Dict[str, Any]) -> str:
         lines += ["", f"`per_cell_errors.csv`: {sources['per_cell_diagnostic']['note']}"]
     if sources.get("notes"):
         lines += ["", "## Provenance notes", ""] + [f"- {note}" for note in sources["notes"]]
-    lines += ["", "Regenerate:", "", "```bash", " ".join(sources["export"]["command"]) or "(command not recorded)", "```", ""]
+    execution = sources.get("execution_provenance") or {}
+    if execution.get("command"):
+        recorded = execution["command"]
+        recorded = " ".join(recorded) if isinstance(recorded, list) else str(recorded)
+        lines += ["", "Command that produced the artifact (recorded in run.json):", "",
+                  "```bash", recorded, "```"]
+    else:
+        lines += ["", "Command that produced the artifact: not recorded (no run.json "
+                  "command beside it)."]
+    export = sources["export"]
+    if export.get("command"):
+        lines += ["", "Export command (as run):", "", "```bash",
+                  " ".join(export["command"]), "```", ""]
+    else:
+        lines += ["", "Export invocation (structured record; no export command was run):",
+                  "", "```json",
+                  json.dumps(export.get("invocation") or {}, indent=2, sort_keys=True,
+                             ensure_ascii=False, default=str),
+                  "```", ""]
     return "\n".join(lines)
 
 

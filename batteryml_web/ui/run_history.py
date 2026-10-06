@@ -545,12 +545,14 @@ def _render_export_action(view: Dict[str, Any], scope: str, *, cell_id: Optional
         st.code(export_command(path, cell_id=cell_id), language="bash")
         if st.button("Prepare figure package", key=f"viz_export::{scope}"):
             try:
-                # The CLI equivalent, so figure_notes.md says how to regenerate it.
-                command = ["python", "-m", "scripts.export_result_figures",
-                           "--artifact", str(path), "--output", "<NEW_DIRECTORY>"]
-                if cell_id is not None:
-                    command += ["--cell-id", str(cell_id)]
-                result = build_export(path, cell_id=cell_id, dpi=300.0, command=command)
+                # What actually happened, as a structured record. No command was
+                # run here, so none is written: the run's own command comes from
+                # its run.json inside build_export.
+                result = build_export(
+                    path, cell_id=cell_id, dpi=300.0,
+                    invocation={"interface": "website", "action": "Prepare figure package",
+                                "artifact": str(path), "cell_id": cell_id, "dpi": 300.0},
+                )
             except ExportError as exc:
                 st.error(str(exc))
                 return
