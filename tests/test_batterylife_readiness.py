@@ -323,5 +323,39 @@ class TestNativeBehaviourDoesNotRegress(_Fixture):
         self.assertIs(by_name["SDU"].status, DatasetStatus.MISSING)
 
 
+class TestContainerFoldersAreNotDatasets(_Fixture):
+    """``data/raw/BatteryLife`` holds datasets; it is not one.
+
+    The reported symptom: a ``BatteryLife  MISSING`` row in the readiness
+    list on every fresh clone, which no download or preprocessing could
+    clear. The fixture already has ``data/raw/BatteryLife/v11``, as a real
+    BatteryLife install does.
+    """
+
+    def test_no_container_folder_is_listed(self) -> None:
+        (self.raw / "BatteryLife" / "v12").mkdir(parents=True)
+        (self.raw / "BatteryLife_Raw").mkdir(parents=True)
+        names = {r.dataset for r in rd.list_dataset_readiness()}
+        for container in ("BatteryLife", "BatteryLife_Raw"):
+            self.assertNotIn(container, names)
+        self.assertEqual(rd.RAW_CONTAINER_DIRS, frozenset({"BatteryLife", "BatteryLife_Raw"}))
+
+    def test_a_real_unknown_dataset_folder_is_still_listed(self) -> None:
+        """Skipping containers must not hide a dataset the user added."""
+        self.native_raw("MyLab_cells")
+        names = {r.dataset for r in rd.list_dataset_readiness()}
+        self.assertIn("MyLab_cells", names)
+
+    def test_the_datasets_inside_the_container_are_still_assessed(self) -> None:
+        self.v11_extracted("Tongji")
+        by_name = {r.dataset: r for r in rd.list_dataset_readiness()}
+        self.assertIs(by_name["Tongji"].status, DatasetStatus.RAW_ONLY)
+
+    def test_naming_a_container_explicitly_still_assesses_it(self) -> None:
+        """Only discovery skips it; an explicit request is answered."""
+        reports = rd.list_dataset_readiness(["BatteryLife"])
+        self.assertEqual([r.dataset for r in reports], ["BatteryLife"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -78,6 +78,15 @@ PLATFORM_DATASETS: tuple[str, ...] = (
 #: this path.
 BATTERYLIFE_RAW_PARTS: tuple[str, ...] = ("data", "raw", "BatteryLife", "v11")
 
+#: Folders under ``data/raw`` that *hold* datasets rather than being one.
+#: ``BatteryLife`` is the distribution root above (its datasets are assessed
+#: by name through ``BATTERYLIFE_RAW_PARTS``); ``BatteryLife_Raw`` is where
+#: ``tools/sync_data_and_config_manifests.py`` looks for unpacked BatteryLife
+#: sources. Listing either as a dataset produced a ``BatteryLife MISSING``
+#: row that no action could ever clear. Only directory *discovery* skips
+#: them; a caller that names one explicitly still gets it assessed.
+RAW_CONTAINER_DIRS: frozenset[str] = frozenset({"BatteryLife", "BatteryLife_Raw"})
+
 def _native_preprocessor_datasets() -> frozenset[str]:
     """Datasets BatteryML has a registered preprocessor for.
 
@@ -479,7 +488,8 @@ def list_dataset_readiness(
     When ``datasets`` is omitted the list is the union of
     :data:`PLATFORM_DATASETS` and the directory names found under
     ``data/raw`` and ``data/processed``, so nothing present locally can be
-    silently left out.
+    silently left out. The container folders in :data:`RAW_CONTAINER_DIRS`
+    are not datasets and are not listed.
     """
     if datasets is None:
         root = _repo_root()
@@ -488,7 +498,9 @@ def list_dataset_readiness(
         on_disk = {
             entry.name
             for entry in list(raw_dir.glob("*")) + list(processed_dir.glob("*"))
-            if entry.is_dir() and not entry.name.startswith("_")
+            if entry.is_dir()
+            and not entry.name.startswith("_")
+            and entry.name not in RAW_CONTAINER_DIRS
         }
         datasets = sorted(set(PLATFORM_DATASETS) | on_disk)
     return [assess_dataset(name, raw_root=raw_root, processed_root=processed_root) for name in datasets]

@@ -1734,9 +1734,19 @@ def render_agent_workflow() -> None:
             st.session_state[REQUEST_STATE_KEY] = template
             st.session_state[REQUEST_WIDGET_KEY] = template
 
+    # Seeded through the widget's own key, never through ``value=``.
+    # Streamlit logs "The widget with key ... was created with a default value
+    # but also had its value set via the Session State API" (with a stack
+    # trace, in the terminal) whenever a non-empty ``value=`` meets a key
+    # written on the same run — which the template fill above does. With a
+    # user key, ``value`` is not part of the widget's identity in Streamlit
+    # 1.64 (``key_as_main_identity``), so dropping it changes nothing else:
+    # an absent key is seeded from the canonical request exactly as
+    # ``value=`` used to seed it.
+    if REQUEST_WIDGET_KEY not in st.session_state:
+        st.session_state[REQUEST_WIDGET_KEY] = st.session_state.get(REQUEST_STATE_KEY, "")
     request = st.text_area(
         REQUEST_LABEL,
-        value=st.session_state.get(REQUEST_STATE_KEY, ""),
         # The generic shape, so the box teaches the pattern without
         # pretending a curated example is waiting there.
         placeholder=REQUEST_TEMPLATE_STRUCTURE,

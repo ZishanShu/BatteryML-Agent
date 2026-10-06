@@ -317,17 +317,25 @@ class FakeStreamlit:
     def text_area(self, label, value="", **kwargs):
         # The placeholder is recorded because the request suggestion *is*
         # the placeholder: grey, and not the user's request until accepted.
+        # "value" is what the box shows: Streamlit takes a keyed widget's
+        # content from its session key when that key exists. "default" is
+        # the raw ``value=`` argument, recorded separately because a
+        # non-empty default on a key written through Session State makes
+        # Streamlit log a warning.
+        key = kwargs.get("key")
+        if key is not None and str(key) in self.session_state:
+            shown = str(self.session_state[str(key)] or "")
+        else:
+            shown = str(value or "")
         self.rec["text_areas"].append(
             {
                 "label": str(label),
-                "value": str(value or ""),
+                "value": shown,
+                "default": str(value or ""),
                 "placeholder": str(kwargs.get("placeholder", "")),
             }
         )
-        key = kwargs.get("key")
-        if key is not None and str(key) in self.session_state:
-            return str(self.session_state[str(key)] or "")
-        return str(value or "")
+        return shown
 
     def selectbox(self, label, options, index=0, **kwargs):
         opts = list(options)
@@ -1828,6 +1836,39 @@ class TestRequestAreaIsOneControl(unittest.TestCase):
         rendered = repr(_render({"gpu_inventory": _FAKE_GPU_INVENTORY}).rec)
         self.assertNotIn("Press Tab", rendered)
         self.assertNotIn("press Tab", rendered)
+
+    def test_the_box_never_combines_a_default_with_a_state_write(self) -> None:
+        """No Streamlit Session State warning on the accepting run.
+
+        Streamlit 1.64 logs "The widget with key ... was created with a
+        default value but also had its value set via the Session State API"
+        (``check_session_state_rules``) when ``value=`` is non-empty on a run
+        that also wrote the key. Accepting the template writes the key, so
+        the box must take its content from the key alone — on every run.
+        """
+        session = {"gpu_inventory": _FAKE_GPU_INVENTORY}
+        runs = [
+            _render(session, clicked={ui.USE_TEMPLATE_LABEL}),
+            _render(session),  # the accepting run: the key is written here
+            _render(session),
+        ]
+        for fake in runs:
+            for area in fake.rec["text_areas"]:
+                if area["label"] == ui.REQUEST_LABEL:
+                    self.assertEqual(area["default"], "")
+        # ...and the content still arrives, through the key.
+        self.assertEqual(runs[1].rec["text_areas"][0]["value"], self.TEMPLATE)
+
+    def test_a_request_handed_over_from_home_still_fills_the_box(self) -> None:
+        """Home pops the widget key; the box must then show the new request."""
+        session = {
+            "gpu_inventory": _FAKE_GPU_INVENTORY,
+            ui.REQUEST_STATE_KEY: "Use XGBoost on MATR to predict RUL.",
+        }
+        fake = _render(session)
+        areas = [a for a in fake.rec["text_areas"] if a["label"] == ui.REQUEST_LABEL]
+        self.assertEqual(areas[0]["value"], "Use XGBoost on MATR to predict RUL.")
+        self.assertEqual(areas[0]["default"], "")
 
 
 class TestStructuredProgressIsThePrimaryView(unittest.TestCase):

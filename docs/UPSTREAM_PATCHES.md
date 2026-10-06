@@ -312,3 +312,30 @@ prediction could not be traced to the cell and cycle it was made for, and
   was lost;
 * the existing keys, the filename and the pickle format are untouched, so
   every existing reader keeps working.
+
+---
+
+## Not a patch: `download_file` is replaced at run time
+
+Recorded here because it changes what an upstream function does when it is
+called through this platform, even though **no file under `batteryml/` or
+`bin/` was edited**.
+
+* **Upstream behaviour.** `batteryml/preprocess/download.py:50`
+  `download_file` opens the target file before sending the request. Any
+  failure leaves a 0-byte or truncated file under the final name, and the next
+  run prints `[INFO] … already exists. Skip it.` and keeps it.
+* **What the platform does.** `batteryml_web/core/run_batteryml_cli.py` calls
+  `install_safe_download()` before `runpy.run_path("bin/batteryml.py")`. That
+  sets `batteryml.preprocess.download_file` to
+  `batteryml_web/core/safe_download.download_file`, and `bin/batteryml.py`
+  picks it up through its own `from batteryml.preprocess import …
+  download_file`. Same parameters; `.part` file, size check, atomic rename;
+  spec `ACQ-01`.
+* **Kept from upstream on purpose.** `verify=False` on the request. Changing
+  TLS verification could break a dataset host that works today, and none of
+  the hosts could be reached from the authoring environment to check.
+* **Guarded by.** `CLI-01` fails if the wrapper stops installing it before the
+  hand-over, or if its parameters drift from upstream's;
+  `tests/test_safe_download.py` asserts the upstream file is unmodified.
+

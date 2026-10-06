@@ -330,11 +330,16 @@ python batteryml_web/core/run_batteryml_cli.py download MATR data/raw/MATR
 This downloads four large `.mat` files from `data.matr.io`. It takes a long
 time; leave it running.
 
-If it ends with a long error whose last line contains `ConnectionError`,
-`ProxyError`, `Max retries exceeded` or `403 Forbidden`, the machine cannot
-reach `data.matr.io`. Fix the network first (open
+If the machine cannot reach `data.matr.io`, the command stops with one line
+that starts with `error: Could not download data/raw/MATR/MATR_batch_….mat`
+and contains `ProxyError`, `ConnectionError` or `403 Forbidden`, and it
+writes **nothing** for that file. Fix the network first (open
 <https://data.matr.io> in a browser on the same machine; a university or
-company proxy may block it), then follow the box below.
+company proxy may block it), then run the same command again.
+
+Running the command again is always safe. Files that are already complete
+are skipped (`[INFO] … already exists and is complete (… bytes). Skip it.`);
+files that are missing, empty or cut off are downloaded again.
 
 > Always start BatteryML through `batteryml_web/core/run_batteryml_cli.py`.
 > Running `python bin/batteryml.py` directly fails with
@@ -352,18 +357,22 @@ The first command lists exactly these four files, each much larger than zero:
 `MATR_batch_20180412.mat`, `MATR_batch_20190124.mat`.
 The second command must print **nothing**.
 
-> **If the download stopped, failed, or the second command printed a file
-> name:** delete the folder and download again.
+> **If a file is missing or the second command printed a file name:** run the
+> download command above again; it replaces empty and incomplete files. Only
+> if it then stops with `… already exists (… bytes), but whether it is
+> complete cannot be checked` (the server could not be reached to compare
+> sizes), delete the folder and download again:
 >
 > ```bash
 > rm -rf data/raw/MATR
 > python batteryml_web/core/run_batteryml_cli.py download MATR data/raw/MATR
 > ```
 >
-> This is necessary because BatteryML creates each file *before* downloading
-> it. After an interruption the incomplete file stays on disk, and running the
-> download again only prints `[INFO] data/raw/MATR/…mat already exists. Skip it.`
-> and keeps the broken file.
+> Folders downloaded with an older version of this repository can still hold
+> an empty or cut-off file: that version created each file *before*
+> downloading it and then skipped it on the next run. The download command
+> now writes to a temporary `.part` file and renames it only when it is
+> complete, so it no longer leaves broken files behind.
 
 Other datasets:
 
@@ -397,8 +406,9 @@ If preprocessing stops with
 the download in §8 is incomplete: redo §8, then run this step again.
 
 If it stops with `OSError: Unable to synchronously open file (file signature
-not found)`, one of the `.mat` files is empty or cut off (a failed download):
-run the `rm -rf data/raw/MATR` box in §8, then this step again.
+not found)`, one of the `.mat` files is empty or cut off — a file left by an
+older version of the download command (see the box in §8). Run the download
+command in §8 again (it replaces such files), then this step again.
 
 A failed preprocessing run leaves an **empty** `data/processed/MATR` folder
 behind. That is why §10 then reports `INCOMPLETE_PROCESSED`, and a model run
@@ -459,13 +469,10 @@ The website runs until you press `Ctrl+C` in this terminal (it prints
 `Stopping...`). Closing the terminal stops it too.
 
 While you use the website, this terminal prints lines starting with a date,
-such as ``Please replace `use_container_width` with `width`.``,
-``Please replace `st.components.v1.html` with `st.iframe`.``, or
-`The widget with key "agent_request_input" was created with a default value
-but also had its value set via the Session State API.` followed by a
-`Stack (most recent call last):` block. These are Streamlit warnings, not
-errors; the website keeps working. Errors that matter are shown on the web
-page itself.
+such as ``Please replace `use_container_width` with `width`.`` or
+``Please replace `st.components.v1.html` with `st.iframe`.``. These are
+Streamlit deprecation warnings, not errors; the website keeps working. Errors
+that matter are shown on the web page itself.
 
 ### If the code runs on a remote server
 
@@ -519,7 +526,9 @@ again.
 
 ### 12.3 Train and evaluate a model
 
-Use the **Agent Workflow** page: its runs appear on the **Review Results** page.
+Use the **Agent Workflow** page: it shows live progress and has **Stop run**.
+Its runs appear on the **Review Results** page (so do runs from the Run Model
+page and the Home page's **Run MATR Demo**, §12.5).
 It does **not** need an API key — the request is interpreted by fixed rules.
 
 1. In the sidebar, click **Agent Workflow**.
@@ -573,9 +582,12 @@ a form: tabs **Configuration** (choose **Dataset**, **Task**, **Model**,
 **Device**, **Seed**), **Dataset Readiness**, **Command & Run** (shows the
 exact command, then **Run BatteryML**) and **Logs / Debug**.
 
-Runs started there are saved to disk (§14) and shown on that page, but they
-are **not listed in Review Results**. Use **Agent Workflow** (§12.3) when you
-want the Review Results page.
+Each run started there gets its own folder (§14) and is listed on
+**Review Results** like an Agent Workflow run. The **Workspace dir** and the
+command shown before you press **Run BatteryML** already contain that run's
+folder, `runs/web_projects/<project>/run_model/<run_id>`. Unlike Agent
+Workflow, this page has no **Stop run** button: the run ends when BatteryML
+finishes.
 
 ---
 
@@ -635,17 +647,29 @@ runs/web_projects/<project>/agent_<dataset>_<model>/<run_id>/
 └── predictions_seed_<seed>_<timestamp>.pkl   predictions and scores
 ```
 
-**Runs from the Run Model page, the Home page's Run MATR Demo button, or the
-command line with `--workspace <folder>`** (§12.5, §13):
+**Runs from the Run Model page or the Home page's Run MATR Demo button**
+(§12.5):
+
+```
+runs/web_projects/<project>/run_model/<run_id>/    Run Model page
+runs/web_projects/<project>/quickstart/<run_id>/   Run MATR Demo
+├── run.json                                  run record: command, status, seed, device, git commit, scores
+├── output.log                                everything the run printed
+├── config_<timestamp>.yaml                   the config as BatteryML used it
+└── predictions_seed_<seed>_<timestamp>.pkl   predictions and scores
+```
+
+The pages also still write `runs/web_projects/<project>/logs/run_model.log`
+(Run Model) and `runs/web_projects/<project>/logs/matr_demo.log` (demo), which
+hold the most recent run's output.
+
+**Runs from the command line with `--workspace <folder>`** (§13):
 
 ```
 <folder>/
 ├── config_<timestamp>.yaml
 └── predictions_seed_<seed>_<timestamp>.pkl
 ```
-
-For the Run Model page, `<folder>` is `runs/web_projects/<project>/workspace/`,
-and the log is `runs/web_projects/<project>/logs/run_model.log`.
 
 To print the scores saved in a `.pkl` file (run inside the `BatteryML-Agent`
 folder; replace the path with your file):
@@ -730,10 +754,11 @@ line names its problem; see §18.
 | `ModuleNotFoundError: … 'batteryml' is not a package` | `python bin/batteryml.py` was run directly. | Use `python batteryml_web/core/run_batteryml_cli.py …` |
 | `ModuleNotFoundError: No module named 'batteryml_web'` | The command was run outside the `BatteryML-Agent` folder. | `cd ~/BatteryML-Agent` and run it again. |
 | `torch.cuda.is_available()` prints `False` on a GPU machine | NVIDIA driver older than PyTorch's CUDA version. | §5, last part. |
-| `[INFO] data/raw/MATR/… already exists. Skip it.` after a failed download | An incomplete file was left behind. | `rm -rf data/raw/MATR`, then §8 again. |
-| `ConnectionError` / `ProxyError` / `403 Forbidden` during §8 | The machine cannot reach the download server. | Fix the network, then `rm -rf data/raw/MATR` and §8 again. |
+| `[INFO] data/raw/MATR/… already exists. Skip it.` (without `and is complete`) | The folder was downloaded with an older version, which skipped broken files. | Update (§17), then run §8 again. |
+| `error: Could not download …` with `ProxyError`, `ConnectionError` or `403 Forbidden` during §8 | The machine cannot reach the download server. Nothing was written. | Fix the network, then run §8 again. |
+| `error: … already exists (… bytes), but whether it is complete cannot be checked` | The server could not be reached to compare sizes. | If the earlier download ended without an error, the file is complete: go on to §9. Otherwise fix the network and run §8 again. |
 | `FileNotFoundError: Batch file not found: data/raw/MATR/…` | The download is incomplete. | §8 again, then §9. |
-| `OSError: Unable to synchronously open file (file signature not found)` in §9 | A `.mat` file is empty or cut off. | `rm -rf data/raw/MATR`, §8 again, then §9. |
+| `OSError: Unable to synchronously open file (file signature not found)` in §9 | A `.mat` file is empty or cut off (left by an older version of the download). | Run §8 again, then §9. |
 | MATR shows `INCOMPLETE_PROCESSED` | Preprocessing failed or was interrupted. | §9 again. |
 | `AssertionError: data/processed/MATR` when running a model | §9 was not run. | Run §9. |
 | `KeyError: 'b1c1'` when running a model | `data/processed/MATR` exists but is empty — §9 failed. | Fix the cause of the §9 error, run §9 again. |
@@ -742,7 +767,7 @@ line names its problem; see §18.
 | Health check: `[FAIL] REG-01 …` and exit code 1 | Upstream gap, expected. | Nothing. See §7. |
 | Health check: `[FAIL] DATA-01 … processed directory/directories exist but contain no *.pkl file: MATR` | §9 failed and left an empty `data/processed/MATR`. | Fix the cause of the §9 error, run §9 again. |
 | Website: **No datasets are available yet.** | The website has not re-read the data folder. | **Prepare Data → Refresh datasets**. |
-| Website: **No run is selected. Choose one in Run History above.** | No Agent Workflow run exists in this project yet, or the run was started from the Run Model page. | Run a model from **Agent Workflow** (§12.3). |
+| Website: **No run is selected. Choose one in Run History above.** | No run has been started in this project yet. | Run a model (§12.3 or §12.5), then open **Review Results** again. |
 | Browser cannot open `localhost:8501` from your own computer | The website runs on a remote server. | Use the SSH tunnel in §11. |
 | `CUDA out of memory` | The model does not fit on the GPU. | Choose **CPU** / `--device cpu`. |
 
@@ -767,11 +792,8 @@ Then repeat from §4.
 - The BatteryLife datasets (`MICH`, `MICH_EXP`, `SDU`, `Stanford_2`, `Tongji`,
   `XJTU`, `ISU_ILCC`) have no BatteryML preprocessor. They can be detected
   (`RAW_ONLY`) but not preprocessed here.
-- After **Refresh datasets**, the readiness list (§10) also shows a line
-  `BatteryLife  MISSING`. It comes from the folder `data/raw/BatteryLife/`
-  that the refresh creates, not from a dataset, and can be ignored.
-- Runs started on the **Run Model** page are not listed on **Review Results**
-  (§12.5).
+- Runs started on the **Run Model** page or with **Run MATR Demo** cannot be
+  stopped from the website; only **Agent Workflow** has **Stop run**.
 - Only one device per run: CPU, or one GPU. Multi-GPU training is not
   supported in the website.
 - Not every dataset × model × task combination has a config. The website only
@@ -805,10 +827,10 @@ What was actually executed, and what was not:
 | Step | Status |
 | --- | --- |
 | §1 `git`/`curl` check, §2 Miniconda (download, install, `conda init`, reopened terminal, Terms of Service), §3 clone, §4 environment, §5 `pip install torch` and the check (CPU), §6 requirements and import check, §7 health check (`10 passed, 1 failed, 2 skipped`) | Executed exactly as written, twice: the second time by copying every command block of this file, unchanged, into a new terminal with an empty home directory. |
-| §8 download command | Executed; the test machine's network policy refused the connection to `data.matr.io` (`403 Forbidden`), so no data was downloaded. The 0-byte file it left behind, the `find … -size 0` check and the recovery command were reproduced with that failure. |
-| §9 preprocess, §10 readiness | Executed without data: the error messages for missing raw files (`FileNotFoundError`) and for an empty raw file (`OSError … file signature not found`), and the `INCOMPLETE_PROCESSED` state, were observed. The count `180` and `MATR READY` come from a separate server that holds the processed MATR data. |
+| §8 download command | Executed; the test machine's network policy refused the connection to `data.matr.io` (`403 Forbidden`), so no data was downloaded. With the current download command that failure exits with one `error:` line and leaves the folder empty; an empty file left by the older version is removed and fetched again. A successful download could not be run here. |
+| §9 preprocess, §10 readiness | Executed without data: the error messages for missing raw files (`FileNotFoundError`) and for an empty raw file (`OSError … file signature not found`), and the `INCOMPLETE_PROCESSED` state, were observed (the `OSError` with a 0-byte file from the older download command). The count `180` and `MATR READY` come from a separate server that holds the processed MATR data. |
 | §11 start the website, §12.1 create a project, §12.2 Refresh datasets, page and button names in §12 | Executed in a browser against this installation. |
-| §12.3–12.4 a run and its results in the website, §13 a completed run | Not executed here (no data). §12.3 steps 1–3 (request, **Use template**, **Analyze**, and the no-data message) were executed in the browser; the labels in steps 4–8 were taken from the code. The CLI commands in §13 were checked as far as the data step: they stop with `AssertionError: data/processed/MATR` when that folder does not exist, and with `KeyError: 'b1c1'` when it exists but is empty. A one-epoch MATR CNN run completed on the separate server. |
+| §12.3–12.4 a run and its results in the website, §13 a completed run | Not executed here (no data). §12.3 steps 1–3 (request, **Use template**, **Analyze**, and the no-data message) were executed in the browser; the labels in steps 4–8 were taken from the code. The CLI commands in §13 were checked as far as the data step: they stop with `AssertionError: data/processed/MATR` when that folder does not exist, and with `KeyError: 'b1c1'` when it exists but is empty. A one-epoch MATR CNN run completed on the separate server. That Run Model and **Run MATR Demo** runs are listed in Review Results (§12.5) is covered by unit tests only; no such run could be started here. |
 | §5 GPU case, the `--index-url` command, `nvidia-smi` | Not executed (no GPU on the test machine; `download.pytorch.org` was blocked). |
 | §15 LLM assistant | Fields, buttons and the six provider presets checked in the browser; no connection was made. |
 | §16 coming back, §17 updating, §18 "Starting over" | Executed exactly as written (website started and stopped with `Ctrl+C`; `git pull` fast-forwarded; `conda env remove` left only `base`). |
