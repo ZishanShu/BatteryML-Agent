@@ -37,6 +37,7 @@ from .result_views import (
     SOH_SCALAR_SCHEMA,
     SOH_SCHEMA,
     TRAJECTORY_SCHEMA,
+    attach_artifact_context,
     build_rul_cycle_view,
     build_rul_view,
     build_soh_view,
@@ -217,6 +218,10 @@ def preview_prediction_file(path: str | Path) -> Dict[str, Any]:
     rul_cycles = (
         build_rul_cycle_view(payload) if schema == RUL_CYCLEWISE_SCHEMA else None
     )
+    # Name the exact artifact on each view, so figures, widget keys and the
+    # export command all refer to this file and no other.
+    attach_artifact_context(rul, payload, target)
+    attach_artifact_context(soh, payload, target)
     result["rul"] = rul
     result["rul_cycles"] = rul_cycles
     result["soh"] = soh
@@ -225,10 +230,11 @@ def preview_prediction_file(path: str | Path) -> Dict[str, Any]:
     prediction = payload.get("prediction")
     scores = payload.get("scores")
     count: Optional[int] = None
+    # Every stored row, including any omitted from the figures as non-finite.
     if rul and rul.get("available"):
-        count = int(rul["count"])
+        count = int(rul.get("total_rows") or rul["count"])
     elif soh and soh.get("available"):
-        count = int(soh["count"])
+        count = int(soh.get("total_rows") or soh["count"])
     elif trajectory and trajectory.get("available"):
         count = int(trajectory["count"])
     elif hasattr(prediction, "__len__"):

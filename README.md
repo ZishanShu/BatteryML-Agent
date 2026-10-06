@@ -678,6 +678,23 @@ folder; replace the path with your file):
 python -c "import pickle; print(pickle.load(open('runs/cli_matr_xgb/predictions_seed_0_TIMESTAMP.pkl', 'rb'))['scores'])"
 ```
 
+To export the result figures of one `.pkl` file for a paper — separate SVG and
+PNG panels, the exact plotted values as CSV, and `figure_sources.json`
+recording where every number came from — first look at what it holds
+(`--inspect` writes nothing), then export into a **new** folder. The command
+only draws; it never trains or evaluates.
+
+```bash
+python -m scripts.export_result_figures --artifact runs/cli_matr_xgb/predictions_seed_0_TIMESTAMP.pkl --inspect
+python -m scripts.export_result_figures --artifact runs/cli_matr_xgb/predictions_seed_0_TIMESTAMP.pkl --output runs/figure_exports/cli_matr_xgb
+```
+
+The folder then contains `parity.svg`/`.png`, `residuals.svg`/`.png`, their
+`_zoom` versions, `plotted_samples.csv`, `figure_sources.json` and
+`figure_notes.md`; an SOH result also gets `soh_cycle_<cell>.svg`/`.png`/`.csv`
+and `per_cell_errors.csv`. The same export is in the website under
+**Export figures** below each result. Details: `docs/VISUALIZATION.md`.
+
 ---
 
 ## 15. Optional: connect an LLM assistant

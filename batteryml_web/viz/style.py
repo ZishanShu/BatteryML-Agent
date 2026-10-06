@@ -223,7 +223,9 @@ def add_titles(
         fontsize=TITLE_SIZE_PT,
         fontweight="semibold",
         loc="left",
-        pad=14.0 if subtitle else 8.0,
+        # 18 pt clears the subtitle line below it (6 pt offset + an 8 pt
+        # line); 14 let the two touch in rendered output.
+        pad=18.0 if subtitle else 8.0,
     )
     if subtitle:
         ax.annotate(

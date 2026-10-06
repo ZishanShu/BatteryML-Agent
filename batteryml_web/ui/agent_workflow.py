@@ -1679,7 +1679,7 @@ def _render_result_figures(result_context: dict[str, Any] | None) -> None:
         )
         return
     if views["schema"] in SCALAR_SCHEMAS:
-        render_rul_figures(views["rul"])
+        render_rul_figures(views["rul"], placement="agent")
         # Only when the artifact genuinely holds per-cell, per-cycle
         # remaining-life estimates. A scalar per-cell result gets no
         # cycle-wise heading at all, rather than a disclosure explaining the
@@ -1691,7 +1691,7 @@ def _render_result_figures(result_context: dict[str, Any] | None) -> None:
         # A cycle-level result: per-cell curves and the range diagnostic, and
         # a table whose rows name the cell and the cycle rather than a
         # position in an array.
-        render_soh_figures(views["soh"])
+        render_soh_figures(views["soh"], placement="agent")
         render_prediction_table(views["soh"])
     elif views["schema"] == TRAJECTORY_SCHEMA:
         render_trajectory_figure(views["trajectory"])
