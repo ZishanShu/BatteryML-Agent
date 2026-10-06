@@ -543,9 +543,12 @@ def render_home_agent_entry() -> None:
         if accept_request_template(template, committed):
             st.session_state["agent_original_request"] = template
             st.session_state["home_agent_request"] = template
+    # Seeded through the widget key, not ``value=``: both on the same run make
+    # Streamlit log a Session State warning (see render_agent_workflow).
+    if "home_agent_request" not in st.session_state:
+        st.session_state["home_agent_request"] = st.session_state.get("agent_original_request", "")
     request = st.text_area(
         "Describe what you want to do...",
-        value=st.session_state.get("agent_original_request", ""),
         placeholder=REQUEST_TEMPLATE_STRUCTURE,
         key="home_agent_request",
         height=90,
