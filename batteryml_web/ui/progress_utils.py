@@ -118,8 +118,11 @@ def run_command_with_progress(
     with host.expander("Logs", expanded=not success):
         st.code(output_tail or "No logs captured.", language="text")
 
+    # The whole output, not the on-screen tail: this file is the run's log,
+    # and a failure's cause is often far above its last 200 lines.
+    output = "".join(logs)
     log_path.write_text(
-        f"COMMAND: {' '.join(str(part) for part in command)}\nReturn code: {return_code}\nElapsed: {elapsed:.2f}s\n\n{output_tail}",
+        f"COMMAND: {' '.join(str(part) for part in command)}\nReturn code: {return_code}\nElapsed: {elapsed:.2f}s\n\n{output}",
         encoding="utf-8",
     )
 
@@ -129,4 +132,5 @@ def run_command_with_progress(
         "elapsed": elapsed,
         "log_path": str(log_path),
         "output_tail": output_tail,
+        "output": output,
     }

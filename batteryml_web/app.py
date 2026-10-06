@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -22,8 +23,11 @@ from batteryml_web.agent.result_analysis import (
 from batteryml_web.agent.llm_client import run_llm_prompt, save_llm_output
 from batteryml_web.agent.catalog import REQUEST_TEMPLATE_STRUCTURE
 from batteryml_web.agent.execution import build_run_command
+from batteryml_web.agent.executor import discover_artifacts
+from batteryml_web.agent.results import build_result_context
 from batteryml_web.ui.agent_workflow import (
     USE_TEMPLATE_LABEL,
+    _git_commit,
     accept_template as accept_request_template,
     render_agent_workflow,
     request_template as agent_request_template,
@@ -64,6 +68,8 @@ from batteryml_web.ui.llm_state import (
 )
 from batteryml_web.core.project_context import resolve_project
 from batteryml_web.core.run_manager import get_run_manager
+from batteryml_web.core import direct_runs
+from batteryml_web.core.run_identity import new_run_id
 from batteryml_web.core import run_manifest as rm
 from batteryml_web.core.run_manifest import find_run
 from batteryml_web.core.selected_result import (
@@ -468,6 +474,143 @@ def _collect_run_outputs(project_root: Path, config_path: Path, log_path: Path, 
                 break
 
 
+#: Session key for the run id the Run Model page shows before Run is pressed.
+RUN_MODEL_RESERVED_ID_KEY = "run_model_reserved_run"
+
+
+def _project_for_runs() -> dict[str, Any]:
+    """The project a Run Model / demo run is recorded under.
+
+    The same resolution Review Results uses (``_current_project``), so a run
+    recorded here is always one Review Results looks for.
+    """
+    return resolve_project(
+        project_root=st.session_state.get("project_root"),
+        project_name=st.session_state.get("project_name")
+        or st.session_state.get("current_project"),
+    )
+
+
+def _registry_entry_for_config(config_path: Any) -> Any:
+    """The config registry entry for one config file, or None."""
+    wanted = Path(str(config_path)).as_posix()
+    for entry in get_config_registry(str(REPO_ROOT)).get_entries():
+        if Path(str(entry.config_path)).as_posix() == wanted:
+            return entry
+    return None
+
+
+def _run_model_workspace(dataset: Any, model: Any, config_path: Any) -> str:
+    """The Run Model page's next run folder, repo-relative.
+
+    Reserved before the click because the page shows the exact command,
+    ``--workspace`` included, before Run is pressed; the reservation follows
+    the current selection (see ``direct_runs.reserve_run_id``).
+    """
+    run_id = direct_runs.reserve_run_id(
+        st.session_state,
+        key=RUN_MODEL_RESERVED_ID_KEY,
+        dataset=dataset,
+        model=model,
+        seed=st.session_state.get("run_seed", 0),
+        device=st.session_state.get("selected_device", "cpu"),
+        config_path=config_path,
+    )
+    return direct_runs.direct_run_dir(
+        _project_for_runs()["root"], "run_model", run_id
+    ).as_posix()
+
+
+def _begin_page_run(
+    *,
+    run_id: str,
+    workspace: str,
+    project_name: str,
+    dataset: str,
+    task: str,
+    model_key: str,
+    model_display: Any,
+    config_path: Any,
+    seed: Any,
+    device: str,
+    command: list[str],
+) -> Path:
+    """Record the run (RUNNING) before BatteryML starts; return its folder."""
+    run_dir = REPO_ROOT / workspace
+    direct_runs.begin_direct_run(
+        run_dir,
+        workspace=workspace,
+        run_id=run_id,
+        project=project_name,
+        dataset=dataset,
+        task=task,
+        model_key=model_key,
+        model_display=model_display,
+        config_path=config_path,
+        seed=seed,
+        device=device,
+        command=command,
+        git_commit=_git_commit(),
+    )
+    return run_dir
+
+
+def _finish_page_run(
+    run_dir: Path,
+    result: dict[str, Any],
+    *,
+    workspace: str,
+    dataset: str,
+    task: str,
+    model_key: str,
+    config_path: Any,
+) -> None:
+    """Record how the run ended, with only what BatteryML actually saved.
+
+    Artifacts and metrics are read exactly as Agent Workflow reads them
+    (``discover_artifacts``, ``build_result_context``), so a run looks the
+    same in Review Results whichever page started it.
+    """
+    artifacts: dict[str, Any] = {}
+    metrics: dict[str, Any] = {}
+    metrics_error: str | None = None
+    if result["success"]:
+        try:
+            artifacts = discover_artifacts(workspace, repo_root=REPO_ROOT)
+            context = build_result_context(
+                workspace,
+                dataset=dataset,
+                task=task,
+                model=model_key,
+                config_path=str(config_path),
+                run_status="SUCCESS",
+                execution_result={
+                    "success": True,
+                    "returncode": result["return_code"],
+                    "workspace": workspace,
+                    "artifacts": artifacts,
+                },
+                smoke_run=False,
+            )
+            metrics = dict((context or {}).get("metrics") or {})
+        except Exception as exc:  # noqa: BLE001 - recorded in run.json and shown, never swallowed
+            traceback.print_exc()
+            metrics_error = f"{type(exc).__name__}: {exc}"
+            st.error(
+                "The run finished, but its results could not be read "
+                f"({metrics_error}). Its files are in {workspace}."
+            )
+    direct_runs.finish_direct_run(
+        run_dir,
+        return_code=result["return_code"],
+        elapsed_seconds=result["elapsed"],
+        output=str(result.get("output") or ""),
+        artifacts=artifacts,
+        metrics=metrics,
+        metrics_error=metrics_error,
+    )
+
+
 def _current_project_name() -> str:
     return st.session_state.get("project_name") or st.session_state.get("current_project") or "No project loaded"
 
@@ -745,23 +888,52 @@ def render_home_page():
     with q2:
         if st.button("Run MATR Demo", type=PRIMARY_ROLE, use_container_width=True, key="home_run_matr_demo", disabled=not preflight_ok):
             workspace_root = project_root or Path("runs/web_projects/default")
-            workspace_dir = workspace_root / "workspace"
             log_path = workspace_root / "logs" / "matr_demo.log"
+            # Its own run folder and run.json, like every other run, so
+            # Review Results — where this button leads — lists it.
+            demo_entry = _registry_entry_for_config(config_path)
+            if demo_entry is None:
+                st.error(
+                    f"{config_path} is not in the config registry, so this demo "
+                    "run cannot be recorded. Run `python -m scripts.verify.run_all` "
+                    "and read CFG-01."
+                )
+                st.stop()
+            project_for_runs = _project_for_runs()
+            demo_run_id = new_run_id(dataset=demo_entry.dataset, model=demo_entry.model_key, seed=0)
+            demo_workspace = direct_runs.direct_run_dir(
+                project_for_runs["root"], "quickstart", demo_run_id
+            ).as_posix()
+            workspace_dir = Path(demo_workspace)
+            demo_command = [
+                sys.executable,
+                "batteryml_web/core/run_batteryml_cli.py",
+                "run",
+                str(config_path),
+                "--workspace",
+                demo_workspace,
+                "--train",
+                "--eval",
+                "--device",
+                "cpu",
+                "--seed",
+                "0",
+            ]
+            demo_run_dir = _begin_page_run(
+                run_id=demo_run_id,
+                workspace=demo_workspace,
+                project_name=project_for_runs["name"],
+                dataset=demo_entry.dataset,
+                task=demo_entry.task,
+                model_key=demo_entry.model_key,
+                model_display=demo_entry.model_display,
+                config_path=config_path,
+                seed=0,
+                device="cpu",
+                command=demo_command,
+            )
             result = run_command_with_progress(
-                command=[
-                    sys.executable,
-                    "batteryml_web/core/run_batteryml_cli.py",
-                    "run",
-                    str(config_path),
-                    "--workspace",
-                    str(workspace_dir),
-                    "--train",
-                    "--eval",
-                    "--device",
-                    "cpu",
-                    "--seed",
-                    "0",
-                ],
+                command=demo_command,
                 cwd=REPO_ROOT,
                 log_path=log_path,
                 steps=[
@@ -775,6 +947,15 @@ def render_home_page():
                     (100, "Demo completed"),
                 ],
                 container=demo_progress_host,
+            )
+            _finish_page_run(
+                demo_run_dir,
+                result,
+                workspace=demo_workspace,
+                dataset=demo_entry.dataset,
+                task=demo_entry.task,
+                model_key=demo_entry.model_key,
+                config_path=config_path,
             )
             st.session_state["last_run_status"] = "success" if result["success"] else "failed"
             st.session_state["last_run_time"] = result["elapsed"]
@@ -1671,7 +1852,7 @@ def render_run_model_page():
         with right:
             config_paths = configs.get((ds, task_choice, model), [])
             config_path = config_paths[0] if config_paths else None
-            workspace_dir = (_project_root() or Path("runs/web_projects/default")) / "workspace"
+            workspace_dir = Path(_run_model_workspace(ds, model, config_path))
             info = readiness[ds]
             st.markdown("**Selected config summary**")
             st.write(f"Dataset: {ds}")
@@ -1739,7 +1920,7 @@ def render_run_model_page():
         model = st.session_state.get("selected_model", "")
         config_paths = configs.get((ds, task_choice, model), [])
         config_path = config_paths[0] if config_paths else None
-        workspace_dir = (_project_root() or Path("runs/web_projects/default")) / "workspace"
+        workspace_dir = Path(_run_model_workspace(ds, model, config_path))
         st.write(f"**Dataset:** {ds}")
         st.write(f"**Task:** {task_choice}")
         st.write(f"**Model:** {model if model else 'Not configured'}")
@@ -1789,7 +1970,38 @@ def render_run_model_page():
         with c2:
             if st.button("Run BatteryML", type=PRIMARY_ROLE, disabled=not can_run, use_container_width=True, key="run_batteryml_btn"):
                 log_path = (_project_root() or Path("runs/web_projects/default")) / "logs" / "run_model.log"
+                # Recorded before it starts, in its own folder, so Review
+                # Results lists it — and a crash or closed tab leaves a run
+                # reported INTERRUPTED rather than no trace at all.
+                project_for_runs = _project_for_runs()
+                entry = _registry_entry_for_config(config_path)
+                run_workspace = workspace_dir.as_posix()
+                run_dir = _begin_page_run(
+                    run_id=workspace_dir.name,
+                    workspace=run_workspace,
+                    project_name=project_for_runs["name"],
+                    dataset=ds,
+                    task=task_choice,
+                    model_key=model,
+                    model_display=getattr(entry, "model_display", None),
+                    config_path=config_path,
+                    seed=st.session_state.get("run_seed", 0),
+                    device=st.session_state.get("selected_device", "cpu"),
+                    command=[str(part) for part in command],
+                )
+                # The next run is a new run: the command on screen gets a
+                # fresh id on the next rerun.
+                direct_runs.release_run_id(st.session_state, key=RUN_MODEL_RESERVED_ID_KEY)
                 result = run_command_with_progress(command=command, cwd=REPO_ROOT, log_path=log_path, steps=[(5, "Initialize"), (10, "Check dataset"), (20, "Load config"), (30, "Start BatteryML run"), (70, "Training/evaluation running"), (90, "Collect outputs"), (100, "Done")], container=run_progress_host)
+                _finish_page_run(
+                    run_dir,
+                    result,
+                    workspace=run_workspace,
+                    dataset=ds,
+                    task=task_choice,
+                    model_key=model,
+                    config_path=config_path,
+                )
                 st.session_state["last_run_status"] = "success" if result["success"] else "failed"
                 st.session_state["last_run_time"] = result["elapsed"]
                 st.session_state["last_run_code"] = result["return_code"]
