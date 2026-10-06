@@ -8,6 +8,12 @@ this check guards:
 * ``--train`` and ``--eval`` are mandatory — without them BatteryML prints the
   workspace path and exits.
 
+It also guards the download fix: the wrapper must install
+``batteryml_web/core/safe_download.download_file`` before it hands over to
+``bin/batteryml.py`` (upstream's version leaves 0-byte or truncated files that
+later runs skip), and that function must still accept upstream's parameters.
+Read from the source with ``ast``; nothing is imported or downloaded.
+
 Inspecting ``--help`` only. This check never trains, never evaluates, never
 touches ``data/`` and never creates a workspace.
 """
@@ -15,6 +21,7 @@ touches ``data/`` and never creates a workspace.
 from __future__ import annotations
 
 import argparse
+import ast
 import re
 import subprocess
 import sys
@@ -41,6 +48,56 @@ FORBIDDEN_RUN_FLAGS = ("--config",)
 _IMPORT_FAILURE_RE = re.compile(r"ModuleNotFoundError|ImportError|No module named", re.IGNORECASE)
 
 HELP_TIMEOUT_S = 120
+
+SAFE_DOWNLOAD = Path("batteryml_web") / "core" / "safe_download.py"
+UPSTREAM_DOWNLOAD = Path("batteryml") / "preprocess" / "download.py"
+
+
+def _function_params(path: Path, name: str) -> list[str] | None:
+    """Positional-or-keyword parameter names of a top-level function, or None."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return [arg.arg for arg in node.args.args]
+    return None
+
+
+def _download_wiring_problems(root: Path) -> tuple[list[str], dict[str, Any]]:
+    """Problems with the safe-download replacement, from source alone."""
+    problems: list[str] = []
+    evidence: dict[str, Any] = {}
+    for required in (SAFE_DOWNLOAD, UPSTREAM_DOWNLOAD):
+        if not (root / required).exists():
+            problems.append(f"{required.as_posix()} does not exist")
+    if problems:
+        return problems, evidence
+
+    calls = [
+        (node.lineno, ast.unparse(node.func))
+        for node in ast.walk(ast.parse((root / WRAPPER).read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call)
+    ]
+    install = [line for line, name in calls if name == "install_safe_download"]
+    handover = [line for line, name in calls if name == "runpy.run_path"]
+    evidence["install_safe_download_lines"] = install
+    evidence["run_path_lines"] = handover
+    if not install or not handover or min(install) > min(handover):
+        problems.append(
+            f"{WRAPPER.as_posix()} does not call install_safe_download() before "
+            "runpy.run_path(), so `download` would use upstream's download_file, "
+            "which leaves 0-byte or truncated files behind"
+        )
+
+    ours = _function_params(root / SAFE_DOWNLOAD, "download_file")
+    upstream = _function_params(root / UPSTREAM_DOWNLOAD, "download_file")
+    evidence["safe_download_params"] = ours
+    evidence["upstream_download_params"] = upstream
+    if ours is None or upstream is None or ours != upstream:
+        problems.append(
+            f"download_file in {SAFE_DOWNLOAD.as_posix()} takes {ours} but upstream's "
+            f"takes {upstream}; bin/batteryml.py calls it with upstream's parameters"
+        )
+    return problems, evidence
 
 
 def _run_help(root: Path, subcommand: list[str]) -> dict[str, Any]:
@@ -202,6 +259,19 @@ def check() -> CheckResult:
             "documented positional-config command block"
         )
 
+    download_problems, download_evidence = _download_wiring_problems(root)
+    evidence["download_wiring"] = download_evidence
+    if download_problems:
+        return CheckResult(
+            CHECK_ID,
+            CHECK_NAME,
+            FAIL,
+            "The dataset download fix is not wired in: "
+            + "; ".join(download_problems)
+            + ". See batteryml_web/core/safe_download.py.",
+            evidence,
+        )
+
     if problems:
         return CheckResult(
             CHECK_ID,
@@ -219,7 +289,8 @@ def check() -> CheckResult:
         CHECK_NAME,
         PASS,
         f"`run` takes `{REQUIRED_RUN_POSITIONAL}` positionally and accepts "
-        f"{', '.join(REQUIRED_RUN_FLAGS)}; no --config option is offered.",
+        f"{', '.join(REQUIRED_RUN_FLAGS)}; no --config option is offered; `download` "
+        "uses the safe downloader (no partial files).",
         evidence,
     )
 

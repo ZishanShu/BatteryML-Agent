@@ -30,12 +30,27 @@ def main():
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(2)
 
+    # Replace upstream's download_file, which leaves a 0-byte or truncated
+    # file behind on any failure and then skips it on the next run. Must
+    # happen before run_path: bin/batteryml.py binds the name when it imports
+    # batteryml.preprocess. Upstream files are not modified (CLAUDE.md §4);
+    # see batteryml_web/core/safe_download.py.
+    from batteryml_web.core.safe_download import DownloadError, install_safe_download
+
+    install_safe_download()
+
     cli_path = repo_root / "bin" / "batteryml.py"
 
     # Preserve user-provided CLI arguments.
     sys.argv = [str(cli_path)] + sys.argv[1:]
 
-    runpy.run_path(str(cli_path), run_name="__main__")
+    try:
+        runpy.run_path(str(cli_path), run_name="__main__")
+    except DownloadError as exc:
+        # The message names the file, the URL and what to do; a traceback
+        # through runpy would only bury it.
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
