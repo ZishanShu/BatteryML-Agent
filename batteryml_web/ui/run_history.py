@@ -417,8 +417,17 @@ def _render_scientific_views(manifest: Dict[str, Any]) -> None:
             "to visualize."
         )
         return
+    chosen = str(files[0])
+    if len(files) > 1:
+        # Never silently "the first": a run with several artifacts asks.
+        picked = st.selectbox(
+            "Prediction artifact", [str(f) for f in files],
+            key=f"history_artifact::{manifest.get('run_id')}",
+        )
+        if picked in [str(f) for f in files]:
+            chosen = str(picked)
     try:
-        views = load_view(files[0])
+        views = load_view(chosen)
     except Exception as exc:  # noqa: BLE001 - a display path must not break a result
         st.warning(
             f"The predictions artifact could not be read "
@@ -427,7 +436,7 @@ def _render_scientific_views(manifest: Dict[str, Any]) -> None:
         return
 
     if views["schema"] in SCALAR_SCHEMAS:
-        render_rul_figures(views["rul"])
+        render_rul_figures(views["rul"], placement="history")
         # Only the cycle-wise schema. A scalar per-cell RUL result used to
         # reach this too: the view refused itself, but the renderer still
         # drew a disclosure headed "Cycle-wise RUL curve" to say so, and a
@@ -439,7 +448,7 @@ def _render_scientific_views(manifest: Dict[str, Any]) -> None:
             render_rul_cycle_figure(views["rul_cycles"])
         render_prediction_table(views["rul"])
     elif views["schema"] == SOH_SCHEMA:
-        render_soh_figures(views["soh"])
+        render_soh_figures(views["soh"], placement="history")
         render_prediction_table(views["soh"])
     elif views["schema"] == TRAJECTORY_SCHEMA:
         render_trajectory_figure(views["trajectory"])
@@ -469,47 +478,147 @@ def _figure(draw) -> Any:
     return figure
 
 
-def render_rul_figures(view: Dict[str, Any]) -> None:
+def _artifact_scope(view: Dict[str, Any], placement: str) -> str:
+    """A widget-key scope naming exactly one artifact revision and one placement.
+
+    Run A and run B never share a key, so a cell or zoom choice made on A
+    cannot survive as the wrong cell on B; a rewritten artifact (size or
+    mtime changed) is a new scope too. The placement keeps the Run History
+    detail and the Predictions tab — both on Review Results — apart.
+    """
+    path = str(view.get("artifact_path") or "")
+    revision = ""
+    if path:
+        try:
+            stat = Path(path).stat()
+            revision = f"{stat.st_size}:{stat.st_mtime_ns}"
+        except OSError:
+            revision = "missing"
+    return f"{placement}::{path}::{revision}"
+
+
+def _figure_badge(view: Dict[str, Any]) -> Optional[str]:
+    """``smoke run · not benchmark performance`` when run.json says so."""
+    path = view.get("artifact_path")
+    if not path:
+        return None
+    from ..agent.artifact_provenance import artifact_provenance
+    from ..viz.result_export import SMOKE_BADGE
+
+    try:
+        record = artifact_provenance(path, hash_files=False)
+    except FileNotFoundError:
+        return None
+    return SMOKE_BADGE if record.get("smoke") is True else None
+
+
+ZOOM_OPTIONS = ("Full range", "Zoomed view")
+
+
+def _zoom_choice(scope: str) -> bool:
+    """True for the zoomed viewport. Full range is the default and always one click away."""
+    choice = st.radio(
+        "Axis range", ZOOM_OPTIONS, index=0, horizontal=True,
+        key=f"viz_zoom::{scope}",
+        help="Zoomed view changes only the visible range; no value is clipped, "
+             "and the figure states how many points fall outside it.",
+    )
+    return choice == ZOOM_OPTIONS[1]
+
+
+def _show(panel: Dict[str, Any]) -> None:
+    st.pyplot(panel["figure"], clear_figure=True)
+
+
+def _render_export_action(view: Dict[str, Any], scope: str, *, cell_id: Optional[str]) -> None:
+    """Compact: the exact CLI command, and the same files as a zip on request."""
+    path = view.get("artifact_path")
+    if not path:
+        return
+    from ..viz.result_export import ExportError, build_export, export_command, zip_bytes
+
+    with st.expander("Export figures", expanded=False):
+        st.caption(
+            "SVG and PNG panels, the exact plotted values (CSV) and a provenance "
+            "record (figure_sources.json), built from this artifact only."
+        )
+        st.code(export_command(path, cell_id=cell_id), language="bash")
+        if st.button("Prepare figure package", key=f"viz_export::{scope}"):
+            try:
+                # What actually happened, as a structured record. No command was
+                # run here, so none is written: the run's own command comes from
+                # its run.json inside build_export.
+                result = build_export(
+                    path, cell_id=cell_id, dpi=300.0,
+                    invocation={"interface": "website", "action": "Prepare figure package",
+                                "artifact": str(path), "cell_id": cell_id, "dpi": 300.0},
+                )
+            except ExportError as exc:
+                st.error(str(exc))
+                return
+            st.download_button(
+                "Download figure package (.zip)", zip_bytes(result),
+                file_name=f"figures_{Path(str(path)).stem}.zip",
+                mime="application/zip", on_click="ignore",
+                key=f"viz_export_download::{scope}",
+            )
+
+
+def _granularity_caption(view: Dict[str, Any]) -> str:
+    target = view.get("target") or {}
+    parts = [
+        f"{target.get('quantity', 'Target')} in {target.get('unit', 'unit not recorded')}",
+        f"{int(view.get('count') or 0):,} plotted point(s)"
+        + (f" from {len(set(view.get('cell_ids') or []))} cell(s)" if view.get("cell_ids") else ""),
+        str(target.get("granularity") or ""),
+    ]
+    return " · ".join(part for part in parts if part)
+
+
+def render_rul_figures(view: Dict[str, Any], *, placement: str = "result") -> None:
     """Observed-vs-predicted and residuals, or an explicit refusal.
 
     A run whose artifact lacks the values gets the reason, never a chart
-    drawn from something else.
+    drawn from something else. The figures come from
+    :func:`batteryml_web.viz.result_figures.build_panels` — the same function
+    the export uses — so what is shown is what is exported.
     """
     if not view.get("available"):
         st.info(str(view.get("reason") or "This visualization is unavailable."))
         return
+    from ..viz.result_figures import FigureDataError, build_panels
+
+    target = view.get("target") or {}
+    st.caption(_granularity_caption(view))
+    if target.get("definition"):
+        st.caption(str(target["definition"]))
     if view.get("note"):
         st.caption(str(view["note"]))
 
-    observed = view["observed"]
-    predicted = view["predicted"]
-    residuals = view["residuals"]
-
+    scope = _artifact_scope(view, placement)
+    zoomed = _zoom_choice(scope)
+    try:
+        panels = build_panels(
+            view, saved_metrics=view.get("saved_metrics"), badge=_figure_badge(view),
+            include_zoom=zoomed,
+        )
+    except FigureDataError as exc:
+        st.info(str(exc))
+        return
+    suffix = "_zoom" if zoomed else ""
     left, right = st.columns(2)
     with left:
-        st.caption("Observed vs predicted")
-
-        def _scatter(axes) -> None:
-            axes.scatter(observed, predicted, s=18, alpha=0.75)
-            low = min(min(observed), min(predicted))
-            high = max(max(observed), max(predicted))
-            # The reference line is y = x: perfect agreement, drawn from the
-            # data's own range rather than a fixed scale.
-            axes.plot([low, high], [low, high], linestyle="--", linewidth=1)
-            axes.set_xlabel("Observed")
-            axes.set_ylabel("Predicted")
-
-        st.pyplot(_figure(_scatter), clear_figure=True)
+        _show(panels["parity" + suffix])
     with right:
-        st.caption("Residuals (predicted − observed)")
-
-        def _residuals(axes) -> None:
-            axes.scatter(observed, residuals, s=18, alpha=0.75)
-            axes.axhline(0.0, linestyle="--", linewidth=1)
-            axes.set_xlabel("Observed")
-            axes.set_ylabel("Residual")
-
-        st.pyplot(_figure(_residuals), clear_figure=True)
+        _show(panels["residuals" + suffix])
+    if zoomed:
+        st.caption(
+            f"Zoomed view: {panels['parity_zoom']['meta']['outside']:,} point(s) lie "
+            "outside the parity viewport and "
+            f"{panels['residuals_zoom']['meta']['outside']:,} outside the residual "
+            "viewport. They are still in the data and in the full-range view."
+        )
+    _render_export_action(view, scope, cell_id=None)
 
 
 def render_rul_cycle_figure(view: Dict[str, Any], *, max_cells: int = 6) -> None:
@@ -561,79 +670,93 @@ def render_rul_cycle_figure(view: Dict[str, Any], *, max_cells: int = 6) -> None
     st.pyplot(_figure(_curves), clear_figure=True)
 
 
-def render_soh_figures(view: Dict[str, Any], *, max_cells: int = 6) -> None:
-    """SOH against cycle, observed vs estimated, plus the range diagnostic.
+def render_soh_figures(view: Dict[str, Any], *, placement: str = "result") -> None:
+    """One selected cell's SOH across observed cycles, parity and residuals.
 
-    A cycle-level result is read per cell: a scatter of all samples answers
-    "is the model calibrated", but only a per-cell curve answers "does it
-    track degradation". Both are drawn, from the stored arrays alone.
+    The cycle panel shows **one** cell at a time — six overlaid cells with a
+    two-entry legend could not say which line was which. The default cell is
+    the first ID in ascending order, a rule that does not look at prediction
+    error; the selector lists only cells this artifact really holds, and its
+    key is scoped to this artifact, so a cell picked on another run never
+    carries over. Parity and residuals use every plotted sample. All panels
+    come from ``build_panels``, the export's own function.
 
-    The diagnostic below them is the honest part. A ratio below 0 or well
-    above 1 is physically impossible, and an average error can hide a few of
-    them completely. They are *counted and shown*, never clipped away: the
-    values plotted are the values the metrics came from.
+    The range diagnostic below is the honest part: estimates far outside the
+    usual range are counted and shown, never clipped away.
     """
     if not view.get("available"):
         st.info(str(view.get("reason") or "This visualization is unavailable."))
         return
+    from ..viz.result_figures import (
+        DEFAULT_CELL_RULE, PER_CELL_NOTE, FigureDataError, build_panels,
+        cell_choices, per_cell_errors,
+    )
+
+    target = view.get("target") or {}
+    st.caption(_granularity_caption(view))
+    if target.get("definition"):
+        st.caption(str(target["definition"]))
     if view.get("note"):
         st.caption(str(view["note"]))
 
-    observed = view["observed"]
-    predicted = view["predicted"]
-    cell_ids = view.get("cell_ids") or []
-    cycles = view.get("cycle_indices") or []
-    st.caption(
-        f"{view['count']:,} cycle-level sample(s) across "
-        f"{view.get('n_cells', 0)} test cell(s)."
-    )
+    scope = _artifact_scope(view, placement)
+    choices = cell_choices(view)
+    chosen = st.selectbox(
+        "Cell", choices, index=0, key=f"viz_cell::{scope}",
+        help=f"Default: {DEFAULT_CELL_RULE}.",
+    ) if choices else None
+    if chosen not in choices:
+        chosen = choices[0] if choices else None
+    zoomed = _zoom_choice(scope)
+    try:
+        panels = build_panels(
+            view, cell_id=chosen, saved_metrics=view.get("saved_metrics"),
+            badge=_figure_badge(view), include_zoom=zoomed,
+        )
+    except FigureDataError as exc:
+        st.info(str(exc))
+        return
 
+    suffix = "_zoom" if zoomed else ""
+    cell_panel = panels.get("soh_cycle" + suffix)
+    duplicates = (cell_panel or {}).get("meta", {}).get("duplicates") or []
     left, right = st.columns(2)
     with left:
-        st.caption("Observed vs estimated SOH (ratio)")
-
-        def _scatter(axes) -> None:
-            axes.scatter(observed, predicted, s=8, alpha=0.4)
-            low = min(min(observed), min(predicted))
-            high = max(max(observed), max(predicted))
-            axes.plot([low, high], [low, high], linestyle="--", linewidth=1)
-            axes.set_xlabel("Observed SOH (ratio)")
-            axes.set_ylabel("Estimated SOH (ratio)")
-
-        st.pyplot(_figure(_scatter), clear_figure=True)
+        if cell_panel is not None:
+            _show(cell_panel)
     with right:
-        st.caption(f"SOH across cycles, first {max_cells} test cell(s)")
-
-        def _per_cell(axes) -> None:
-            # Insertion order, so the cells shown are the first the run
-            # actually evaluated rather than an alphabetical sample of them.
-            selected: List[str] = []
-            for cell in cell_ids:
-                if cell not in selected:
-                    selected.append(cell)
-                if len(selected) >= max_cells:
-                    break
-            for position, cell in enumerate(selected):
-                rows = [i for i, name in enumerate(cell_ids) if name == cell]
-                rows.sort(key=lambda i: cycles[i])
-                axes.plot(
-                    [cycles[i] for i in rows], [observed[i] for i in rows],
-                    linewidth=1,
-                    label="observed" if position == 0 else None,
-                )
-                axes.plot(
-                    [cycles[i] for i in rows], [predicted[i] for i in rows],
-                    linewidth=1, linestyle="--",
-                    label="estimated" if position == 0 else None,
-                )
-            axes.set_xlabel("Cycle")
-            axes.set_ylabel("SOH (ratio)")
-            if selected:
-                axes.legend(loc="best", fontsize="small")
-
-        st.pyplot(_figure(_per_cell), clear_figure=True)
+        _show(panels["parity" + suffix])
+    left, right = st.columns(2)
+    with left:
+        _show(panels["residuals" + suffix])
+    with right:
+        st.caption(
+            "SOH estimates across observed cycles: each point is an estimate made "
+            "at that recorded cycle, joined in cycle order for one cell only. It is "
+            "not a forecast; nothing is smoothed or interpolated."
+        )
+        if chosen is not None and choices and chosen == choices[0]:
+            st.caption(f"Cell shown by default: {DEFAULT_CELL_RULE}.")
+        if target.get("residual_note"):
+            st.caption(str(target["residual_note"]))
+        if zoomed:
+            st.caption(
+                f"Zoomed view: {panels['parity_zoom']['meta']['outside']:,} of "
+                f"{int(view.get('count') or 0):,} point(s) lie outside the parity "
+                "viewport; they are still in the data and in the full-range view."
+            )
+    if duplicates:
+        st.warning(
+            f"Cell {chosen} has repeated cycle records "
+            + ", ".join(f"cycle {d['cycle_index']} ×{d['count']}" for d in duplicates)
+            + ". They are drawn as stored, not averaged."
+        )
+    with st.expander("Per-cell error summary (display diagnostic)", expanded=False):
+        st.caption(PER_CELL_NOTE)
+        st.dataframe(per_cell_errors(view), hide_index=True, use_container_width=True)
 
     render_soh_range_diagnostics(view)
+    _render_export_action(view, scope, cell_id=chosen)
 
 
 def render_soh_range_diagnostics(view: Dict[str, Any]) -> None:
@@ -654,7 +777,7 @@ def render_soh_range_diagnostics(view: Dict[str, Any]) -> None:
         ("Below 0", summary.get("below_zero", 0)),
         ("Above 1.0", summary.get("above_one", 0)),
         ("Above 1.1", summary.get("above_implausible", 0)),
-        ("Outside range", summary.get("out_of_range", 0)),
+        ("Outside [0, 1.0]", summary.get("out_of_range", 0)),
     )
     for column, (label, value) in zip(columns, figures):
         with column:
@@ -665,7 +788,7 @@ def render_soh_range_diagnostics(view: Dict[str, Any]) -> None:
             f"Estimated SOH spans {low:.4f} to {high:.4f} across "
             f"{int(summary['count']):,} sample(s); "
             f"{summary.get('fraction_out_of_range', 0.0) * 100:.2f}% lie "
-            "outside (0, 1.0]."
+            "outside [0, 1.0] (below 0, or above the reference capacity)."
         )
     st.caption(str(summary.get("note") or ""))
 
@@ -992,14 +1115,14 @@ def render_predictions_panel(manifest: Dict[str, Any]) -> None:
             use_container_width=True,
         )
         if preview["schema"] in SCALAR_SCHEMAS and preview["rul"]:
-            render_rul_figures(preview["rul"])
+            render_rul_figures(preview["rul"], placement="predictions")
             # As above: the heading belongs only to an artifact that has the
             # curve.
             if preview["schema"] == RUL_CYCLEWISE_SCHEMA:
                 render_rul_cycle_figure(preview.get("rul_cycles") or {})
             render_prediction_table(preview["rul"])
         elif preview["schema"] == SOH_SCHEMA and preview.get("soh"):
-            render_soh_figures(preview["soh"])
+            render_soh_figures(preview["soh"], placement="predictions")
             render_prediction_table(preview["soh"])
         elif preview["schema"] == TRAJECTORY_SCHEMA and preview["trajectory"]:
             render_trajectory_figure(preview["trajectory"])

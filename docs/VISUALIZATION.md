@@ -225,3 +225,108 @@ validator on the hue order before it ships; do not eyeball it.
 * `[ASSUMED]` — the layout: margins, the equal-aspect parity box, and the
   per-cell figure's height scaling were chosen by calculation, not by looking at
   a rendered figure. Open the four PNGs and check for clipped labels.
+
+---
+
+## Website result figures and `scripts/export_result_figures.py`
+
+Implements `VIZ-09` … `VIZ-14` (`docs/SPEC.md`). Separate from the offline
+`viz.cli results` route above: that one draws the four contracted RUL figures
+from an artifact plus its config; this one is what Review Results, the
+Predictions tab and the Agent Workflow page show, and its export.
+
+### One data path
+
+```
+selected run (run.json) ─► exact artifact path
+  ─► agent/results.load_prediction_payload        (CPU-safe unpickler, the only reader)
+  ─► agent/result_views.build_rul_view / build_soh_view
+        _invert: recorded label_transformation.inverse_transform, applied once;
+                 status inverted / none_recorded / metadata_missing / inverse_failed
+                 (the last two refuse a physical-unit view instead of guessing)
+        _paired_series: one finite mask over observed AND predicted; omitted rows counted
+        target_spec: quantity + unit from the recorded label annotator
+  ─► viz/result_figures.build_panels              (panel data + matplotlib Figure)
+        ├─► ui/run_history.render_*_figures      st.pyplot — the page
+        └─► viz/result_export.build_export       SVG/PNG/CSV/JSON/MD — the export
+```
+
+`build_panels` returns the figure *and* the exact arrays given to its builder,
+so `plotted_samples.csv` is what was drawn, not a recomputation.
+
+### What each panel means
+
+| Panel | x | y | One point/line | Units |
+| --- | --- | --- | --- | --- |
+| `soh_cycle_<cell>` | recorded `cycle_index` | observed (solid) and estimated (dashed) SOH | one recorded cycle of **one** cell, in recorded cycle order | ratio (capacity / reference capacity) |
+| `parity` | observed target | predicted target | one stored row: a cell (lifetime) or a cell × cycle (SOH) | lifetime: cycles; SOH: ratio |
+| `residuals` | observed target | predicted − observed | as parity | same unit; SOH ×100 = percentage points |
+| `*_zoom` | as above | as above | same points; viewport only | as above |
+
+* **Lifetime, not RUL.** `RULLabelAnnotator` counts cycles from the first
+  recorded cycle to end of life, so a whole-cell value is the cell's cycle
+  life. The axis says "Battery lifetime (cycles)". Only a genuine cycle-wise
+  RUL artifact is called remaining useful life.
+* **Default SOH cell** = first cell ID in ascending text order among the
+  plotted samples. Independent of error; recorded in every export. Another
+  real cell can be chosen in the page or with `--cell-id`.
+* **Zoom** = 1st–99th percentile of the plotted values, padded 5 %. It changes
+  only the visible range; the count of points outside is printed on the
+  figure and recorded. The full-range view is the default.
+* **Per-cell summary** = each cell's mean absolute and RMS residual over its
+  plotted samples: a display diagnostic. It weights cells equally; the saved
+  scores weight samples equally. Neither replaces the other.
+* **SOH > 1.0** is shown as stored and counted; it is not called invalid.
+  Below 0 is counted as not physical.
+* **Non-finite rows** are dropped from the figures through one shared mask and
+  counted; the saved metrics are never recomputed on the reduced set.
+
+### Export command
+
+```bash
+# read-only: schema, counts, cell IDs, transformation, smoke evidence
+python -m scripts.export_result_figures --artifact <EXACT.pkl> --inspect
+python -m scripts.export_result_figures --artifact <EXACT.pkl> --list-cells
+
+# write the export into a NEW directory (runs/ is git-ignored)
+python -m scripts.export_result_figures \
+  --artifact <EXACT.pkl> \
+  --output runs/figure_exports/<NEW_DIRECTORY> \
+  [--cell-id <REAL_CELL_ID>] [--dpi 300]
+```
+
+Writes `parity`, `parity_zoom`, `residuals`, `residuals_zoom` (and, for
+cycle-level SOH, `soh_cycle_<cell>`, `soh_cycle_<cell>_zoom`) as `.svg` +
+`.png`; `plotted_samples.csv`; `soh_cycle_<cell>.csv` and `per_cell_errors.csv`
+for SOH; `figure_sources.json`; `figure_notes.md`. It refuses an output
+directory that exists and is not empty, an unknown cell ID, and any artifact
+that is not a scalar-per-sample result. The page's **Export figures** expander
+shows the same command and offers the same files as a zip.
+
+`figure_sources.json` records the artifact path and SHA-256, everything
+`run.json` and the `config_<ts>.yaml` copy beside it record (run id, model,
+split, seed, smoke flag, epochs override), the transformation chain and its
+fitted parameters, units, counts, the selected cell and rule, every panel's
+limits and outside counts, the saved metrics verbatim, the export command,
+the git commit (with an uncommitted-changes flag) and library versions. No
+environment variables are read.
+
+**Provenance trap, recorded not fixed:** `Pipeline.train` copies the
+*original* config before applying `--epochs`, so a 1-epoch smoke run's config
+copy still shows the full epoch count. Only `run.json` records the override.
+A legacy CLI workspace has no `run.json`; its smoke status is "not recorded",
+and a directory named `..._smoke_...` is not taken as evidence.
+
+### Verification status
+
+* `[VERIFIED]` here, synthetic fixtures only: `tests/test_result_figures.py`
+  (28 tests, two of them proved non-vacuous by mutation), the export CLI on
+  pickled fixtures built with real BatteryML LogScale/ZScore transformations,
+  and a Chromium check of Review Results with two synthetic runs (desktop and
+  720 px).
+* Not inspected here: any real artifact. The MATR Ridge SOH and MATR CNN
+  smoke artifacts live only on the server; use `--inspect` there first.
+* Layout change shared with the offline route: `style.add_titles` now pads the
+  title 18 pt above a subtitle (was 14 pt, which let them touch).
+* The offline `viz/loaders.py` still unpickles with plain `pickle.load`, not
+  the CPU-safe loader; a CUDA-origin artifact needs a GPU there. Not changed.

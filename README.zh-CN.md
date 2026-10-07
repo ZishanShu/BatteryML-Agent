@@ -619,6 +619,20 @@ runs/web_projects/<project>/quickstart/<run_id>/   Run MATR Demo
 python -c "import pickle; print(pickle.load(open('runs/cli_matr_xgb/predictions_seed_0_TIMESTAMP.pkl', 'rb'))['scores'])"
 ```
 
+如果要把某个 `.pkl` 的结果图导出用于论文——分开的 SVG 和 PNG 图、实际绘制数值的 CSV，
+以及记录每个数字来源的 `figure_sources.json`——先查看它包含什么（`--inspect` 不写任何文件），
+再导出到一个**新的**文件夹。这条命令只画图，从不训练或评估。
+
+```bash
+python -m scripts.export_result_figures --artifact runs/cli_matr_xgb/predictions_seed_0_TIMESTAMP.pkl --inspect
+python -m scripts.export_result_figures --artifact runs/cli_matr_xgb/predictions_seed_0_TIMESTAMP.pkl --output runs/figure_exports/cli_matr_xgb
+```
+
+导出的文件夹包含 `parity.svg`/`.png`、`residuals.svg`/`.png`、它们的 `_zoom` 版本、
+`plotted_samples.csv`、`figure_sources.json` 和 `figure_notes.md`；SOH 结果还会有
+`soh_cycle_<cell>.svg`/`.png`/`.csv` 和 `per_cell_errors.csv`。网站中每个结果下方的
+**Export figures** 提供同样的导出。详见 `docs/VISUALIZATION.md`。
+
 ---
 
 ## 15. 可选：连接 LLM 助手

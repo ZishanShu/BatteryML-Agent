@@ -159,3 +159,17 @@ The numbers mean nothing; they exist so the arrays have a length.
 | `soh_scalar_payload` | `soh_scalar` |
 | `trajectory_payload` | `trajectory`, never `rul_cyclewise` |
 | `trajectory_payload_with_cycle_index` | `trajectory` — the adversarial case, where every non-shape signal points at cycle-wise RUL |
+
+## Rows that cannot be plotted, and what a value is
+
+Two rules added with the website figure rework (`docs/VISUALIZATION.md`):
+
+* A single NaN or inf no longer makes a result "unknown". The schema is
+  decided from the row shape; the views then drop rows whose observed **or**
+  predicted value is non-finite through one shared mask, report how many, and
+  filter cell and cycle identity with the same mask.
+* Every view carries `target`: the quantity and unit read from the recorded
+  label annotator — "Battery lifetime (cycles)" for `RULLabelAnnotator`,
+  "SOH (ratio)" for the SOH annotators, "Remaining useful life (cycles)" only
+  for `rul_cyclewise`. Nothing is rescaled for display.
+

@@ -123,20 +123,24 @@ SOH_IMPLAUSIBLE_HIGH = 1.1
 #: the metrics were computed from and what the artifact holds; this is a
 #: reading of them, and reading is all it is.
 RANGE_NOTE = (
-    "Diagnostic only. SOH is a ratio, so a physically meaningful estimate "
-    "lies at or below 1.0 and above 0. Predictions outside that range are "
-    "counted here and left exactly as the model produced them: nothing is "
-    "clipped, rescaled or excluded, and the reported metrics are computed "
+    "Diagnostic only. SOH is a ratio to the recorded reference capacity: a "
+    "value below 0 is not physical, while a value above 1.0 can occur when a "
+    "later cycle exceeds the reference and is not by itself invalid. Values "
+    "are counted here and left exactly as the model produced them: nothing "
+    "is clipped, rescaled or excluded, and the reported metrics are computed "
     "from these same values."
 )
 
 
-def _to_list(values: Any) -> Optional[List[float]]:
+def _to_list(values: Any, *, finite_only: bool = True) -> Optional[List[float]]:
     """A flat list of floats from a tensor, array or sequence.
 
-    Returns None for anything that is not a 1-D sequence of finite numbers,
-    so a structure this module does not understand produces no figure rather
-    than a misleading one.
+    Returns None for anything that is not a 1-D sequence of numbers, so a
+    structure this module does not understand produces no figure rather than
+    a misleading one. With ``finite_only`` (the default) a single NaN or inf
+    also returns None; the view builders pass ``finite_only=False`` and then
+    omit non-finite *rows* through one shared mask, counted and reported
+    (:func:`_paired_series`), instead of hiding the whole result.
     """
     import math
 
@@ -173,10 +177,233 @@ def _to_list(values: Any) -> Optional[List[float]]:
         if isinstance(item, bool) or not isinstance(item, (int, float)):
             return None
         number = float(item)
-        if not math.isfinite(number):
+        if finite_only and not math.isfinite(number):
             return None
         flat.append(number)
     return flat
+
+
+#: The label transformation was recorded and inverted exactly once.
+TRANSFORM_INVERTED = "inverted"
+#: The bundle records that no label transformation was used, so the stored
+#: values already are the target values.
+TRANSFORM_NONE = "none_recorded"
+#: The bundle does not say whether a transformation was used. Nothing is
+#: plotted in physical units from such an artifact.
+TRANSFORM_MISSING = "metadata_missing"
+#: A transformation is recorded but its inverse raised. The stored values are
+#: in transformed space and are never labelled as physical units.
+TRANSFORM_FAILED = "inverse_failed"
+
+
+def transformation_chain(payload: Optional[Dict[str, Any]]) -> List[str]:
+    """Class names of the recorded label transformation, outermost first.
+
+    A ``SequentialDataTransformation`` is expanded into its members, in the
+    order they were applied. Empty when none is recorded.
+    """
+    if not isinstance(payload, dict):
+        return []
+    transformation = getattr(payload.get("data"), "label_transformation", None)
+    if transformation is None:
+        return []
+    members = getattr(transformation, "transformations", None)
+    if isinstance(members, (list, tuple)) and members:
+        return [type(member).__name__ for member in members]
+    return [type(transformation).__name__]
+
+
+def _invert(values: Any, payload: Dict[str, Any]) -> tuple:
+    """``(values, status, detail)``: the recorded inverse, applied once.
+
+    The single place a label transformation is undone for display. Unlike
+    :func:`_inverse_transform` it never hands back untransformed values as
+    if they were inverted: the status says what happened, and the view
+    builders refuse a physical-unit view for :data:`TRANSFORM_MISSING` and
+    :data:`TRANSFORM_FAILED`.
+    """
+    bundle = payload.get("data")
+    if bundle is None or not hasattr(bundle, "label_transformation"):
+        return values, TRANSFORM_MISSING, (
+            "The saved artifact does not record whether its labels were "
+            "transformed, so the stored values cannot be placed in physical "
+            "units."
+        )
+    transformation = bundle.label_transformation
+    if transformation is None:
+        return values, TRANSFORM_NONE, ""
+    try:
+        return transformation.inverse_transform(values), TRANSFORM_INVERTED, ""
+    except Exception as exc:  # noqa: BLE001 - reported as a refusal, never as data
+        return values, TRANSFORM_FAILED, (
+            f"The recorded label transformation ({type(transformation).__name__}) "
+            f"could not be inverted ({type(exc).__name__}: {exc}). The stored "
+            "values are in transformed space and are not plotted as physical "
+            "units."
+        )
+
+
+def _paired_series(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Observed and predicted target values, paired row by row.
+
+    Returns ``{"ok", "reason", "observed", "predicted", "positions",
+    "total_rows", "omitted_nonfinite", "transform_status"}``. ``positions``
+    are the artifact row numbers of the kept rows, so every other per-row
+    field (cell id, cycle) is filtered with the same mask. A row is omitted
+    only when its observed **or** predicted value is NaN/inf after
+    inversion; the count is reported and the saved metrics are never
+    recomputed on the reduced set.
+    """
+    import math
+
+    out: Dict[str, Any] = {
+        "ok": False, "reason": UNAVAILABLE_MESSAGE, "observed": [],
+        "predicted": [], "positions": [], "total_rows": 0,
+        "omitted_nonfinite": 0, "transform_status": "",
+    }
+    raw_labels = observed_labels(payload)
+    if raw_labels is None:
+        return out
+    observed_raw, status, detail = _invert(raw_labels, payload)
+    out["transform_status"] = status
+    if status in (TRANSFORM_MISSING, TRANSFORM_FAILED):
+        out["reason"] = detail
+        return out
+    predicted_raw, status_p, detail_p = _invert(payload.get("prediction"), payload)
+    if status_p != status:
+        out["reason"] = detail_p or UNAVAILABLE_MESSAGE
+        return out
+    observed = _to_list(observed_raw, finite_only=False)
+    predicted = _to_list(predicted_raw, finite_only=False)
+    if observed is None or predicted is None:
+        return out
+    if len(observed) != len(predicted):
+        out["reason"] = (
+            f"The artifact holds {len(observed)} observed value(s) and "
+            f"{len(predicted)} prediction(s); they cannot be paired."
+        )
+        return out
+    out["total_rows"] = len(observed)
+    keep = [
+        i for i in range(len(observed))
+        if math.isfinite(observed[i]) and math.isfinite(predicted[i])
+    ]
+    out["omitted_nonfinite"] = len(observed) - len(keep)
+    if not keep:
+        out["reason"] = (
+            f"All {len(observed)} row(s) have a non-finite observed or "
+            "predicted value, so nothing can be plotted."
+        )
+        return out
+    out.update(
+        ok=True, reason="",
+        observed=[observed[i] for i in keep],
+        predicted=[predicted[i] for i in keep],
+        positions=keep,
+    )
+    return out
+
+
+def _omission_note(paired: Dict[str, Any]) -> str:
+    omitted = int(paired.get("omitted_nonfinite") or 0)
+    if not omitted:
+        return ""
+    return (
+        f"{omitted} of {paired['total_rows']} row(s) have a non-finite observed "
+        "or predicted value and are not plotted. The saved metrics are shown "
+        "as recorded and were not recomputed without them."
+    )
+
+
+#: What one plotted value is, by target. ``unit`` is the canonical unit of
+#: the stored (inverse-transformed) value; nothing here rescales it.
+TARGET_LIFETIME = "lifetime"
+TARGET_RUL = "rul"
+TARGET_SOH = "soh"
+TARGET_UNKNOWN = "unknown"
+
+
+def target_spec(payload: Optional[Dict[str, Any]], schema: str,
+                *, label_annotator: Optional[str] = None) -> Dict[str, Any]:
+    """What the plotted number *is*, read from what the run recorded.
+
+    Returns ``{"kind", "quantity", "unit", "residual_unit", "granularity",
+    "definition", "reference"}``. ``label_annotator`` is an optional hint
+    from saved provenance (the run's own config copy) for an artifact that
+    predates ``task_metadata``; the artifact's own record wins.
+
+    ``RULLabelAnnotator`` counts cycles from the first recorded cycle until
+    discharge capacity falls to ``eol_soh`` of nominal
+    (``batteryml/label/rul.py``). One such value per cell is that cell's
+    **cycle life**, not the remaining life at some observation cycle, so a
+    whole-cell result is named "Battery lifetime" even though the platform's
+    task is called RUL prediction.
+    """
+    metadata = payload.get("task_metadata") if isinstance(payload, dict) else None
+    metadata = metadata if isinstance(metadata, dict) else {}
+    annotator = str(metadata.get("label_annotator") or label_annotator or "").strip()
+    family = task_family(payload) or _ANNOTATOR_FAMILIES.get(annotator.lower())
+    spec: Dict[str, Any] = {
+        "kind": TARGET_UNKNOWN, "quantity": "Target value",
+        "unit": "unit not recorded", "residual_unit": "unit not recorded",
+        "granularity": "one point per stored row", "definition": "",
+        "reference": "",
+        "residual_note": "",
+        "label_annotator": annotator or None,
+    }
+    if schema in (SOH_SCHEMA, SOH_SCALAR_SCHEMA) or family == _TASK_FAMILY_SOH:
+        mode = str(metadata.get("reference_capacity_mode") or "").strip()
+        spec.update(
+            kind=TARGET_SOH, quantity="SOH",
+            unit="ratio", residual_unit="ratio",
+            residual_note=(
+                "An SOH residual ×100 is in percentage points, not a relative "
+                "percentage error."
+            ),
+            granularity=(
+                "one point per observed cell and cycle"
+                if schema == SOH_SCHEMA else "one point per cell"
+            ),
+            definition=(
+                "SOH is the ratio of a cycle's discharge capacity to the "
+                "recorded reference capacity"
+                + (f" ({mode})." if mode else " (reference mode not recorded).")
+                + " Values above 1.0 can occur when a later cycle exceeds the "
+                "reference; they are shown as stored."
+            ),
+            reference=mode or "not recorded",
+        )
+        return spec
+    if schema == RUL_CYCLEWISE_SCHEMA:
+        spec.update(
+            kind=TARGET_RUL, quantity="Remaining useful life", unit="cycles",
+            residual_unit="cycles",
+            granularity="one point per observed cell and cycle",
+            definition="Remaining useful life at the observed cycle, as stored.",
+        )
+        return spec
+    if annotator.lower() == "rullabelannotator":
+        spec.update(
+            kind=TARGET_LIFETIME, quantity="Battery lifetime", unit="cycles",
+            residual_unit="cycles", granularity="one point per cell",
+            definition=(
+                "RULLabelAnnotator counts cycles from the first recorded cycle "
+                "to end of life (discharge capacity at or below eol_soh of "
+                "nominal), so each value is a cell's cycle life, not remaining "
+                "life at an observation cycle."
+            ),
+        )
+        return spec
+    if family == _TASK_FAMILY_RUL:
+        spec.update(
+            kind=TARGET_LIFETIME, quantity="RUL/lifetime target",
+            unit="cycles", residual_unit="cycles",
+            granularity="one point per cell",
+            definition=(
+                f"Recorded task is RUL; label annotator {annotator or 'not recorded'}."
+            ),
+        )
+    return spec
 
 
 def _inverse_transform(values: Any, payload: Dict[str, Any]) -> Any:
@@ -301,7 +528,9 @@ def schema_evidence(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     }
     if not isinstance(payload, dict):
         return evidence
-    flat = _to_list(payload.get("prediction"))
+    # A NaN row is still a scalar row: it is omitted from figures later,
+    # counted, and must not turn the whole result into "unknown".
+    flat = _to_list(payload.get("prediction"), finite_only=False)
     if flat is None:
         return evidence
     evidence["rows"] = len(flat)
@@ -369,7 +598,7 @@ def detect_schema(payload: Optional[Dict[str, Any]]) -> str:
     prediction = payload.get("prediction")
     if prediction is None:
         return UNKNOWN_SCHEMA
-    flat = _to_list(prediction)
+    flat = _to_list(prediction, finite_only=False)
     if flat is None:
         rows = _trajectory_rows(prediction)
         return TRAJECTORY_SCHEMA if rows is not None else UNKNOWN_SCHEMA
@@ -474,39 +703,43 @@ def build_rul_view(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             "observed-versus-predicted view does not apply to it."
         ))
 
-    raw_labels = observed_labels(payload)
-    if raw_labels is None:
+    if observed_labels(payload) is None:
         return dict(empty, reason=(
             "The saved artifact carries no observed labels, so predictions "
             "cannot be compared against ground truth. Nothing is plotted "
             "rather than plotting predictions against themselves."
         ))
 
-    bundle = payload.get("data")
-    transformed = getattr(bundle, "label_transformation", None) is not None
-    observed = _to_list(_inverse_transform(raw_labels, payload))
-    predicted = _to_list(_inverse_transform(payload.get("prediction"), payload))
-    if observed is None or predicted is None:
-        return empty
-    if len(observed) != len(predicted):
-        return dict(empty, reason=(
-            f"The artifact holds {len(observed)} observed value(s) and "
-            f"{len(predicted)} prediction(s); they cannot be paired."
-        ))
-    if not observed:
-        return empty
+    paired = _paired_series(payload)
+    if not paired["ok"]:
+        return dict(empty, reason=paired["reason"])
+    observed, predicted, keep = paired["observed"], paired["predicted"], paired["positions"]
+    transformed = paired["transform_status"] == TRANSFORM_INVERTED
 
-    # A cycle-wise result names the cell *and* the cycle of every row, because
-    # a bare cell id would repeat and identify nothing.
-    index = cycle_sample_index(payload) if schema == RUL_CYCLEWISE_SCHEMA else None
-    if index is not None and len(index) == len(observed):
+    # Identity, filtered by the same mask as the values. A cycle-wise result
+    # names the cell *and* the cycle of every row, because a bare cell id
+    # would repeat and identify nothing; a whole-cell index names the cell.
+    index = cycle_sample_index(payload)
+    if index is not None and len(index) != paired["total_rows"]:
+        index = None
+    cell_ids: Optional[List[str]] = None
+    if index is not None:
+        cell_ids = [str(index[i]["cell_id"]) for i in keep]
+    if index is not None and schema == RUL_CYCLEWISE_SCHEMA:
         ids: Optional[List[str]] = [
-            f"{record['cell_id']} @ cycle {record['cycle_index']}"
-            for record in index
+            f"{index[i]['cell_id']} @ cycle {index[i]['cycle_index']}" for i in keep
         ]
+    elif index is not None and all(
+        int(index[i]["cycle_index"]) == WHOLE_CELL_CYCLE for i in keep
+    ):
+        ids = list(cell_ids or [])
     else:
-        ids = sample_ids(payload, len(observed))
+        all_ids = sample_ids(payload, paired["total_rows"])
+        ids = [all_ids[i] for i in keep] if all_ids else None
+        if all_ids and cell_ids is None:
+            cell_ids = list(ids or [])
 
+    notes = [TRANSFORM_NOTE if transformed else "", _omission_note(paired)]
     return {
         "available": True,
         "reason": "",
@@ -515,11 +748,18 @@ def build_rul_view(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         # A display of two stored values, not a recomputed score.
         "residuals": [p - o for o, p in zip(observed, predicted)],
         "sample_ids": ids,
+        "cell_ids": cell_ids,
+        "row_positions": keep,
         "count": len(observed),
+        "total_rows": paired["total_rows"],
+        "omitted_nonfinite": paired["omitted_nonfinite"],
         "inverse_transformed": transformed,
-        "note": TRANSFORM_NOTE if transformed else "",
+        "transform_status": paired["transform_status"],
+        "transform_chain": transformation_chain(payload),
+        "note": " ".join(part for part in notes if part),
         "schema": schema,
         "supports_cycle_curve": schema == RUL_CYCLEWISE_SCHEMA,
+        "target": target_spec(payload, schema),
     }
 
 
@@ -566,57 +806,57 @@ def build_rul_cycle_view(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         ))
 
     index = cycle_sample_index(payload) or []
-    raw_labels = observed_labels(payload)
-    if raw_labels is None:
+    if observed_labels(payload) is None:
         return dict(empty, reason=(
             "The saved artifact carries no observed remaining-life labels. "
             "A true-RUL line is never reconstructed from a cell's final "
             "lifetime, so nothing is drawn."
         ))
-    observed = _to_list(_inverse_transform(raw_labels, payload))
-    predicted = _to_list(_inverse_transform(payload.get("prediction"), payload))
-    if observed is None or predicted is None:
-        return empty
-    if not (len(observed) == len(predicted) == len(index)):
+    paired = _paired_series(payload)
+    if not paired["ok"]:
+        return dict(empty, reason=paired["reason"])
+    if paired["total_rows"] != len(index):
         return dict(empty, reason=(
-            f"The artifact holds {len(observed)} observed value(s), "
-            f"{len(predicted)} prediction(s) and {len(index)} sample "
-            "identity record(s); they cannot be paired."
+            f"The artifact holds {paired['total_rows']} observed/predicted "
+            f"pair(s) and {len(index)} sample identity record(s); they cannot "
+            "be paired."
         ))
-    if not observed:
-        return empty
+    observed, predicted, keep = paired["observed"], paired["predicted"], paired["positions"]
 
     # Insertion order, so the cells listed are the ones the run evaluated
-    # first rather than an alphabetical sample of them.
+    # first rather than an alphabetical sample of them. ``j`` indexes the
+    # kept rows; ``keep[j]`` is the artifact row, whose identity it carries.
     order: List[str] = []
     rows_by_cell: Dict[str, List[int]] = {}
-    for position, record in enumerate(index):
-        cell = str(record["cell_id"])
+    for j, position in enumerate(keep):
+        cell = str(index[position]["cell_id"])
         if cell not in rows_by_cell:
             rows_by_cell[cell] = []
             order.append(cell)
-        rows_by_cell[cell].append(position)
+        rows_by_cell[cell].append(j)
 
     cells: List[Dict[str, Any]] = []
     for cell in order:
-        rows = sorted(rows_by_cell[cell], key=lambda i: int(index[i]["cycle_index"]))
+        rows = sorted(rows_by_cell[cell], key=lambda j: int(index[keep[j]]["cycle_index"]))
         cells.append({
             "cell_id": cell,
-            "cycles": [int(index[i]["cycle_index"]) for i in rows],
-            "observed": [observed[i] for i in rows],
-            "predicted": [predicted[i] for i in rows],
+            "cycles": [int(index[keep[j]]["cycle_index"]) for j in rows],
+            "observed": [observed[j] for j in rows],
+            "predicted": [predicted[j] for j in rows],
         })
 
-    bundle = payload.get("data")
-    transformed = getattr(bundle, "label_transformation", None) is not None
+    transformed = paired["transform_status"] == TRANSFORM_INVERTED
+    notes = [RUL_CURVE_NOTE, TRANSFORM_NOTE if transformed else "", _omission_note(paired)]
     return {
         "available": True,
         "reason": "",
         "cells": cells,
         "count": len(observed),
+        "total_rows": paired["total_rows"],
+        "omitted_nonfinite": paired["omitted_nonfinite"],
         "n_cells": len(cells),
         "inverse_transformed": transformed,
-        "note": RUL_CURVE_NOTE + ((" " + TRANSFORM_NOTE) if transformed else ""),
+        "note": " ".join(part for part in notes if part),
     }
 
 
@@ -656,30 +896,29 @@ def build_soh_view(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         ))
     index = cycle_sample_index(payload) or []
 
-    raw_labels = observed_labels(payload)
-    if raw_labels is None:
+    if observed_labels(payload) is None:
         return dict(empty, reason=(
             "The saved artifact carries no observed SOH labels, so estimates "
             "cannot be compared against ground truth. Nothing is plotted "
             "rather than plotting predictions against themselves."
         ))
 
-    bundle = payload.get("data")
-    transformed = getattr(bundle, "label_transformation", None) is not None
-    observed = _to_list(_inverse_transform(raw_labels, payload))
-    predicted = _to_list(_inverse_transform(payload.get("prediction"), payload))
-    if observed is None or predicted is None:
-        return empty
-    if not (len(observed) == len(predicted) == len(index)):
+    paired = _paired_series(payload)
+    if not paired["ok"]:
+        return dict(empty, reason=paired["reason"])
+    if paired["total_rows"] != len(index):
         return dict(empty, reason=(
-            f"The artifact holds {len(observed)} observed value(s), "
-            f"{len(predicted)} prediction(s) and {len(index)} sample "
-            "identity record(s); they cannot be paired."
+            f"The artifact holds {paired['total_rows']} observed/predicted "
+            f"pair(s) and {len(index)} sample identity record(s); they cannot "
+            "be paired."
         ))
-    if not observed:
-        return empty
+    observed, predicted, keep = paired["observed"], paired["predicted"], paired["positions"]
+    transformed = paired["transform_status"] == TRANSFORM_INVERTED
 
-    cell_ids = [record["cell_id"] for record in index]
+    # Every per-row field goes through the same mask as the values.
+    kept_index = [index[i] for i in keep]
+    cell_ids = [record["cell_id"] for record in kept_index]
+    notes = [TRANSFORM_NOTE if transformed else "", _omission_note(paired)]
     return {
         "available": True,
         "reason": "",
@@ -688,17 +927,24 @@ def build_soh_view(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         # A display of two stored values, not a recomputed score.
         "residuals": [p - o for o, p in zip(observed, predicted)],
         "cell_ids": cell_ids,
-        "cycle_indices": [record["cycle_index"] for record in index],
+        "cycle_indices": [record["cycle_index"] for record in kept_index],
         # Readable row labels for the table: a real cell and a real cycle.
         "sample_ids": [
             f"{record['cell_id']} @ cycle {record['cycle_index']}"
-            for record in index
+            for record in kept_index
         ],
+        "row_positions": keep,
         "count": len(observed),
+        "total_rows": paired["total_rows"],
+        "omitted_nonfinite": paired["omitted_nonfinite"],
         "n_cells": len(set(cell_ids)),
         "inverse_transformed": transformed,
-        "note": TRANSFORM_NOTE if transformed else "",
+        "transform_status": paired["transform_status"],
+        "transform_chain": transformation_chain(payload),
+        "note": " ".join(part for part in notes if part),
         "range": soh_range_diagnostics(predicted),
+        "schema": SOH_SCHEMA,
+        "target": target_spec(payload, SOH_SCHEMA),
     }
 
 
@@ -829,6 +1075,44 @@ def prediction_table(view: Dict[str, Any], *, limit: int = 200) -> List[Dict[str
     return rows
 
 
+def attach_artifact_context(
+    view: Optional[Dict[str, Any]],
+    payload: Optional[Dict[str, Any]],
+    artifact: str | Path,
+) -> Optional[Dict[str, Any]]:
+    """Record which exact artifact a view was built from, in place.
+
+    Adds ``artifact_path`` (so the page can name the file and offer the
+    export command for exactly it, and key its widgets to it) and, for an
+    artifact that predates ``task_metadata``, refines ``target`` with the
+    label annotator from the run's own config copy beside the artifact —
+    saved provenance, never a guess. The artifact's own record still wins.
+    """
+    if not isinstance(view, dict):
+        return view
+    view["artifact_path"] = str(artifact)
+    # The scores BatteryML saved, verbatim, for captions and exports. Copied,
+    # never computed: this module has no formula for any of them.
+    scores = payload.get("scores") if isinstance(payload, dict) else None
+    view["saved_metrics"] = {
+        str(name): value for name, value in (scores or {}).items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    } if isinstance(scores, dict) else {}
+    target = view.get("target")
+    if isinstance(target, dict) and not target.get("label_annotator"):
+        from .artifact_provenance import artifact_provenance
+
+        try:
+            hint = artifact_provenance(artifact, hash_files=False).get("label_annotator")
+        except FileNotFoundError:
+            hint = None
+        if hint:
+            view["target"] = target_spec(
+                payload, str(view.get("schema") or ""), label_annotator=str(hint)
+            )
+    return view
+
+
 def load_view(predictions_file: str | Path) -> Dict[str, Any]:
     """Read one predictions artifact and build whatever view it supports.
 
@@ -836,12 +1120,17 @@ def load_view(predictions_file: str | Path) -> Dict[str, Any]:
     a genuine cycle-wise RUL one, so a caller that draws it unconditionally
     still draws nothing where no such curve exists.
     """
-    payload = load_prediction_payload(Path(predictions_file))
+    path = Path(predictions_file)
+    payload = load_prediction_payload(path)
     schema = detect_schema(payload)
-    return {
+    views = {
         "schema": schema,
         "rul": build_rul_view(payload),
         "rul_cycles": build_rul_cycle_view(payload),
         "soh": build_soh_view(payload),
         "trajectory": build_trajectory_view(payload),
+        "artifact_path": str(path),
     }
+    for key in ("rul", "soh"):
+        attach_artifact_context(views[key], payload, path)
+    return views

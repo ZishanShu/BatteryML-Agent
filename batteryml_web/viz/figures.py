@@ -123,6 +123,12 @@ def parity_figure(
     cell_ids: list[str] | None = None,
     n_labelled: int = 3,
     dpi: float = 300.0,
+    limits: tuple[float, float] | None = None,
+    x_label: str | None = None,
+    y_label: str | None = None,
+    marker_area: float | None = None,
+    alpha: float = 1.0,
+    ring: bool = True,
 ) -> Figure:
     """Predicted against measured, on a shared scale with the identity line.
 
@@ -146,6 +152,14 @@ def parity_figure(
         n_labelled: how many extreme points to direct-label. Labels are sparing
             by design; a value on every point goes unread.
         dpi: raster resolution.
+        limits: a shared ``(low, high)`` viewport for both axes. Changes only
+            what is visible — every point is still drawn, none is clipped
+            from the data — so a zoomed view must say how many points fall
+            outside it. Default: the data's own padded range.
+        x_label / y_label: full axis labels; default ``Measured (<unit>)`` /
+            ``Predicted (<unit>)``.
+        marker_area / alpha / ring: marker density for a cloud of thousands
+            of points. Defaults are the single-series spec.
 
     Returns:
         The figure. The caller saves it.
@@ -164,11 +178,14 @@ def parity_figure(
     fig.subplots_adjust(left=0.16, right=0.965, top=0.855, bottom=0.115)
     style_axes(ax, theme)
 
-    low = float(min(true_arr.min(), pred_arr.min()))
-    high = float(max(true_arr.max(), pred_arr.max()))
-    span = high - low
-    pad = span * 0.05 if span > 0 else max(abs(high), 1.0) * 0.05
-    lo, hi = low - pad, high + pad
+    if limits is not None:
+        lo, hi = float(limits[0]), float(limits[1])
+    else:
+        low = float(min(true_arr.min(), pred_arr.min()))
+        high = float(max(true_arr.max(), pred_arr.max()))
+        span = high - low
+        pad = span * 0.05 if span > 0 else max(abs(high), 1.0) * 0.05
+        lo, hi = low - pad, high + pad
     line = np.array([lo, hi], dtype=np.float64)
 
     if band_fraction > 0 and lo > 0:
@@ -197,10 +214,11 @@ def parity_figure(
     )
     ax.scatter(
         true_arr, pred_arr,
-        s=MARKER_AREA_PT2,
+        s=MARKER_AREA_PT2 if marker_area is None else marker_area,
         color=theme.series,
-        edgecolors=theme.surface,
-        linewidths=MARKER_RING_WIDTH_PT,
+        alpha=alpha,
+        edgecolors=theme.surface if ring else "none",
+        linewidths=MARKER_RING_WIDTH_PT if ring else 0.0,
         zorder=3,
     )
 
@@ -232,8 +250,8 @@ def parity_figure(
     ax.set_xlim(lo, hi)
     ax.set_ylim(lo, hi)
     ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel(f"Measured ({unit_label})", color=theme.text_secondary, fontsize=LABEL_SIZE_PT)
-    ax.set_ylabel(f"Predicted ({unit_label})", color=theme.text_secondary, fontsize=LABEL_SIZE_PT)
+    ax.set_xlabel(x_label or f"Measured ({unit_label})", color=theme.text_secondary, fontsize=LABEL_SIZE_PT)
+    ax.set_ylabel(y_label or f"Predicted ({unit_label})", color=theme.text_secondary, fontsize=LABEL_SIZE_PT)
     add_titles(ax, theme, title=title, subtitle=subtitle)
 
     legend = ax.legend(
@@ -257,6 +275,13 @@ def residual_figure(
     unit_label: str = "label",
     annotation: str | None = None,
     dpi: float = 300.0,
+    xlim: tuple[float, float] | None = None,
+    ylim: tuple[float, float] | None = None,
+    x_label: str | None = None,
+    y_label: str | None = None,
+    marker_area: float | None = None,
+    alpha: float = 1.0,
+    ring: bool = True,
 ) -> Figure:
     """Signed error against the measured value, on a zero baseline.
 
@@ -273,6 +298,11 @@ def residual_figure(
         unit_label: the label's unit.
         annotation: verbatim line placed in the axes.
         dpi: raster resolution.
+        xlim / ylim: viewport only (see :func:`parity_figure`'s ``limits``).
+            Default: x autoscaled to every point, y symmetric about zero at
+            1.15 × the largest absolute residual, so extremes stay visible.
+        x_label / y_label / marker_area / alpha / ring: as for
+            :func:`parity_figure`.
 
     Returns:
         The figure.
@@ -297,10 +327,11 @@ def residual_figure(
     )
     ax.scatter(
         true_arr, residual_arr,
-        s=MARKER_AREA_PT2,
+        s=MARKER_AREA_PT2 if marker_area is None else marker_area,
         color=theme.series,
-        edgecolors=theme.surface,
-        linewidths=MARKER_RING_WIDTH_PT,
+        alpha=alpha,
+        edgecolors=theme.surface if ring else "none",
+        linewidths=MARKER_RING_WIDTH_PT if ring else 0.0,
         zorder=3,
     )
 
@@ -315,12 +346,17 @@ def residual_figure(
             color=theme.text_secondary,
         )
 
-    limit = float(np.max(np.abs(residual_arr)))
-    if limit > 0:
-        ax.set_ylim(-limit * 1.15, limit * 1.15)
-    ax.set_xlabel(f"Measured ({unit_label})", color=theme.text_secondary, fontsize=LABEL_SIZE_PT)
+    if ylim is not None:
+        ax.set_ylim(float(ylim[0]), float(ylim[1]))
+    else:
+        limit = float(np.max(np.abs(residual_arr)))
+        if limit > 0:
+            ax.set_ylim(-limit * 1.15, limit * 1.15)
+    if xlim is not None:
+        ax.set_xlim(float(xlim[0]), float(xlim[1]))
+    ax.set_xlabel(x_label or f"Measured ({unit_label})", color=theme.text_secondary, fontsize=LABEL_SIZE_PT)
     ax.set_ylabel(
-        f"Predicted − measured ({unit_label})",
+        y_label or f"Predicted − measured ({unit_label})",
         color=theme.text_secondary,
         fontsize=LABEL_SIZE_PT,
     )
@@ -670,3 +706,87 @@ def soh_vs_cycle_figure(
         legend.get_title().set_color(theme.text_secondary)
         legend.get_title().set_fontsize(ANNOTATION_SIZE_PT)
     return fig
+
+
+def soh_cell_figure(
+    cycles: np.ndarray,
+    observed: np.ndarray,
+    predicted: np.ndarray,
+    *,
+    theme: Theme,
+    cell_id: str,
+    title: str = "SOH estimates across observed cycles",
+    subtitle: str | None = None,
+    unit_label: str = "ratio",
+    annotation: str | None = None,
+    ylim: tuple[float, float] | None = None,
+    dpi: float = 300.0,
+) -> Figure:
+    """Observed and estimated SOH for **one** cell, at its recorded cycles.
+
+    One cell, so the legend means exactly one thing: observed is a solid
+    neutral line, estimated a dashed accent line, both with a marker at every
+    recorded point. Points are drawn in the order of the recorded cycle
+    index, as stored — nothing is smoothed, interpolated, extrapolated or
+    made monotonic, and the y range is the data's own (no forced [0, 1]).
+
+    **Not a forecast.** Each estimate was made at an observed cycle from that
+    cycle's data; the line joining them is a reading aid.
+
+    Raises:
+        VizFigureError: empty, mismatched, unsorted or non-finite input.
+    """
+    cycle_arr = np.asarray(cycles, dtype=np.float64).reshape(-1)
+    true_arr, pred_arr = _check_pair(observed, predicted,
+                                     first_name="observed", second_name="predicted")
+    if cycle_arr.size != true_arr.size:
+        raise VizFigureError(
+            f"cycles has {cycle_arr.size} entries but there are {true_arr.size} points."
+        )
+    if not np.all(np.isfinite(cycle_arr)):
+        raise VizFigureError("cycles contains NaN or inf.")
+    if cycle_arr.size > 1 and np.any(np.diff(cycle_arr) < 0):
+        raise VizFigureError(
+            "cycles must be sorted ascending with observed/predicted reordered "
+            "together; pass the series from soh_cell_series()."
+        )
+
+    fig = _new_figure(theme, (5.4, 3.6), dpi)
+    ax = fig.add_subplot(111)
+    fig.subplots_adjust(left=0.135, right=0.97, top=0.82, bottom=0.15)
+    style_axes(ax, theme)
+    marker = 3.2 if cycle_arr.size <= 300 else 0.0
+    ax.plot(
+        cycle_arr, true_arr,
+        color=theme.text_secondary, linewidth=LINE_WIDTH_PT, linestyle="-",
+        marker="o" if marker else None, markersize=marker,
+        zorder=2, label="Observed SOH",
+    )
+    ax.plot(
+        cycle_arr, pred_arr,
+        color=theme.series, linewidth=LINE_WIDTH_PT, linestyle="--",
+        marker="o" if marker else None, markersize=marker,
+        zorder=3, label="Estimated SOH",
+    )
+    if ylim is not None:
+        # Viewport only: every point is still drawn; the caller counts and
+        # states how many fall outside.
+        ax.set_ylim(float(ylim[0]), float(ylim[1]))
+    if annotation:
+        ax.annotate(
+            annotation, xy=(0.02, 0.04), xycoords="axes fraction",
+            ha="left", va="bottom", fontsize=ANNOTATION_SIZE_PT,
+            color=theme.text_secondary, zorder=5,
+        )
+    ax.set_xlabel("Observed cycle index", color=theme.text_secondary, fontsize=LABEL_SIZE_PT)
+    ax.set_ylabel(f"SOH ({unit_label})", color=theme.text_secondary, fontsize=LABEL_SIZE_PT)
+    add_titles(
+        ax, theme, title=title,
+        subtitle=subtitle if subtitle is not None else f"Cell {cell_id}",
+    )
+    legend = ax.legend(loc="best", frameon=False, fontsize=ANNOTATION_SIZE_PT,
+                       handlelength=2.4)
+    for text in legend.get_texts():
+        text.set_color(theme.text_secondary)
+    return fig
+

@@ -227,6 +227,47 @@ def _audit_manifest(output_dir: Path) -> dict[str, Any] | None:
     }
 
 
+def _check_result_panels(render: Any) -> dict[str, Any]:
+    """VIZ-09/VIZ-13: the shared panel path builds, is deterministic, and zoom
+    leaves the plotted arrays untouched. Constant literals, rendered to memory
+    only (CLAUDE.md §7); no artifact is read."""
+    from batteryml_web.viz.result_figures import build_panels
+
+    view = {
+        "available": True,
+        "observed": [0.99, 0.97, 0.95, 0.98, 0.96, 0.94],
+        "predicted": [0.98, 0.99, -0.40, 0.97, 1.30, 0.93],
+        "cell_ids": ["synthetic_a", "synthetic_a", "synthetic_a",
+                     "synthetic_b", "synthetic_b", "synthetic_b"],
+        "cycle_indices": [20, 10, 15, 10, 20, 15],
+        "row_positions": [0, 1, 2, 3, 4, 5],
+        "count": 6,
+        "target": {"kind": "soh", "quantity": "SOH", "unit": "ratio",
+                   "residual_unit": "ratio", "granularity": "one point per observed cell and cycle"},
+    }
+    view["residuals"] = [p - o for o, p in zip(view["observed"], view["predicted"])]
+    before = {key: list(view[key]) for key in ("observed", "predicted", "residuals")}
+    problems: list[str] = []
+    panels_out: dict[str, Any] = {}
+    try:
+        first = build_panels(view, include_zoom=True, dpi=72.0)
+        second = build_panels(view, include_zoom=True, dpi=72.0)
+    except Exception as exc:  # reported as a FIG-01 problem, never swallowed
+        return {"panels": {}, "problems": [f"result panels: build_panels raised {type(exc).__name__}: {exc}"]}
+    for panel_id, panel in first.items():
+        a = render.render_to_bytes(panel["figure"], fmt="svg")
+        b = render.render_to_bytes(second[panel_id]["figure"], fmt="svg")
+        panels_out[panel_id] = {"svg_bytes": len(a), "deterministic": a == b}
+        if a != b:
+            problems.append(f"result panel {panel_id}: two SVG renders differ")
+    if first.get("soh_cycle", {}).get("meta", {}).get("cell_id") != "synthetic_a":
+        problems.append("result panels: default SOH cell is not the first sorted cell ID")
+    for key, values in before.items():
+        if view[key] != values:
+            problems.append(f"result panels: building the zoomed view changed view[{key!r}]")
+    return {"panels": panels_out, "problems": problems}
+
+
 def check(output_dir: str | Path | None = None) -> CheckResult:
     """Run FIG-01.
 
@@ -368,6 +409,9 @@ def check(output_dir: str | Path | None = None) -> CheckResult:
                 "non-deterministic — a timestamp or a salted id — is reaching the output."
             )
 
+    panel_check = _check_result_panels(render)
+    problems.extend(panel_check["problems"])
+
     audit = _audit_manifest(out_dir)
     if audit and audit["problems"]:
         problems.extend(audit["problems"])
@@ -377,6 +421,7 @@ def check(output_dir: str | Path | None = None) -> CheckResult:
         "declared": len(specs),
         "dispatched_in_cli": sorted(dispatched),
         "manifest_audit": audit or "no figure_manifest.json in the output directory",
+        "result_panels": panel_check,
         "synthetic_smoke_inputs": {
             "rendered_to": "memory (io.BytesIO); never written to disk",
             "note": "constant literals used to exercise the drawing code; not results "
@@ -397,7 +442,8 @@ def check(output_dir: str | Path | None = None) -> CheckResult:
     rendered = sum(1 for row in rows if row.get("rendered"))
     summary = (
         f"{len(specs)} contracted figure(s); {rendered} rendered to memory and byte-identical "
-        "across two renders."
+        f"across two renders. Website/export result panels: {len(panel_check['panels'])} "
+        "built, each SVG byte-identical across two renders, plotted data unchanged by zoom."
     )
     if audit:
         summary += f" Manifest audit: {audit['listed']} figure(s) listed, all present and hash-matched."
