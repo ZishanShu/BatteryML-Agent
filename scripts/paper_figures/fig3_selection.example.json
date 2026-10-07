@@ -1,0 +1,37 @@
+{
+  "_comment": "TEMPLATE. Copy to fig3_selection.json and replace every <...> with a path printed by `collect_fig3_data list-runs`. Nothing here is a real run; collect refuses a path that does not exist.",
+  "model_order": ["ridge", "lasso", "elastic_net", "rf", "xgb", "cnn"],
+  "model_labels": {
+    "ridge": "Ridge",
+    "lasso": "Lasso",
+    "elastic_net": "ElasticNet",
+    "rf": "Random forest",
+    "xgb": "XGBoost",
+    "cnn": "CNN"
+  },
+  "runs": [
+    {
+      "id": "xgb_matr1_seed0",
+      "model": "xgb",
+      "artifact": "runs/<run_dir>/predictions_seed_0_<timestamp>.pkl",
+      "dataset": "MATR",
+      "protocol": "MATR1",
+      "_comment": "dataset/protocol are cross-checked against run.json and the config copy; a contradiction is refused."
+    },
+    {
+      "id": "xgb_matr1_seed1",
+      "model": "xgb",
+      "artifact": "runs/<run_dir>/predictions_seed_1_<timestamp>.pkl"
+    }
+  ],
+  "published_reference": {
+    "include": false,
+    "models": ["ridge", "xgb"],
+    "protocols": ["MATR1", "MATR2", "HUST", "SNL", "CLO"]
+  },
+  "latency_csv": null,
+  "radar": {
+    "metrics_csv": null,
+    "config": null
+  }
+}

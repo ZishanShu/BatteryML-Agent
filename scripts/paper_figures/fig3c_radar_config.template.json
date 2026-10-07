@@ -1,0 +1,29 @@
+{
+  "_comment": "TEMPLATE. Every dimension must be a measured quantity with a definition, unit, source, direction and FIXED bounds chosen before looking at the models. null bounds are refused. At least 3 dimensions; every model needs every dimension. Subjective scores (interpretability, usability, ratings) are refused.",
+  "dimensions": [
+    {
+      "name": "lifetime_RMSE_MATR1",
+      "definition": "BatteryML saved RMSE on the MATR primary test split (whole-cell cycle life)",
+      "unit": "cycles",
+      "source": "runs.csv saved_RMSE for the entry ids listed in radar_metrics.csv",
+      "direction": "lower_is_better",
+      "bounds": [null, null]
+    },
+    {
+      "name": "<measured_dimension_2>",
+      "definition": "<what was measured, on which data>",
+      "unit": "<unit>",
+      "source": "<file or run that holds the measurement>",
+      "direction": "lower_is_better",
+      "bounds": [null, null]
+    },
+    {
+      "name": "<measured_dimension_3>",
+      "definition": "<what was measured, on which data>",
+      "unit": "<unit>",
+      "source": "<file or run that holds the measurement>",
+      "direction": "higher_is_better",
+      "bounds": [null, null]
+    }
+  ]
+}
