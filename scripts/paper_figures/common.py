@@ -250,7 +250,7 @@ def first_seen(values: Iterable[Any]) -> List[Any]:
 
 #: Fields that must agree for two runs to sit in one dataset/protocol column.
 COLUMN_KEYS = ("schema", "label_annotator", "unit", "split_class", "sample_weighting",
-               "soh_reference")
+               "soh_reference", "stored_rows")
 
 
 def check_columns(rows: List[Dict[str, str]]) -> None:
@@ -271,6 +271,33 @@ def check_columns(rows: List[Dict[str, str]]) -> None:
     units = sorted({str(r.get("unit")) for r in rows})
     if len(units) > 1:
         raise PanelSkip(INVALID_COMPARISON, f"selected runs use different units {units}.")
+
+
+def check_observed_agree(rows: List[Dict[str, str]], samples: List[Dict[str, str]],
+                         *, atol: float = 1e-2, rtol: float = 1e-5) -> None:
+    """INVALID_COMPARISON when two runs in one column disagree on a true label.
+
+    Keyed by (cell_id, cycle_index) for runs whose identity is known. Catches
+    runs made on different processed-data versions or label definitions.
+    """
+    known = {r["entry_id"]: r for r in rows if r.get("identity_status") in ("recorded", "recovered")}
+    truth: Dict[tuple, tuple] = {}
+    for sample in samples:
+        row = known.get(sample["entry_id"])
+        if row is None:
+            continue
+        key = (row["dataset"], row["protocol"], sample["cell_id"], sample["cycle_index"])
+        value = float(sample["observed"])
+        if key in truth:
+            other_entry, other = truth[key]
+            if abs(value - other) > atol + rtol * abs(other):
+                raise PanelSkip(
+                    INVALID_COMPARISON,
+                    f"{key[0]}/{key[1]} cell {key[2]} cycle {key[3]}: observed label "
+                    f"{value} in {sample['entry_id']} but {other} in {other_entry}; runs "
+                    "with different ground truth are not compared.")
+        else:
+            truth[key] = (sample["entry_id"], value)
 
 
 def group_runs(rows: List[Dict[str, str]]) -> Dict[tuple, List[Dict[str, str]]]:

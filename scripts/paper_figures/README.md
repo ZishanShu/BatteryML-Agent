@@ -120,10 +120,103 @@ A panel the data cannot support is listed with its reason and not drawn.
   same device, hardware, batch size, threads, warm-up, timing boundary,
   inclusions and GPU sync. `measurement_kind` must be `inference`.
 
+## Experiment campaign (server): audit → plan → run → measure → collect → plot
+
+`fig3_experiments.py` is one resumable entry point for the experiments
+behind Fig. 3. It must run on the machine that holds `data/processed/` (conda
+env `batteryml`), from the repository root:
+
+```bash
+python -m scripts.paper_figures.fig3_experiments \
+    --campaign runs/paper_figures/fig3_campaign_v1 \
+    --stages audit,plan,run,measure,collect,plot,report \
+    --existing-selection runs/paper_figures/fig3_local_LfPNvddj/fig3_selection.json
+```
+
+Re-running the same command resumes the campaign:
+
+- tasks already accepted are skipped;
+- a task left `RUNNING` by a killed runner gets its `run.json` marked
+  `INTERRUPTED` and runs again under a new run id;
+- `--retry-failed` retries failed tasks;
+- `--max-tasks N` and `--only-groups soh` bound one invocation.
+
+**Campaign directory contents.** Everything is written under the campaign
+directory and nothing outside it is modified:
+
+- `audit/`: `environment.json`, `existing_artifacts.csv`, and one row-identity
+  audit per existing artifact under `artifact_audits/`;
+- `experiment_plan.json` (written once);
+- `state/tasks.json`;
+- `runs/<run_id>/`: `run.json`, `output.log`, config copy, checkpoints,
+  predictions and `fig3_task_record.json`;
+- `measurements/measure_NNN/`;
+- `derived/identity/`;
+- `selection/`;
+- `collected/collected_NNN/`;
+- `figures/figures_NNN/`;
+- `experiment_table.csv`;
+- `stage_log.txt`.
+
+**Protocol (fixed before any result is seen).**
+
+- **SOH MATR1:** Ridge, Lasso, ElasticNet, RF, XGBoost.
+- **Lifetime MATR1:** Ridge, RF, XGBoost, CNN, plus BatLiNet and CPTransformer
+  when their sources exist.
+- **Lifetime HUST:** Ridge, RF, XGBoost, CNN when `data/processed/HUST` is
+  populated. No HUST configuration is invented for the extension models.
+- **Seeds:** seeds 0, 1 and 2 for models the pipeline seed reaches (RF,
+  neural models); one fit for deterministic estimators (Ridge, LassoCV,
+  ElasticNetCV, and XGBoost with its default fixed `random_state`). If seeded
+  runs turn out to give identical predictions, collect keeps only one of them
+  rather than fake an error bar.
+- **Training:** config epoch budgets with final-epoch weights, no `--epochs`
+  override, no test-based selection.
+- **Reuse:** an existing run is reused only when its `run.json` says
+  COMPLETED with `return_code` 0, `smoke` is false, there is no epochs
+  override, the seed matches, and its config copy is byte-identical to the
+  planned config. Among several eligible runs, the earliest finished one is
+  taken. The choice is never made by score.
+- **Devices:** deep models use one free GPU (no DDP; busy GPUs are skipped,
+  never preempted). CPU models run with `--cpu-threads` threads.
+
+**Measurement (D and C).** `fig3_measure.py` runs in a child process with 1
+CPU thread.
+
+- **Batch:** one fixed batch of 32 real test samples (evenly spaced ranks,
+  the same keys for every model).
+- **Warm-up and repeats:** 20 untimed calls, then 100 timed calls of
+  `estimator.predict` on the already-transformed features. Every timing is
+  saved.
+- **Check:** before timing, the checkpoint must reproduce the saved
+  predictions.
+- **Units:** ms per batch is the primary unit. The batch-amortized ms/sample
+  is labelled as such; it is not a batch-size-1 online latency.
+- **Inference-file size:** the checkpoint file plus the fitted feature and
+  label transformations, in MiB. This is file size, not RAM.
+- **Radar (C):** uses `reference_relative` normalization,
+  `score = r / (r + x)`, with Ridge as the reference (0.5 on every axis).
+
+**Row identity (`artifact_audit.py`).** `artifact_audit.py` reports the raw
+shapes, `sample_index`, rows per cell and the evaluator's recomputed scores
+for any artifact:
+
+```bash
+python -m scripts.paper_figures.artifact_audit --artifact <predictions.pkl> \
+    --collected <collect dir> --entry <entry id> --recover-identity --sidecar <new.json>
+```
+
+- **No identity recorded:** an artifact that carries no cell identity is
+  marked `identity_status = not_recorded` in `runs.csv`, never given a
+  placeholder id. Panel E leaves such a model out and states the reason.
+- **Recovery:** identity can be recovered only by rebuilding the run's own
+  test split and matching every label. The match must be verified; the
+  result is a sidecar file and the artifact is never edited.
+
 ## Tests
 
 ```bash
-python -m unittest tests.test_paper_figures -v
+python -m unittest tests.test_paper_figures tests.test_fig3_experiments -v
 ```
 
 The tests use synthetic artifacts only (`synthetic_` cell ids in a temporary

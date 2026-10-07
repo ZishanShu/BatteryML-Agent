@@ -34,7 +34,7 @@ from typing import Any, Dict, List, Optional
 from scripts.paper_figures.common import (
     CREATED, GRID, INVALID_COMPARISON, MISSING_DATA, TEXT_PRIMARY, TEXT_SECONDARY,
     PanelResult, PanelSkip, Style, base_parser, check_columns, collected, command_line,
-    first_seen, group_runs, kept_or_skip, model_colors, model_label, model_marker,
+    check_observed_agree, first_seen, group_runs, kept_or_skip, model_colors, model_label, model_marker,
     model_order, new_figure, report, run_provenance, save_panel, smoke_annotation,
     style_from_args, to_float, unrecorded_smoke,
 )
@@ -97,14 +97,38 @@ def build(runs: List[Dict[str, str]], samples: List[Dict[str, str]], order: List
     by_entry: Dict[str, List[Dict[str, str]]] = {}
     for row in samples:
         by_entry.setdefault(row["entry_id"], []).append(row)
+    # A model whose rows cannot be tied to one named test cell each is left
+    # out with its reason; its rows are never averaged, deduplicated or cut.
+    excluded_models: Dict[str, str] = {}
+    for model, run in list(chosen.items()):
+        rows = by_entry.get(run["entry_id"], [])
+        cells = [str(r["cell_id"]) for r in rows]
+        if run.get("identity_status") not in ("recorded", "recovered"):
+            excluded_models[model] = (
+                f"entry {run['entry_id']}: cell identity {run.get('identity_status') or 'unknown'} "
+                f"({run.get('identity_source') or 'no identity source'}); rows cannot be "
+                "matched to test cells")
+        elif not rows:
+            excluded_models[model] = f"entry {run['entry_id']}: no rows in samples.csv"
+        elif len(cells) != len(set(cells)):
+            excluded_models[model] = (
+                f"entry {run['entry_id']}: {len(cells)} rows for {len(set(cells))} cells; "
+                "repeated rows are distinct observations and are not averaged or deduplicated")
+        if model in excluded_models:
+            del chosen[model]
+    if not chosen:
+        raise PanelSkip(INVALID_COMPARISON, "no model has one verified row per test cell: "
+                        + "; ".join(excluded_models.values()))
+    models = [m for m in models if m in chosen]
+    check_observed_agree(list(chosen.values()),
+                         [r for r in samples if r["entry_id"] in {c["entry_id"] for c in chosen.values()}])
+
     unit = in_column[0]["unit"]
     points: List[Dict[str, Any]] = []
     errors: Dict[str, List[float]] = {}
     cell_sets: Dict[str, List[str]] = {}
     for model, run in chosen.items():
-        rows = by_entry.get(run["entry_id"], [])
-        if not rows:
-            raise PanelSkip(MISSING_DATA, f"samples.csv has no rows for entry {run['entry_id']}.")
+        rows = by_entry[run["entry_id"]]
         values = []
         for row in rows:
             observed, predicted = to_float(row["observed"]), to_float(row["predicted"])
@@ -124,13 +148,8 @@ def build(runs: List[Dict[str, str]], samples: List[Dict[str, str]], order: List
                            "cell_id": row["cell_id"], "artifact_row": row["artifact_row"],
                            "observed": observed, "predicted": predicted, "abs_error": error,
                            "unit": unit, "on_axis": not (yscale == "log" and error == 0.0)})
-        cells = [str(r["cell_id"]) for r in rows]
-        if len(cells) != len(set(cells)):
-            raise PanelSkip(INVALID_COMPARISON,
-                            f"entry {run['entry_id']} has several rows per cell; a lifetime "
-                            "distribution needs one row per cell.")
         errors[model] = values
-        cell_sets[model] = sorted(cells)
+        cell_sets[model] = sorted(str(r["cell_id"]) for r in rows)
     reference = next(iter(cell_sets.values()))
     for model, cells in cell_sets.items():
         if cells != reference:
@@ -139,7 +158,8 @@ def build(runs: List[Dict[str, str]], samples: List[Dict[str, str]], order: List
             raise PanelSkip(INVALID_COMPARISON,
                             f"{model} covers different test cells than {models[0]} "
                             f"(only in {model}: {only_here[:5]}; missing: {only_ref[:5]}); "
-                            "distributions over different cells are not compared.")
+                            "distributions over different cells are not compared, and no "
+                            "intersection is taken.")
 
     small = {m: (len(v), len(set(v))) for m, v in errors.items()
              if len(v) < VIOLIN_MIN_N or len(set(v)) < VIOLIN_MIN_DISTINCT}
@@ -160,7 +180,8 @@ def build(runs: List[Dict[str, str]], samples: List[Dict[str, str]], order: List
             "labels": {m: model_label(meta, m) for m in models},
             "chosen": chosen, "mode": mode, "mode_reason": reason, "zeros": zeros,
             "unit": unit, "kept": list(chosen.values()), "excluded_smoke": excluded,
-            "n_cells": len(reference),
+            "n_cells": len(reference), "excluded_models": excluded_models,
+            "order": list(order),
             "smoke_used": any(str(r.get("smoke")).lower() == "true" for r in chosen.values())}
 
 
@@ -173,7 +194,7 @@ def draw(built: Dict[str, Any], style: Style, *, yscale: str):
     import matplotlib
 
     models = built["models"]
-    colors = model_colors(models)
+    colors = model_colors(built["order"])  # slot = position in the global model_order
     with matplotlib.rc_context(style.rc()):
         fig = new_figure(style)
         ax = fig.add_subplot(111)
@@ -191,7 +212,7 @@ def draw(built: Dict[str, Any], style: Style, *, yscale: str):
                 box_width = 0.16
             else:
                 ax.scatter([i + o for o in _offsets(len(values))], values, s=9,
-                           marker=model_marker(models, model), color=colors[model],
+                           marker=model_marker(built["order"], model), color=colors[model],
                            edgecolors="#ffffff", linewidths=0.4, zorder=3)
                 box_width = 0.45
             ax.boxplot([values], positions=[i], widths=box_width, whis=1.5,
@@ -256,6 +277,7 @@ def make_panel(data_dir: Path, out_dir: Path, *, style: Optional[Style] = None,
         "non_finite": "pairs with non-finite observed/predicted were dropped by collect and are "
                       "counted in runs.csv omitted_nonfinite",
         "models": built["models"],
+        "excluded_models": built["excluded_models"],
         "runs": run_provenance(built["kept"]),
         "excluded_smoke_entries": [r["entry_id"] for r in built["excluded_smoke"]],
         "smoke_included": built["smoke_used"],
@@ -265,7 +287,8 @@ def make_panel(data_dir: Path, out_dir: Path, *, style: Optional[Style] = None,
         "command": command or command_line(argv, "scripts.paper_figures.fig3e_lifetime_error_distribution"),
     }
     outputs = save_panel(fig, out_dir, STEM, style, built["points"], SOURCE_COLUMNS, metadata)
-    return PanelResult(STEM, CREATED, outputs)
+    note = "; ".join(f"excluded {m}: {why}" for m, why in built["excluded_models"].items())
+    return PanelResult(STEM, CREATED, outputs, note)
 
 
 def main(argv: Optional[List[str]] = None) -> int:

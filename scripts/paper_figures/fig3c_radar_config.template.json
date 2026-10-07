@@ -1,5 +1,8 @@
 {
-  "_comment": "TEMPLATE. Every dimension must be a measured quantity with a definition, unit, source, direction and FIXED bounds chosen before looking at the models. null bounds are refused. At least 3 dimensions; every model needs every dimension. Subjective scores (interpretability, usability, ratings) are refused.",
+  "_comment": "TEMPLATE. Every dimension must be a measured quantity with a definition, unit, source, direction and FIXED bounds chosen before looking at the models. null bounds are refused. At least 3 dimensions; every model needs every dimension. Subjective scores (interpretability, usability, ratings) are refused. normalization.mode: 'fixed_bounds_linear' (bounds required, below) or 'reference_relative' (score = r/(r+x) against normalization.reference_model; lower_is_better axes only; bounds not used).",
+  "normalization": {
+    "mode": "fixed_bounds_linear"
+  },
   "dimensions": [
     {
       "name": "lifetime_RMSE_MATR1",
@@ -7,7 +10,10 @@
       "unit": "cycles",
       "source": "runs.csv saved_RMSE for the entry ids listed in radar_metrics.csv",
       "direction": "lower_is_better",
-      "bounds": [null, null]
+      "bounds": [
+        null,
+        null
+      ]
     },
     {
       "name": "<measured_dimension_2>",
@@ -15,7 +21,10 @@
       "unit": "<unit>",
       "source": "<file or run that holds the measurement>",
       "direction": "lower_is_better",
-      "bounds": [null, null]
+      "bounds": [
+        null,
+        null
+      ]
     },
     {
       "name": "<measured_dimension_3>",
@@ -23,7 +32,10 @@
       "unit": "<unit>",
       "source": "<file or run that holds the measurement>",
       "direction": "higher_is_better",
-      "bounds": [null, null]
+      "bounds": [
+        null,
+        null
+      ]
     }
   ]
 }

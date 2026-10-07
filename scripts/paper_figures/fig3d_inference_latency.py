@@ -162,7 +162,7 @@ def build(rows: List[Dict[str, str]], order: List[str], meta: Dict[str, Any], *,
             "timing_boundary": row["timing_boundary"], "source_file": row["source_file"],
         })
     protocol = {name: rows[0][name] for name in PROTOCOL_FIELDS}
-    return {"bars": bars, "models": models, "protocol": protocol,
+    return {"bars": bars, "models": models, "protocol": protocol, "order": list(order),
             "not_measured": missing_measurements(order, rows)}
 
 
@@ -170,7 +170,7 @@ def draw(built: Dict[str, Any], style: Style, *, yscale: str):
     import matplotlib
 
     models = built["models"]
-    colors = model_colors(models)
+    colors = model_colors(built["order"])  # slot = position in the global model_order
     unit = {"ms_per_sample": "ms per sample", "ms_per_batch": "ms per batch"}[
         built["protocol"]["latency_unit"]]
     with matplotlib.rc_context(style.rc()):

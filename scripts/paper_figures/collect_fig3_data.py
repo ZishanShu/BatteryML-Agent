@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+from collections import Counter
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -59,7 +60,11 @@ RUN_COLUMNS = [
     "saved_RMSE", "saved_MAE", "saved_MAPE_ratio", "metric_source",
     "sample_weighting", "stored_rows", "plotted_rows", "omitted_nonfinite",
     "n_cells", "transform_status", "transform_chain",
+    "identity_status", "identity_source", "rows_per_cell_max",
+    "determinism", "observation_budget",
 ]
+#: identity_status values. Only these two let a row stand for one named cell.
+IDENTITY_KNOWN = ("recorded", "recovered")
 SAMPLE_COLUMNS = ["entry_id", "artifact_row", "cell_id", "cycle_index",
                   "observed", "predicted", "abs_error"]
 PUBLISHED_COLUMNS = ["model", "model_label", "dataset", "protocol", "central",
@@ -207,15 +212,47 @@ def collect_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
         "transform_chain": "|".join(view.get("transform_chain") or []) or "none",
     }
     positions = view.get("row_positions") or list(range(view["count"]))
-    cells = view.get("cell_ids") or [None] * view["count"]
+    index = cycle_sample_index(payload)
+    index_ok = index is not None and len(index) == view.get("total_rows")
+    cells = view.get("cell_ids")
+    if index_ok:
+        identity = ("recorded", "sample_index written by Pipeline.evaluate")
+    elif cells:
+        identity = ("recorded", "cell ids carried by the saved DataBundle")
+    else:
+        identity = ("not_recorded",
+                    "the artifact carries no sample_index and no cell ids; rows are "
+                    "unnamed (never given a placeholder id)")
     cycles = view.get("cycle_indices")
     if cycles is None:
         # Scalar views carry no cycle list; take it from the recorded index
         # through the same row positions (-1 = whole cell), never invent it.
-        index = cycle_sample_index(payload)
-        cycles = ([index[p]["cycle_index"] for p in positions]
-                  if index is not None and len(index) == view.get("total_rows") else
-                  [None] * view["count"])
+        cycles = ([index[p]["cycle_index"] for p in positions] if index_ok
+                  else [None] * view["count"])
+    if entry.get("identity_sidecar"):
+        recovered = load_identity_sidecar(_resolve(str(entry["identity_sidecar"])), record,
+                                          int(view.get("total_rows") or 0), entry_id)
+        named = [recovered["cell_ids"][p] for p in positions]
+        if cells and [str(c) for c in cells] != named:
+            raise CollectError(
+                f"entry {entry_id!r}: the identity sidecar disagrees with the identity the "
+                "artifact records; the recorded identity is never overridden.")
+        if not cells:
+            cells = named
+            cycles = [-1] * view["count"]
+            identity = ("recovered", (
+                f"identity sidecar {entry['identity_sidecar']}: {recovered['method']}; "
+                f"max |label difference| {recovered.get('max_abs_label_diff')}"))
+    if not cells:
+        cells = [""] * view["count"]
+    counts = Counter(str(c) for c in cells) if identity[0] != "not_recorded" else None
+    run_row.update({
+        "identity_status": identity[0], "identity_source": identity[1],
+        "rows_per_cell_max": max(counts.values()) if counts else None,
+        "n_cells": len(counts) if counts else NR,
+        "determinism": str(entry.get("determinism") or NR),
+        "observation_budget": str(entry.get("observation_budget") or NR),
+    })
     samples = [
         {"entry_id": entry_id, "artifact_row": positions[i], "cell_id": cells[i],
          "cycle_index": cycles[i], "observed": view["observed"][i],
@@ -224,6 +261,32 @@ def collect_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
         for i in range(view["count"])
     ]
     return {"run": run_row, "samples": samples}
+
+
+def load_identity_sidecar(path: Path, record: Dict[str, Any], total_rows: int,
+                          entry_id: str) -> Dict[str, Any]:
+    """A verified identity sidecar bound to exactly this artifact, or CollectError."""
+    from scripts.paper_figures.artifact_audit import SIDECAR_KIND
+
+    if not path.is_file():
+        raise CollectError(f"entry {entry_id!r}: identity sidecar {path} does not exist.")
+    sidecar = read_json(path)
+    problems = []
+    if sidecar.get("kind") != SIDECAR_KIND:
+        problems.append("not an identity sidecar")
+    if sidecar.get("status") != "verified":
+        problems.append(f"status is {sidecar.get('status')!r}, not 'verified'")
+    if sidecar.get("artifact_sha256") != record["artifact_sha256"]:
+        problems.append("it was made for a different artifact (SHA-256 differs)")
+    ids = sidecar.get("cell_ids") or []
+    if len(ids) != total_rows:
+        problems.append(f"it names {len(ids)} cells for {total_rows} artifact rows")
+    if len(set(ids)) != len(ids):
+        problems.append("its cell ids repeat")
+    if problems:
+        raise CollectError(f"entry {entry_id!r}: identity sidecar {path} refused: "
+                           + "; ".join(problems))
+    return sidecar
 
 
 def published_rows(spec: Dict[str, Any]) -> List[Dict[str, Any]]:

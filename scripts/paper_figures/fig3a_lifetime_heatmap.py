@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional
 from scripts.paper_figures.common import (
     CENSORED_FILL, CREATED, INVALID_COMPARISON, MISSING_DATA, NA_FILL, SEQUENTIAL,
     TEXT_MUTED, TEXT_PRIMARY, PanelResult, PanelSkip, Style, base_parser, check_columns,
+    check_observed_agree,
     collected, column_label, command_line, first_seen, fmt_value, group_runs,
     kept_or_skip, model_colors, model_label, model_marker, model_order, report,
     run_provenance, save_panel, smoke_annotation, style_from_args, summarize,
@@ -45,12 +46,14 @@ COLOR_SCALES = ("global", "column", "none")
 SOURCE_COLUMNS = [
     "source_type", "model", "model_label", "dataset", "protocol", "metric", "unit",
     "value_mean", "value_sd", "n_runs", "seeds", "entry_ids", "run_ids",
-    "censored", "display_text", "color_fraction", "note",
+    "censored", "display_text", "color_fraction", "note", "determinism",
+    "observation_budget",
 ]
 
 
 def local_cells(runs: List[Dict[str, str]], order: List[str], meta: Dict[str, Any], *,
-                metric: str, allow_smoke: bool) -> Dict[str, Any]:
+                metric: str, allow_smoke: bool,
+                samples: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
     """Pure: runs.csv rows -> the heatmap's cells (one dict per model x column)."""
     if metric not in METRICS:
         raise PanelSkip(INVALID_COMPARISON, f"--metric must be one of {METRICS}.")
@@ -58,10 +61,14 @@ def local_cells(runs: List[Dict[str, str]], order: List[str], meta: Dict[str, An
     kept, excluded = kept_or_skip(lifetime, allow_smoke=allow_smoke,
                                   what="whole-cell lifetime runs (task_kind=lifetime)")
     check_columns(kept)
+    if samples is not None:
+        check_observed_agree(kept, samples)
     groups = group_runs(kept)
     columns = first_seen((r["dataset"], r["protocol"]) for r in kept)
     models = [m for m in order if any(r["model"] == m for r in kept)]
     unit = kept[0]["unit"]
+    budgets = {m: sorted({str(r.get("observation_budget") or "not recorded")
+                          for r in kept if r["model"] == m}) for m in models}
     cells = []
     for model in models:
         for dataset, protocol in columns:
@@ -76,6 +83,8 @@ def local_cells(runs: List[Dict[str, str]], order: List[str], meta: Dict[str, An
                 "entry_ids": ";".join(m["entry_id"] for m in members),
                 "run_ids": ";".join(str(m["run_id"]) for m in members),
                 "censored": False, "note": "",
+                "determinism": ";".join(sorted({str(m.get("determinism") or "not recorded")
+                                                for m in members})),
             }
             if not members:
                 cell["note"] = "no selected run for this model/column"
@@ -87,10 +96,18 @@ def local_cells(runs: List[Dict[str, str]], order: List[str], meta: Dict[str, An
                 stats = summarize(values)
                 cell["value_mean"], cell["value_sd"] = stats["mean"], stats["sd"]
                 cell["note"] = ("mean ± sample SD over independent seeds"
-                                if stats["n"] >= 2 else "single run; no error estimate")
+                                if stats["n"] >= 2 else
+                                "deterministic fit; one run, no error estimate"
+                                if cell["determinism"] == "deterministic" else
+                                "single run; no error estimate")
             cells.append(cell)
+    for cell in cells:
+        budget = budgets.get(cell["model"]) or []
+        if len(budget) == 1 and budget[0] != "not recorded":
+            cell["model_label"] = f"{cell['model_label']}\n({budget[0]})"
+        cell["observation_budget"] = ";".join(budget)
     return {"cells": cells, "models": models, "columns": columns, "kept": kept,
-            "excluded_smoke": excluded, "unit": unit,
+            "excluded_smoke": excluded, "unit": unit, "order": list(order),
             "smoke_used": any(str(r.get("smoke")).lower() == "true" for r in kept)}
 
 
@@ -132,7 +149,7 @@ def published_cells(published: List[Dict[str, str]], order: List[str],
                 "censor_threshold": row.get("censor_threshold") if row else None,
             })
     return {"cells": cells, "models": models, "columns": columns, "kept": [],
-            "excluded_smoke": [], "unit": "cycles", "smoke_used": False}
+            "excluded_smoke": [], "unit": "cycles", "smoke_used": False, "order": list(order)}
 
 
 def color_fractions(cells: List[Dict[str, Any]], scale: str) -> None:
@@ -174,7 +191,8 @@ def cell_text(cell: Dict[str, Any]) -> str:
         mean, sd = fmt_pair(cell["value_mean"], cell["value_sd"])
         return f"{mean}\n±{sd}\nn={cell['n_runs']}"
     if cell["source_type"] == "local run":
-        return f"{fmt_value(cell['value_mean'])}\n1 run"
+        tag = "deterministic" if cell.get("determinism") == "deterministic" else "1 run"
+        return f"{fmt_value(cell['value_mean'])}\n{tag}"
     return fmt_value(cell["value_mean"])
 
 
@@ -186,7 +204,7 @@ def draw(built: Dict[str, Any], style: Style, *, metric: str, scale: str):
     from scripts.paper_figures.common import new_figure
 
     models, columns, cells = built["models"], built["columns"], built["cells"]
-    colors = model_colors(models)
+    colors = model_colors(built["order"])  # slot = position in the global model_order
     with matplotlib.rc_context(style.rc()):
         fig = new_figure(style)
         ax = fig.add_subplot(111)
@@ -223,7 +241,7 @@ def draw(built: Dict[str, Any], style: Style, *, metric: str, scale: str):
             spine.set_visible(False)
         # Identity marker in the model's fixed colour (same as panels B-E).
         for i, model in enumerate(models):
-            ax.scatter([-0.58], [i], marker=model_marker(models, model), s=14,
+            ax.scatter([-0.58], [i], marker=model_marker(built["order"], model), s=14,
                        color=colors[model], clip_on=False, linewidths=0)
         if scale == "global" and any(c["color_fraction"] is not None for c in cells):
             values = [c["value_mean"] for c in cells if c["value_mean"] is not None]
@@ -254,7 +272,7 @@ def make_panel(data_dir: Path, out_dir: Path, *, style: Optional[Style] = None,
         built, stem = published_cells(data["published_rmse"], order, meta, metric=metric), PUBLISHED_STEM
     elif source == "local":
         built, stem = local_cells(data["runs"], order, meta, metric=metric,
-                                  allow_smoke=allow_smoke), STEM
+                                  allow_smoke=allow_smoke, samples=data["samples"]), STEM
     else:
         raise PanelSkip(INVALID_COMPARISON, "--source must be 'local' or 'published'.")
     color_fractions(built["cells"], color_scale)

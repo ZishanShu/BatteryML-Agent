@@ -92,7 +92,9 @@ def plot_all(data_dir: Path, out_dir: Path, *, allow_smoke: bool = False,
 def status_table(results: List[PanelResult]) -> str:
     lines = ["| Panel | Status | Output / Reason |", "| --- | --- | --- |"]
     for r in results:
-        detail = (", ".join(Path(o).name for o in r.outputs) if r.outputs else r.reason)
+        detail = ", ".join(Path(o).name for o in r.outputs) if r.outputs else r.reason
+        if r.outputs and r.reason:
+            detail += f" — {r.reason}"
         lines.append(f"| {r.panel} | {r.status} | {detail.replace('|', '/')} |")
     return "\n".join(lines)
 

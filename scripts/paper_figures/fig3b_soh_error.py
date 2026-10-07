@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 
 from scripts.paper_figures.common import (
     CREATED, INVALID_COMPARISON, TEXT_MUTED, TEXT_PRIMARY, PanelResult, PanelSkip, Style,
-    base_parser, check_columns, collected, column_label, command_line, first_seen,
+    base_parser, check_columns, check_observed_agree, collected, column_label, command_line, first_seen,
     group_runs, kept_or_skip, model_colors, model_label, model_order, new_figure, report,
     run_provenance, save_panel, smoke_annotation, style_from_args, summarize, to_float,
     unrecorded_smoke,
@@ -72,6 +72,7 @@ def build(runs: List[Dict[str, str]], samples: List[Dict[str, str]], order: List
     soh = [r for r in runs if r.get("task_kind") == "soh"]
     kept, excluded = kept_or_skip(soh, allow_smoke=allow_smoke, what="SOH runs (task_kind=soh)")
     check_columns(kept)
+    check_observed_agree(kept, samples)
     groups = group_runs(kept)
     columns = first_seen((r["dataset"], r["protocol"]) for r in kept)
     models = [m for m in order if any(r["model"] == m for r in kept)]
@@ -112,7 +113,7 @@ def build(runs: List[Dict[str, str]], samples: List[Dict[str, str]], order: List
                                else "single run; no error bar")
             bars.append(bar)
     return {"bars": bars, "models": models, "columns": columns, "kept": kept,
-            "excluded_smoke": excluded, "unit": unit,
+            "excluded_smoke": excluded, "unit": unit, "order": list(order),
             "smoke_used": any(str(r.get("smoke")).lower() == "true" for r in kept)}
 
 
@@ -120,7 +121,7 @@ def draw(built: Dict[str, Any], style: Style, *, statistic: str, scale: str):
     import matplotlib
 
     models, columns = built["models"], built["columns"]
-    colors = model_colors(models)
+    colors = model_colors(built["order"])  # slot = position in the global model_order
     width = 0.8 / max(len(models), 1)
     with matplotlib.rc_context(style.rc()):
         fig = new_figure(style)
