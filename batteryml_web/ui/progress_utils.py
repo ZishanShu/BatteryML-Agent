@@ -1,12 +1,25 @@
 from __future__ import annotations
 
+import html
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import streamlit as st
+
+
+# tqdm uses ANSI cursor controls when it refreshes a bar in a terminal.
+# Streamlit is not a terminal, so those controls would appear literally as
+# sequences such as ``\x1b[A`` in the browser.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[@-_])")
+
+
+def _strip_terminal_controls(text: str) -> str:
+    """Remove terminal-only ANSI controls while preserving line breaks."""
+    return _ANSI_ESCAPE_RE.sub("", text).replace("\x08", "")
 
 
 def get_safe_runtime_env() -> dict:
@@ -26,6 +39,32 @@ def _format_elapsed(seconds: float) -> str:
     h, rem = divmod(total, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _render_progress_log(log_box: Any, logs: list[str]) -> None:
+    """Render the current tqdm-style update as one refreshing line.
+
+    tqdm advances its display with carriage returns rather than emitting a
+    new log record.  Streamlit's text iterator can expose those updates as a
+    series of lines, so rendering every captured chunk makes one progress bar
+    grow into a wall of repeated percentages.  Keep the complete chunks in
+    ``logs`` for the durable log and show only the newest non-empty carriage
+    return segment here.
+    """
+    output = "Waiting for command output..."
+    for chunk in reversed(logs):
+        clean_chunk = _strip_terminal_controls(chunk)
+        segments = [part.strip() for part in re.split(r"[\r\n]+", clean_chunk) if part.strip()]
+        if segments:
+            output = segments[-1]
+            break
+    escaped = html.escape(output)
+    log_box.markdown(
+        "<div class=\"bml-progress-log-scroll\" aria-label=\"Latest command output\">"
+        f"<pre>{escaped}</pre>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def run_command_with_progress(
@@ -63,7 +102,8 @@ def run_command_with_progress(
     status_text = host.empty()
     elapsed_text = host.empty()
     cmd_box = host.empty()
-    log_box = host.empty()
+    log_surface = host.container(key="bml_progress_log")
+    log_box = log_surface.empty()
     logs: list[str] = []
 
     cmd_box.code(" ".join(str(part) for part in command), language="bash")
@@ -89,8 +129,8 @@ def run_command_with_progress(
 
     if process.stdout is not None:
         for line in process.stdout:
-            logs.append(line)
-            log_box.code("".join(logs[-80:]), language="text")
+            logs.append(_strip_terminal_controls(line))
+            _render_progress_log(log_box, logs)
 
     return_code = process.wait()
     output_tail = "".join(logs[-200:])
@@ -115,8 +155,9 @@ def run_command_with_progress(
 
     elapsed_text.caption(f"Elapsed time: {_format_elapsed(elapsed)}")
     host.caption(f"Log file: `{log_path}`")
-    with host.expander("Logs", expanded=not success):
-        st.code(output_tail or "No logs captured.", language="text")
+    with host.container(key="bml_progress_log_details"):
+        with host.expander("Logs", expanded=not success):
+            st.code(output_tail or "No logs captured.", language="text")
 
     log_path.write_text(
         f"COMMAND: {' '.join(str(part) for part in command)}\nReturn code: {return_code}\nElapsed: {elapsed:.2f}s\n\n{output_tail}",
@@ -130,3 +171,24 @@ def run_command_with_progress(
         "log_path": str(log_path),
         "output_tail": output_tail,
     }
+
+
+def run_data_command_with_progress(
+    command: Sequence[str],
+    cwd: Optional[Path],
+    log_path: Path,
+    steps: list[tuple[int, str]],
+    container: Any = None,
+) -> dict:
+    """Run a download or preprocessing command through the same progress UI.
+
+    Keeping data preparation as a named operation makes the intent at the
+    workflow surface clear while reusing the tested command runner below it.
+    """
+    return run_command_with_progress(
+        command=command,
+        cwd=cwd,
+        log_path=log_path,
+        steps=steps,
+        container=container,
+    )

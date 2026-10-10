@@ -2,6 +2,8 @@ import runpy
 import sys
 from pathlib import Path
 
+import requests
+
 
 def main():
     repo_root = Path(__file__).resolve().parents[2]
@@ -35,7 +37,15 @@ def main():
     # Preserve user-provided CLI arguments.
     sys.argv = [str(cli_path)] + sys.argv[1:]
 
-    runpy.run_path(str(cli_path), run_name="__main__")
+    try:
+        runpy.run_path(str(cli_path), run_name="__main__")
+    except requests.exceptions.RequestException:
+        print(
+            "error: Unable to connect to data.matr.io:443. "
+            "Check Windows firewall/network policy or configure HTTPS_PROXY, then retry.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from None
 
 
 if __name__ == "__main__":

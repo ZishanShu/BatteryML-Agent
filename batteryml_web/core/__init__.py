@@ -22,6 +22,12 @@ from .readiness import (
     list_dataset_readiness,
     list_model_readiness,
 )
+from .config_semantics import (
+    ConfigSemantics,
+    infer_config_semantics,
+    load_config_semantics,
+    model_display_name,
+)
 
 __all__ = [
     "check_nvidia_smi",
@@ -42,4 +48,8 @@ __all__ = [
     "get_workflow_context",
     "list_dataset_readiness",
     "list_model_readiness",
+    "ConfigSemantics",
+    "infer_config_semantics",
+    "load_config_semantics",
+    "model_display_name",
 ]

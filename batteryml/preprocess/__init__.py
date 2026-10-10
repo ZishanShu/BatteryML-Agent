@@ -1,5 +1,5 @@
 import logging
-from .download import DOWNLOAD_LINKS, download_file
+from .download import DOWNLOAD_LINKS, download_file, is_download_complete
 from .preprocess_CALCE import CALCEPreprocessor
 from .preprocess_HNEI import HNEIPreprocessor
 from .preprocess_HUST import HUSTPreprocessor

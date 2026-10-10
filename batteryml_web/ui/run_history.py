@@ -469,6 +469,11 @@ def _figure(draw) -> Any:
     return figure
 
 
+def _show_figure(draw) -> None:
+    """Render a chart at the available tab width instead of clipping it."""
+    st.pyplot(_figure(draw), clear_figure=True, use_container_width=True)
+
+
 def render_rul_figures(view: Dict[str, Any]) -> None:
     """Observed-vs-predicted and residuals, or an explicit refusal.
 
@@ -499,7 +504,7 @@ def render_rul_figures(view: Dict[str, Any]) -> None:
             axes.set_xlabel("Observed")
             axes.set_ylabel("Predicted")
 
-        st.pyplot(_figure(_scatter), clear_figure=True)
+        _show_figure(_scatter)
     with right:
         st.caption("Residuals (predicted − observed)")
 
@@ -509,7 +514,7 @@ def render_rul_figures(view: Dict[str, Any]) -> None:
             axes.set_xlabel("Observed")
             axes.set_ylabel("Residual")
 
-        st.pyplot(_figure(_residuals), clear_figure=True)
+        _show_figure(_residuals)
 
 
 def render_rul_cycle_figure(view: Dict[str, Any], *, max_cells: int = 6) -> None:
@@ -558,7 +563,7 @@ def render_rul_cycle_figure(view: Dict[str, Any], *, max_cells: int = 6) -> None
         axes.set_ylabel("Remaining useful life (cycles)")
         axes.legend(loc="best", fontsize="small")
 
-    st.pyplot(_figure(_curves), clear_figure=True)
+    _show_figure(_curves)
 
 
 def render_soh_figures(view: Dict[str, Any], *, max_cells: int = 6) -> None:
@@ -600,7 +605,7 @@ def render_soh_figures(view: Dict[str, Any], *, max_cells: int = 6) -> None:
             axes.set_xlabel("Observed SOH (ratio)")
             axes.set_ylabel("Estimated SOH (ratio)")
 
-        st.pyplot(_figure(_scatter), clear_figure=True)
+        _show_figure(_scatter)
     with right:
         st.caption(f"SOH across cycles, first {max_cells} test cell(s)")
 
@@ -631,7 +636,7 @@ def render_soh_figures(view: Dict[str, Any], *, max_cells: int = 6) -> None:
             if selected:
                 axes.legend(loc="best", fontsize="small")
 
-        st.pyplot(_figure(_per_cell), clear_figure=True)
+        _show_figure(_per_cell)
 
     render_soh_range_diagnostics(view)
 
@@ -701,7 +706,7 @@ def render_trajectory_figure(view: Dict[str, Any], *, limit: int = 8) -> None:
             axes.legend(loc="best", fontsize="small")
 
     st.caption(f"{view['count']} trajectory(ies), {view['length']} point(s) each")
-    st.pyplot(_figure(_draw), clear_figure=True)
+    _show_figure(_draw)
 
 
 def render_prediction_table(view: Dict[str, Any], *, limit: int = 200) -> None:

@@ -422,8 +422,19 @@ class RunManager:
         pid = getattr(process, "pid", None)
         if pid is None:
             return
+        # ``killpg``/``getpgid`` are POSIX-only.  Windows still needs a
+        # targeted cancellation path, so fall back to the Popen handle rather
+        # than attempting to call an API that does not exist on that host.
+        kill_group = getattr(os, "killpg", None)
+        get_group = getattr(os, "getpgid", None)
+        if kill_group is None or get_group is None:
+            try:
+                process.send_signal(sig)
+            except Exception:  # noqa: BLE001
+                pass
+            return
         try:
-            os.killpg(os.getpgid(pid), sig)
+            kill_group(get_group(pid), sig)
         except (ProcessLookupError, PermissionError, OSError):
             # Fall back to the single process; still targeted, never broad.
             try:
