@@ -43,7 +43,13 @@ class MATRPreprocessor(BasePreprocessor):
 
 
 def load_batch(file, k):
-    f = h5py.File(file)
+    try:
+        f = h5py.File(file)
+    except OSError as exc:
+        raise OSError(
+            f'MATR batch file is incomplete or corrupt: {file.name}. '
+            'Delete it and download the file again.'
+        ) from exc
     batch = f['batch']
     num_cells = batch['summary'].shape[0]
     bat_dict = {}

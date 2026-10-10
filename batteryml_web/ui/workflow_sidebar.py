@@ -20,6 +20,7 @@ import streamlit as st
 from ..core.project_context import resolve_project
 from .llm_state import llm_settings_summary
 from .settings_panel import render_sidebar_settings
+from .sidebar_style import SIDEBAR_THEME_CSS
 from .styles import render_layout_css
 from .surfaces import NAV_ROLE
 
@@ -189,6 +190,11 @@ SIDEBAR_GROUP_KEYS: tuple[str, ...] = (
 
 
 def render_sidebar_workflow():
+    # Keep the visual theme independent from the tuned spacing sheet.  The
+    # sidebar is rendered on every page, so its light card language must be
+    # injected here rather than relying on home_style.py.
+    st.markdown(SIDEBAR_THEME_CSS, unsafe_allow_html=True)
+
     # Spacing only, and injected before the sidebar is drawn so the first
     # paint is already compact. See ui/styles.py for what it may not do.
     render_layout_css()

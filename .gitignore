@@ -64,3 +64,4 @@ third_party/PBT/
 var/
 wheels/
 workspaces/
+.venv/

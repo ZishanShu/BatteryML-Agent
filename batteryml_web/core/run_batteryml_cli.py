@@ -2,6 +2,8 @@ import runpy
 import sys
 from pathlib import Path
 
+import requests
+
 
 def main():
     repo_root = Path(__file__).resolve().parents[2]
@@ -51,6 +53,15 @@ def main():
         # through runpy would only bury it.
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1)
+    except requests.exceptions.RequestException as exc:
+        # A network failure outside the safe downloader, which reports its
+        # own failures above as DownloadError with the URL it tried.
+        print(
+            f"error: network request failed ({exc}). "
+            "Check firewall/network policy or configure HTTPS_PROXY, then retry.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from None
 
 
 if __name__ == "__main__":

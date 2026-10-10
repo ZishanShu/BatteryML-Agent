@@ -390,7 +390,9 @@ class TestBoundedCodeViewports(unittest.TestCase):
         came down from 4510px to the cap.
         """
         self.assertIn("max-height:", surfaces.SURFACE_CSS)
-        self.assertNotIn("\n    height:", surfaces.SURFACE_CSS)
+        # No fixed height anywhere; ``height: auto`` (let content decide) is
+        # the opposite of a fixed height and is allowed.
+        self.assertIsNone(re.search(r"(?m)^\s+height:\s*[0-9.]", surfaces.SURFACE_CSS))
         self.assertIn("overflow: auto", surfaces.SURFACE_CSS)
 
     def test_both_viewports_are_scoped_to_app_owned_keys(self) -> None:

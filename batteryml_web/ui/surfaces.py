@@ -345,6 +345,51 @@ SURFACE_CSS = f"""
     max-height: {_VIEWPORT_MAX_REM}rem;
     overflow: auto;
 }}
+
+/* Live download/preprocess output is intentionally shorter than a result
+   log.  Ten lines keep the action area compact.  The Python renderer orders
+   the captured tail newest-first so this plain scroll surface opens on the
+   newest output without rotating text or depending on browser scroll APIs. */
+[class*="st-key-bml_progress_log"] .bml-progress-log-scroll,
+[class*="st-key-bml_progress_log_details"] pre {{
+    max-height: 12rem;
+    overflow-y: auto;
+    overflow-x: auto;
+}}
+[class*="st-key-bml_progress_log"] .bml-progress-log-scroll {{
+    box-sizing: border-box;
+    padding: 0.55rem 0.7rem;
+    border: 1px solid color-mix(in srgb, currentColor 14%, transparent);
+    border-radius: 12px;
+    background: color-mix(in srgb, CanvasText 3%, Canvas);
+    scrollbar-color: color-mix(in srgb, CanvasText 28%, transparent) transparent;
+}}
+[class*="st-key-bml_progress_log"] .bml-progress-log-scroll pre {{
+    margin: 0;
+    white-space: pre;
+    overflow-wrap: normal;
+    font-size: 0.78rem;
+    line-height: 1.2rem;
+}}
+/* Explicitly neutralize stale hot-reload styles that used scaleY(-1), which
+   made terminal output appear vertically mirrored in an existing session. */
+[class*="st-key-bml_progress_log"] .bml-progress-log-scroll,
+[class*="st-key-bml_progress_log"] .bml-progress-log-scroll pre,
+[class*="st-key-bml_progress_log_details"] pre {{
+    transform: none !important;
+    direction: ltr;
+    writing-mode: horizontal-tb;
+    unicode-bidi: plaintext;
+}}
+
+/* Result tabs must grow with their own content. In particular, prediction
+   figures can be taller than the Summary tab and must remain fully visible. */
+[data-testid="stTabs"] [role="tabpanel"],
+[data-testid="stTabs"] [data-baseweb="tab-panel"] {{
+    height: auto !important;
+    max-height: none !important;
+    overflow: visible !important;
+}}
 </style>
 """
 

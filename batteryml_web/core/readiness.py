@@ -470,9 +470,20 @@ def assess_dataset(
         # A BatteryLife v11 dataset — extracted or archived — is detected but
         # has no BatteryML preprocessor, so it stays False and no preprocess
         # command is ever offered for it. Detected is not runnable.
+        # An empty or incomplete processed directory must not hide the
+        # native preprocessor.  This is the normal state after a first
+        # interrupted/failed preprocessing attempt: the user still needs a
+        # real "Run preprocessing" action, and MATR (among the native
+        # BatteryML datasets) is able to provide it.  The previous
+        # RAW_ONLY-only gate turned that state into a misleading
+        # "automatic preprocessing is not enabled" warning.
         preprocessing_supported=(
-            status is DatasetStatus.RAW_ONLY
+            status in {
+                DatasetStatus.RAW_ONLY,
+                DatasetStatus.INCOMPLETE_PROCESSED,
+            }
             and best is not None
+            and best.kind == "native"
             and best.preprocessable
         ),
     )

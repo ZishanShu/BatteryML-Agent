@@ -526,8 +526,31 @@ def _zoom_choice(scope: str) -> bool:
     return choice == ZOOM_OPTIONS[1]
 
 
+def _pyplot_full_width(figure: Any) -> None:
+    """Draw a figure at the available tab width instead of clipping it.
+
+    Newer Streamlit takes ``width="stretch"`` (``use_container_width`` is
+    deprecated there); older releases only know ``use_container_width``.
+    """
+    import inspect
+
+    try:
+        accepts_width = "width" in inspect.signature(st.pyplot).parameters
+    except (TypeError, ValueError):
+        accepts_width = False
+    if accepts_width:
+        st.pyplot(figure, clear_figure=True, width="stretch")
+    else:
+        st.pyplot(figure, clear_figure=True, use_container_width=True)
+
+
 def _show(panel: Dict[str, Any]) -> None:
-    st.pyplot(panel["figure"], clear_figure=True)
+    _pyplot_full_width(panel["figure"])
+
+
+def _show_figure(draw) -> None:
+    """Render a chart drawn by ``draw`` at the available tab width."""
+    _pyplot_full_width(_figure(draw))
 
 
 def _render_export_action(view: Dict[str, Any], scope: str, *, cell_id: Optional[str]) -> None:
@@ -667,7 +690,7 @@ def render_rul_cycle_figure(view: Dict[str, Any], *, max_cells: int = 6) -> None
         axes.set_ylabel("Remaining useful life (cycles)")
         axes.legend(loc="best", fontsize="small")
 
-    st.pyplot(_figure(_curves), clear_figure=True)
+    _show_figure(_curves)
 
 
 def render_soh_figures(view: Dict[str, Any], *, placement: str = "result") -> None:
@@ -824,7 +847,7 @@ def render_trajectory_figure(view: Dict[str, Any], *, limit: int = 8) -> None:
             axes.legend(loc="best", fontsize="small")
 
     st.caption(f"{view['count']} trajectory(ies), {view['length']} point(s) each")
-    st.pyplot(_figure(_draw), clear_figure=True)
+    _show_figure(_draw)
 
 
 def render_prediction_table(view: Dict[str, Any], *, limit: int = 200) -> None:

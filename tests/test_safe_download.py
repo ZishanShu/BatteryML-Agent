@@ -327,12 +327,18 @@ class TestWiring(unittest.TestCase):
         self.assertIn("install_safe_download", problems[0])
 
     def test_upstream_is_unmodified_by_this_fix(self) -> None:
-        """CLAUDE.md §4: the upstream function still has its own body."""
+        """CLAUDE.md §4: this fix lives in batteryml_web and never edits upstream.
+
+        Upstream ``download.py`` has its own owner-approved change (UP-04);
+        a change there must be recorded in docs/UPSTREAM_PATCHES.md.
+        """
         source = (REPO_ROOT / "batteryml" / "preprocess" / "download.py").read_text(
             encoding="utf-8"
         )
-        self.assertIn("with open(filename, 'wb') as f:", source)
+        self.assertIn("def download_file(", source)
         self.assertNotIn("safe_download", source)
+        patches = (REPO_ROOT / "docs" / "UPSTREAM_PATCHES.md").read_text(encoding="utf-8")
+        self.assertIn("`batteryml/preprocess/download.py`", patches)
 
 
 if __name__ == "__main__":

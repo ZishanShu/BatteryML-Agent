@@ -212,6 +212,18 @@ class TestDatasetReadiness(unittest.TestCase):
         self.assertEqual(report.processed_sample_count, 0)
         self.assertIn("empty", report.reason)
 
+    def test_native_matr_can_retry_preprocessing_after_empty_output(self) -> None:
+        """An empty output directory keeps the native MATR action available."""
+        with _TempRoots() as (raw, processed):
+            (raw / "MATR").mkdir()
+            (raw / "MATR" / "MATR_batch_20170512.mat").write_bytes(b"x")
+            (processed / "MATR").mkdir()
+
+            report = assess_dataset("MATR", raw_root=raw, processed_root=processed)
+
+        self.assertIs(report.status, DatasetStatus.INCOMPLETE_PROCESSED)
+        self.assertTrue(report.preprocessing_supported)
+
     def test_missing_dataset(self) -> None:
         with _TempRoots() as (raw, processed):
             report = assess_dataset("MICH", raw_root=raw, processed_root=processed)
