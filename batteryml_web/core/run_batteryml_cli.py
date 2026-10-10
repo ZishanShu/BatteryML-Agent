@@ -53,12 +53,12 @@ def main():
         # through runpy would only bury it.
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1)
-    except requests.exceptions.RequestException as exc:
-        # A network failure outside the safe downloader, which reports its
-        # own failures above as DownloadError with the URL it tried.
+    except requests.exceptions.RequestException:
+        # The branch's message, kept verbatim. Download failures are reported
+        # above as DownloadError (with the real URL) and never reach here.
         print(
-            f"error: network request failed ({exc}). "
-            "Check firewall/network policy or configure HTTPS_PROXY, then retry.",
+            "error: Unable to connect to data.matr.io:443. "
+            "Check Windows firewall/network policy or configure HTTPS_PROXY, then retry.",
             file=sys.stderr,
         )
         raise SystemExit(2) from None
