@@ -183,6 +183,15 @@ SIDEBAR_THEME_CSS = r"""
     font-weight: 700;
 }
 
+/* Prev / Next are two buttons, not rows of a list: their labels sit in the
+   middle. surfaces.py left-aligns every sidebar navigation button so the
+   page list reads like headings; this more specific rule exempts the pager. */
+[data-testid="stSidebar"] .st-key-sb_pager [data-testid="stButton"] > button,
+[data-testid="stSidebar"] .st-key-sb_pager [data-testid="stButton"] > button > div {
+    justify-content: center;
+    text-align: center;
+}
+
 [data-testid="stSidebar"] .st-key-sb_pager [data-testid="stButton"] > button:hover {
     border-color: rgba(40,123,245,0.44);
     background: rgba(234,244,255,0.96);
