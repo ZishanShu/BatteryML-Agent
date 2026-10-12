@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import pickle
 import subprocess
 import sys
 import time
@@ -74,8 +73,8 @@ from batteryml_web.core import direct_runs
 from batteryml_web.core.run_identity import new_run_id
 from batteryml_web.core import run_manifest as rm
 from batteryml_web.core.run_manifest import find_run
+from batteryml_web.core import config_upload, quick_experience
 from batteryml_web.core.config_semantics import (
-    infer_config_semantics,
     load_config_semantics,
     model_display_name,
 )
@@ -146,11 +145,14 @@ if "project_name" not in st.session_state:
     st.session_state["project_name"] = None
 if "current_project" not in st.session_state:
     st.session_state["current_project"] = None
-if "home_entry" not in st.session_state:
+if "home_entry_defaulted" not in st.session_state:
     # Quick experience is the documented first path.  Showing its detail
     # panel on first load makes the default visible instead of leaving the
     # highlighted card looking like an unexplained selection.
-    st.session_state["home_entry"] = "quick"
+    # Applied once per session: "← Choose another start path" clears
+    # home_entry, and re-defaulting it on every rerun made that button a no-op.
+    st.session_state.setdefault("home_entry", "quick")
+    st.session_state["home_entry_defaulted"] = True
 if "selected_dataset" not in st.session_state:
     st.session_state["selected_dataset"] = "MATR"
 if "selected_task" not in st.session_state:
@@ -524,13 +526,9 @@ def _raw_download_progress(dataset: str, raw_path: Path) -> tuple[int, int, bool
     return present, len(expected_names), present == len(expected_names)
 
 
-def _refresh_data_manifests() -> bool:
-    """Refresh the local dataset/config catalog after a data action."""
-    result = _run_cmd(
-        [sys.executable, "tools/sync_data_and_config_manifests.py"],
-        cwd=REPO_ROOT,
-    )
-    return result["returncode"] == 0
+def _refresh_data_manifests() -> tuple[bool, str]:
+    """Refresh the local dataset/config catalog after a data action; ``(ok, detail)``."""
+    return quick_experience.sync_manifests(REPO_ROOT, python=sys.executable, run=_run_cmd)
 
 
 def _data_action_root() -> Path:
@@ -698,35 +696,6 @@ def _finish_page_run(
         metrics=metrics,
         metrics_error=metrics_error,
     )
-
-
-def _read_run_metrics(workspace_dir: Path) -> dict[str, float]:
-    """Read BatteryML's saved evaluation scores from the completed workspace."""
-    candidates = sorted(
-        workspace_dir.glob("predictions_seed_*.pkl"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    for path in candidates:
-        try:
-            with path.open("rb") as stream:
-                payload = pickle.load(stream)
-        except (OSError, EOFError, pickle.PickleError, AttributeError, ValueError):
-            continue
-        scores = payload.get("scores") if isinstance(payload, dict) else None
-        if not isinstance(scores, dict):
-            continue
-        metrics: dict[str, float] = {}
-        for name, value in scores.items():
-            try:
-                number = float(value)
-            except (TypeError, ValueError):
-                continue
-            if number == number and number not in (float("inf"), float("-inf")):
-                metrics[str(name)] = number
-        if metrics:
-            return metrics
-    return {}
 
 
 def _current_project_name() -> str:
@@ -960,12 +929,14 @@ def _quick_failure_reason(result: dict[str, Any]) -> str:
             "MATR 原始文件不完整或已损坏。请删除日志中指出的文件，"
             "重新下载并保持文件名不变，然后再次处理。"
         )
-    if "data.matr.io" in lower_tail and any(
+    # The host the failing download itself named — never an assumed one.
+    failed_host = quick_experience.download_failure_host(tail)
+    if failed_host and any(
         marker in lower_tail
         for marker in ("connectionerror", "winerror 10013", "max retries", "unable to connect")
     ):
         return (
-            "无法连接 data.matr.io:443。请检查 Windows 防火墙/网络策略，"
+            f"无法连接 {failed_host}。请检查 Windows 防火墙/网络策略，"
             "或配置 HTTPS_PROXY 后重试；未完成的临时文件已清理。"
         )
     lines = [line.strip() for line in tail.splitlines() if line.strip()]
@@ -1009,15 +980,14 @@ def _run_home_data_action(
 def _run_home_experiment(
     *,
     project_root: Path | None,
-    dataset: str,
-    task: str,
-    model_key: str,
-    model_display: str,
-    config_path: Path,
-    device: str,
+    plan: quick_experience.QuickPlan,
     demo_progress_host: Any,
 ) -> tuple[dict[str, Any], Path, Path, str]:
     """Run Quick experience once, recorded exactly like every other page run.
+
+    ``plan`` is the validated selection (``quick_experience.build_quick_plan``,
+    re-checked by the caller immediately before this call); an invalid plan is
+    refused here as well, so nothing unvalidated can start.
 
     The run gets its own folder, ``<project>/quickstart/<run_id>/``, which is
     also BatteryML's ``--workspace`` (``direct_runs``), so its run.json sits
@@ -1027,21 +997,21 @@ def _run_home_experiment(
     other. Returns ``(result, run_dir, workspace_dir, run_id)``; the run
     folder and the workspace are the same directory.
     """
+    if not plan.valid:
+        raise ValueError("Quick experience refused an invalid plan: " + "; ".join(plan.errors))
     workspace_root = project_root or _data_action_root()
     workspace_root.mkdir(parents=True, exist_ok=True)
-    run_id = new_run_id(dataset=dataset, model=model_key or "model", seed=0)
+    dataset = str(plan.dataset)
+    task = str(plan.task)
+    model_key = str(plan.model_key or "model")
+    config_path = Path(str(plan.config_path))
+    run_id = new_run_id(dataset=dataset, model=model_key, seed=0)
     run_dir = direct_runs.direct_run_dir(workspace_root, "quickstart", run_id)
     try:
         workspace = Path(os.path.relpath(run_dir, REPO_ROOT)).as_posix()
     except ValueError:  # another drive on Windows: keep the absolute path
         workspace = run_dir.as_posix()
-    command = build_run_command(
-        config_path=str(config_path),
-        workspace=workspace,
-        task=task,
-        device=device,
-        seed=0,
-    )
+    command = quick_experience.plan_command(plan, workspace=workspace, seed=0)
     _begin_page_run(
         run_id=run_id,
         workspace=workspace,
@@ -1049,10 +1019,10 @@ def _run_home_experiment(
         dataset=dataset,
         task=task,
         model_key=model_key,
-        model_display=model_display,
+        model_display=plan.model_display,
         config_path=config_path,
         seed=0,
-        device=device,
+        device=str(plan.device),
         command=command,
     )
     result = run_command_with_progress(
@@ -1090,6 +1060,15 @@ def _run_home_experiment(
     return result, run_dir, run_dir, run_id
 
 
+def _quick_uploaded_configs() -> list[dict[str, Any]]:
+    """Validated uploads of this session that are still where they were stored."""
+    root = _data_action_root()
+    return [
+        item for item in st.session_state.get("quick_uploaded_configs") or []
+        if config_upload.is_managed_upload(Path(str(item.get("path"))), root)
+    ]
+
+
 def _render_home_entry_workflow(entry: str) -> None:
     """Give Create and Existing projects the same four-step mental model."""
     st.markdown("#### Workflow steps")
@@ -1120,6 +1099,17 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
         st.session_state["quick_device_selector"] = "cpu"
     if "quick_config_selector" not in st.session_state:
         st.session_state["quick_config_selector"] = str(_home_resolve_path(QUICKSTART_CONFIG))
+    if "quick_model_selector" not in st.session_state:
+        # First visit: the model of the default protocol (MATR · XGBoost), as before.
+        st.session_state["quick_model_selector"] = load_config_semantics(
+            _home_resolve_path(QUICKSTART_CONFIG)
+        ).model_key
+    pending_upload = st.session_state.pop("quick_pending_upload", None)
+    if pending_upload:
+        st.session_state["quick_task_selector"] = pending_upload["task"]
+        st.session_state["quick_model_selector"] = pending_upload["model_key"]
+        st.session_state["quick_config_selector"] = pending_upload["path"]
+        st.session_state["quick_uploaded_notice"] = pending_upload["path"]
 
     st.markdown("#### 1 · Prepare data")
     # Keep the raw dataset choice in the Prepare Data step.  The built-in Quick
@@ -1188,7 +1178,8 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
             )
             st.session_state["quick_data_action_error"] = None if result["success"] else _quick_failure_reason(result)
             if result["success"]:
-                _refresh_data_manifests()
+                synced, sync_detail = _refresh_data_manifests()
+                st.session_state["quick_manifest_sync_error"] = None if synced else sync_detail
                 notify_success("Raw data downloaded", event_key=EVENT_PREPROCESS_DONE, signature=[dataset, "download"])
                 st.rerun()
     with data_cols[1]:
@@ -1209,7 +1200,8 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
             )
             st.session_state["quick_data_action_error"] = None if result["success"] else _quick_failure_reason(result)
             if result["success"]:
-                _refresh_data_manifests()
+                synced, sync_detail = _refresh_data_manifests()
+                st.session_state["quick_manifest_sync_error"] = None if synced else sync_detail
                 notify_success("Processed data is ready", event_key=EVENT_PREPROCESS_DONE, signature=[dataset, "preprocess"])
                 st.rerun()
     if not raw_ready:
@@ -1218,6 +1210,11 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
         st.warning("This raw layout is detected, but BatteryML does not provide an automatic preprocessing route for it.")
     if st.session_state.get("quick_data_action_error"):
         st.error(str(st.session_state["quick_data_action_error"]))
+    if st.session_state.get("quick_manifest_sync_error"):
+        st.error(
+            "The data action finished, but the dataset and configuration list could not be "
+            f"refreshed: {st.session_state['quick_manifest_sync_error']}"
+        )
 
     st.markdown("#### 2 · Configure model")
     task_options = ["RUL prediction", "SOH estimation"]
@@ -1226,87 +1223,116 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
         current_task = "RUL prediction"
         st.session_state["quick_task_selector"] = current_task
     task_choice = st.selectbox("Prediction task", task_options, key="quick_task_selector")
+    # Task -> model -> config, never the other way round: every option below is
+    # recomputed from the task on screen, so a config that trains another task
+    # (or belongs to another model) cannot stay selected.
     entries = _quick_config_entries(task_choice)
-    model_options = list(dict.fromkeys(entry.model_key for entry in entries))
+    config_options = [
+        quick_experience.ConfigOption(str(_home_resolve_path(entry.config_path)), entry.task, entry.model_key)
+        for entry in entries
+    ] + [
+        quick_experience.ConfigOption(item["path"], item["task"], item["model_key"])
+        for item in _quick_uploaded_configs()
+    ]
+    model_options = list(dict.fromkeys(
+        option.model_key for option in config_options
+        if option.task == task_choice and option.model_key
+    ))
     if not model_options:
-        model_options = ["xgb"]
-    preferred_config = _home_resolve_path(
-        st.session_state.get("quick_config_selector", QUICKSTART_CONFIG)
-    )
-    preferred_semantics = load_config_semantics(preferred_config)
-    current_model = st.session_state.get("quick_model_selector")
-    if preferred_semantics.model_key in model_options:
-        current_model = preferred_semantics.model_key
-        st.session_state["quick_model_selector"] = current_model
-    if current_model not in model_options:
-        current_model = model_options[0]
-        st.session_state["quick_model_selector"] = current_model
+        st.error(f"No {task_choice} configuration is registered for {dataset}.")
+    if st.session_state.get("quick_model_selector") not in model_options:
+        st.session_state["quick_model_selector"] = model_options[0] if model_options else None
     model_key = st.selectbox(
         "Prediction model",
         model_options,
         format_func=lambda value: next((entry.model_display for entry in entries if entry.model_key == value), model_display_name(value) or value),
         key="quick_model_selector",
     )
-    config_paths = [str(_home_resolve_path(entry.config_path)) for entry in entries if entry.model_key == model_key]
-    selected_config = preferred_config
-    if selected_config.exists() and str(selected_config) not in config_paths:
-        config_paths.insert(0, str(selected_config))
-    if not config_paths:
-        config_paths = [str(_home_resolve_path(QUICKSTART_CONFIG))]
-    if str(selected_config) not in config_paths:
-        selected_config = Path(config_paths[0])
-        st.session_state["quick_config_selector"] = str(selected_config)
+    config_paths = quick_experience.config_choices(config_options, task=task_choice, model_key=model_key)
+    selected_config, cleared_config = quick_experience.reconcile_config(
+        st.session_state.get("quick_config_selector"),
+        config_paths,
+        # The page's default protocol (MATR primary split) when this model has it.
+        default=next((path for path in config_paths if Path(path).stem == QUICKSTART_CONFIG.stem), None),
+    )
+    st.session_state["quick_config_selector"] = selected_config
     config_choice = st.selectbox(
         "Protocol configuration",
         config_paths,
         format_func=lambda value: f"{Path(value).stem} · {_home_display_path(value)}",
         key="quick_config_selector",
     )
-    config_path = _home_resolve_path(config_choice)
-    device = st.selectbox("Compute device", ["cpu", "cuda"], key="quick_device_selector")
-    if device == "cuda" and not torch.cuda.is_available():
-        st.warning("CUDA is not available in this environment, so CPU will be used.")
-        device = "cpu"
-        st.session_state["quick_device_selector"] = "cpu"
+    if cleared_config:
+        st.caption(
+            f"{_home_display_path(cleared_config)} is not a {task_choice} configuration for this "
+            "model, so it is no longer selected."
+        )
+    config_path = _home_resolve_path(config_choice) if config_choice else None
+    cuda_ok, cuda_detail = quick_experience.cuda_available()
+    device = st.selectbox(
+        "Compute device",
+        list(quick_experience.DEVICE_OPTIONS),
+        format_func=lambda value: value if value == quick_experience.CPU or cuda_ok else f"{value} (not available on this machine)",
+        key="quick_device_selector",
+    )
+    device_issue = quick_experience.device_problem(device, cuda_ok=cuda_ok, cuda_detail=cuda_detail)
+    if device_issue:
+        st.warning(device_issue)
 
     uploaded = st.file_uploader("Upload YAML configuration (optional)", type=["yaml", "yml"], key="quick_config_upload")
     if uploaded is not None and st.button("Apply uploaded configuration", type=NAV_ROLE, key="quick_apply_config"):
-        try:
-            uploaded_data = yaml.safe_load(uploaded.getvalue().decode("utf-8"))
-        except (UnicodeDecodeError, yaml.YAMLError) as exc:
-            uploaded_data = None
-            st.error(f"The YAML file could not be read: {exc}")
-        if isinstance(uploaded_data, dict):
-            target = _data_action_root() / "configs" / Path(uploaded.name).name
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(yaml.safe_dump(uploaded_data, sort_keys=False), encoding="utf-8")
-            semantics = infer_config_semantics(uploaded_data, source_path=target)
-            if semantics.dataset:
-                st.session_state["quick_dataset"] = semantics.dataset
-            if semantics.task in task_options:
-                st.session_state["quick_task_selector"] = semantics.task
-            if semantics.model_key:
-                st.session_state["quick_model_selector"] = semantics.model_key
-            st.session_state["quick_config_selector"] = str(target)
-            st.session_state["selected_config"] = str(target)
-            st.session_state["quick_uploaded_notice"] = str(target)
+        # Applying selects the config after validation; it never starts a run.
+        outcome = config_upload.stage_uploaded_config(
+            uploaded.getvalue(),
+            uploaded.name,
+            managed_root=_data_action_root(),
+            repo_root=REPO_ROOT,
+            allowed_datasets=dataset_options,
+            allowed_tasks=task_options,
+        )
+        if outcome.ok:
+            record = {"path": str(outcome.path), "task": outcome.task, "model_key": outcome.model_key}
+            st.session_state.setdefault("quick_uploaded_configs", []).append(record)
+            # Widgets above are already drawn: the selection is applied at the
+            # top of the next run, before they are instantiated.
+            st.session_state["quick_pending_upload"] = record
+            st.session_state.pop("quick_upload_error", None)
             st.rerun()
+        else:
+            st.session_state["quick_upload_error"] = list(outcome.errors)
+    if st.session_state.get("quick_upload_error"):
+        st.error(
+            "The uploaded configuration was not applied; the previous selection is unchanged.\n\n"
+            + "\n".join(f"- {problem}" for problem in st.session_state["quick_upload_error"])
+        )
 
-    semantics = load_config_semantics(config_path)
-    display_dataset = semantics.dataset or dataset
-    display_task = semantics.task or task_choice
-    display_model = semantics.model_display or model_display_name(model_key) or model_key
+    plan_inputs = dict(
+        task=task_choice,
+        config_path=config_path,
+        device=device,
+        repo_root=REPO_ROOT,
+        allowed_datasets=dataset_options,
+        cuda_ok=cuda_ok,
+        cuda_detail=cuda_detail,
+        uploaded=bool(config_path) and config_upload.is_managed_upload(config_path, _data_action_root()),
+    )
+    plan = quick_experience.build_quick_plan(**plan_inputs, require_data=True)
+    semantics = load_config_semantics(config_path) if config_path else None
+    display_dataset = (semantics.dataset if semantics else None) or dataset
+    display_task = task_choice
+    display_model = (semantics.model_display if semantics else None) or model_display_name(model_key) or model_key or "none"
     st.info(
         f"This configuration means: **Dataset** {display_dataset} · **Task** {display_task} · "
-        f"**Prediction model** {display_model} · **Device** {device} · **Config file** {config_path.name}"
+        f"**Prediction model** {display_model} · **Device** {device} · "
+        f"**Config file** {config_path.name if config_path else 'not selected'}"
     )
-    if st.session_state.get("quick_uploaded_notice"):
+    if st.session_state.get("quick_uploaded_notice") and str(config_path) == st.session_state["quick_uploaded_notice"]:
         st.caption(f"Uploaded configuration: {_home_display_path(st.session_state['quick_uploaded_notice'])}")
     st.session_state["quick_dataset"] = display_dataset
     st.session_state["selected_dataset"] = display_dataset
     st.session_state["selected_task"] = display_task
-    st.session_state["selected_model"] = semantics.model_key or model_key
-    st.session_state["selected_config"] = str(config_path)
+    st.session_state["selected_model"] = (semantics.model_key if semantics else None) or model_key
+    st.session_state["selected_config"] = str(config_path) if config_path else ""
     st.session_state["selected_device"] = device
 
     st.markdown("#### 3 · Run training")
@@ -1315,11 +1341,17 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
     if project_root is None:
         st.caption("No project is selected. Quick experience will use this local workspace:")
     st.code(str(workspace_root), language="text")
-    run_ready = processed_ready and config_path.exists()
+    run_ready = processed_ready and plan.valid
     if not processed_ready:
         st.warning("Process the dataset in step 1 before starting a model run.")
-    if not config_path.exists():
-        st.warning(f"Configuration file is missing: {_home_display_path(config_path)}")
+    # Data readiness is reported once, by the line above; every other reason
+    # the Run button is disabled is listed here.
+    shown_plan = plan if processed_ready else quick_experience.build_quick_plan(**plan_inputs, require_data=False)
+    for problem in shown_plan.errors:
+        if problem != device_issue:
+            st.error(problem)
+    for problem in st.session_state.pop("quick_run_blocked", None) or []:
+        st.error(f"The run was not started: {problem}")
     demo_progress_host = st.container()
     if st.button(
         "Run experiment",
@@ -1328,16 +1360,18 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
         key="home_quick_run_experiment",
         disabled=not run_ready,
     ):
+        # Re-validated from disk immediately before launch: what runs is what
+        # was checked, even if the file or the machine changed since drawing.
+        final_plan = quick_experience.build_quick_plan(**plan_inputs, require_data=True)
+        if not final_plan.valid:
+            st.session_state["quick_run_blocked"] = list(final_plan.errors)
+            st.rerun()
         result, run_dir, workspace_dir, run_id = _run_home_experiment(
             project_root=project_root,
-            dataset=display_dataset,
-            task=display_task,
-            model_key=str(semantics.model_key or model_key),
-            model_display=display_model,
-            config_path=config_path,
-            device=device,
+            plan=final_plan,
             demo_progress_host=demo_progress_host,
         )
+        metrics, metrics_problem = quick_experience.run_metrics(run_dir)
         st.session_state["last_run_status"] = "success" if result["success"] else "failed"
         st.session_state["last_run_time"] = result["elapsed"]
         st.session_state["last_run_code"] = result["return_code"]
@@ -1345,7 +1379,8 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
         st.session_state["last_run_log_path"] = str(run_dir / "run.log")
         st.session_state["last_run_command"] = " ".join(str(part) for part in result.get("command") or [])
         st.session_state["last_run_id"] = run_id
-        st.session_state["last_run_metrics"] = _read_run_metrics(workspace_dir) if result["success"] else {}
+        st.session_state["last_run_metrics"] = metrics if result["success"] else {}
+        st.session_state["last_run_metrics_problem"] = metrics_problem if result["success"] else None
         st.session_state["project_root"] = str(workspace_root)
         st.session_state["project_name"] = workspace_root.name
         st.session_state["current_project"] = workspace_root.name
@@ -1365,6 +1400,8 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
                 with column:
                     st.metric(str(name).upper(), f"{float(value):.4f}")
             st.caption(f"Run {st.session_state.get('last_run_id') or 'latest'} · metrics recorded by BatteryML")
+        elif st.session_state.get("last_run_metrics_problem"):
+            st.warning(f"The run completed, but its metrics could not be read: {st.session_state['last_run_metrics_problem']}")
         else:
             st.info("The run completed, but BatteryML did not save evaluation metrics for this run.")
     elif last_status == "failed":
