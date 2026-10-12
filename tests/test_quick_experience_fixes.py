@@ -677,15 +677,13 @@ class _ReadyMATRStatus(_ReadyMATR):
         return self._report.status
 
 
-@unittest.skipIf(AppTest is None, "streamlit.testing is not available")
-class TestRunModelDevicePage(_PageHarness, unittest.TestCase):
-    """Run Model → Device on a machine with and without CUDA.
+class _RunModelHarness(_PageHarness):
+    """The page harness with MATR listed and READY on Run Model.
 
-    Run is never pressed here: Run Model records every run under the
+    Run is never pressed with it: Run Model records every run under the
     repository's own ``runs/web_projects/`` (``project_context``), and a test
     must not leave a run there. What is checked is what Run would execute —
-    the button's state and the command it is bound to — and the device the
-    session records.
+    the button's state and the command it is bound to.
     """
 
     MANIFEST = REPO_ROOT / "data" / "metadata" / "dataset_manifest.json"
@@ -720,6 +718,10 @@ class TestRunModelDevicePage(_PageHarness, unittest.TestCase):
         commands = [c.value for c in at.code if "run_batteryml_cli.py run" in c.value]
         self.assertEqual(len(commands), 1, commands)
         return commands[0]
+
+@unittest.skipIf(AppTest is None, "streamlit.testing is not available")
+class TestRunModelDevicePage(_RunModelHarness, unittest.TestCase):
+    """Run Model → Device on a machine with and without CUDA."""
 
     def device_warnings(self, at) -> List[str]:
         return [w.value for w in at.warning if "cuda" in w.value.lower()]
@@ -757,6 +759,84 @@ class TestRunModelDevicePage(_PageHarness, unittest.TestCase):
         self.assertIn("--device cuda", self.command(at))
         self.assertFalse(at.button(key="run_batteryml_btn").disabled)
         self.assertEqual(self.device_warnings(at), [])
+
+
+@unittest.skipIf(AppTest is None, "streamlit.testing is not available")
+class TestRunModelTaskPage(_RunModelHarness, unittest.TestCase):
+    """Run Model → Task: canonical labels, kept across pages, never a stale config."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.stack.enter_context(mock.patch.object(qx, "cuda_available", lambda probe=None: (False, "")))
+
+    def go(self, at, step: str) -> None:
+        at.session_state["current_step"] = step
+        at.run()
+        self.assertHealthy(at)
+
+    def set_task(self, at, task: str) -> None:
+        at.radio(key="run_task_radio").set_value(task).run()
+        self.assertHealthy(at)
+
+    def assertAgrees(self, at, task: str) -> Dict[str, Any]:
+        """Task on screen = session task = task of the displayed config = config in the command."""
+        displayed = {m.value.split("`")[1] for m in at.markdown if m.value.startswith("**Config path:**")}
+        self.assertEqual(len(displayed), 1, displayed)          # Configuration and Command & Run tabs
+        config = displayed.pop()
+        self.assertIn(f" run {config} --workspace ", self.command(at))
+        self.assertEqual(at.radio(key="run_task_radio").value, task)
+        self.assertEqual(at.session_state["selected_task"], task)
+        trains = ct.resolve_config_task(yaml.safe_load(Path(config).read_text(encoding="utf-8"))).task
+        self.assertEqual(trains, task, config)
+        return {"model": self.value(at, "run_model_select"), "config": config}
+
+    def test_fresh_home_then_run_model_opens_on_rul(self) -> None:
+        at = self.app()
+        at.run()                                                 # Home, as a user arrives
+        self.assertHealthy(at)
+        self.assertEqual(at.session_state["selected_task"], ct.TASK_RUL)
+        self.go(at, "run_model")
+        self.assertAgrees(at, ct.TASK_RUL)
+        self.assertAgrees(self.open_run_model(cuda_ok=False), ct.TASK_RUL)   # straight to Run Model
+
+    def test_explicit_soh_is_kept_across_navigation(self) -> None:
+        at = self.open_run_model(cuda_ok=False)
+        self.set_task(at, ct.TASK_SOH)
+        self.assertAgrees(at, ct.TASK_SOH)
+        for page in ("review_results", "prepare_data", "home"):
+            with self.subTest(page=page):
+                self.go(at, page)
+                if page == "home":
+                    # Home's Quick panel is unchanged and shows its own task.
+                    self.assertEqual(at.session_state["quick_task_selector"], ct.TASK_RUL)
+                self.go(at, "run_model")
+                self.assertAgrees(at, ct.TASK_SOH)
+
+    def test_home_quick_task_is_the_start_until_run_model_has_its_own(self) -> None:
+        at = self.app()
+        at.run()
+        self.select(at, "quick_task_selector", ct.TASK_SOH)
+        self.go(at, "run_model")
+        self.assertAgrees(at, ct.TASK_SOH)
+
+    def test_every_model_gets_its_task_config_and_switching_drops_stale_ones(self) -> None:
+        at = self.open_run_model(cuda_ok=False)
+        options = {}
+        for task in (ct.TASK_SOH, ct.TASK_RUL):
+            self.set_task(at, task)
+            options[task] = list(at.selectbox(key="run_model_select").options)
+        self.assertTrue(options[ct.TASK_RUL] and options[ct.TASK_SOH], options)
+        for model in options[ct.TASK_RUL]:
+            with self.subTest(model=model):
+                self.select(at, "run_model_select", model)
+                self.assertEqual(self.assertAgrees(at, ct.TASK_RUL)["model"], model)   # RUL config only
+                self.set_task(at, ct.TASK_SOH)
+                soh = self.assertAgrees(at, ct.TASK_SOH)
+                self.assertIn(soh["model"], options[ct.TASK_SOH])
+                if model in options[ct.TASK_SOH]:
+                    self.assertEqual(soh["model"], model)       # a model with an SOH config is kept
+                self.set_task(at, ct.TASK_RUL)
+                self.assertAgrees(at, ct.TASK_RUL)
 
 
 class TestMentorDesignKept(unittest.TestCase):

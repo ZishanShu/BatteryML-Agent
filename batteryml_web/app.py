@@ -73,7 +73,7 @@ from batteryml_web.core import direct_runs
 from batteryml_web.core.run_identity import new_run_id
 from batteryml_web.core import run_manifest as rm
 from batteryml_web.core.run_manifest import find_run
-from batteryml_web.core import config_upload, quick_experience
+from batteryml_web.core import config_task, config_upload, quick_experience
 from batteryml_web.core.config_semantics import (
     load_config_semantics,
     model_display_name,
@@ -156,7 +156,7 @@ if "home_entry_defaulted" not in st.session_state:
 if "selected_dataset" not in st.session_state:
     st.session_state["selected_dataset"] = "MATR"
 if "selected_task" not in st.session_state:
-    st.session_state["selected_task"] = "RUL"
+    st.session_state["selected_task"] = config_task.TASK_RUL
 if "selected_model" not in st.session_state:
     st.session_state["selected_model"] = "XGBoost"
 if "selected_config" not in st.session_state:
@@ -563,6 +563,10 @@ def _collect_run_outputs(project_root: Path, config_path: Path, log_path: Path, 
 
 #: Session key for the run id the Run Model page shows before Run is pressed.
 RUN_MODEL_RESERVED_ID_KEY = "run_model_reserved_run"
+#: The Task the user last chose on Run Model. A plain key, not the radio's:
+#: Streamlit drops a widget's state while another page is shown, and Home's
+#: Quick panel rewrites ``selected_task`` on every render it draws.
+RUN_MODEL_TASK_KEY = "run_model_task"
 
 
 def _project_for_runs() -> dict[str, Any]:
@@ -2317,12 +2321,30 @@ def _render_run_model_without_datasets() -> None:
     render_bottom_step_navigation()
 
 
+def _remember_run_model_task() -> None:
+    """``on_change`` of Run Model's Task radio: record the user's explicit choice."""
+    st.session_state[RUN_MODEL_TASK_KEY] = st.session_state["run_task_radio"]
+
+
+def _run_model_initial_task() -> str:
+    """The Task Run Model opens with, as a canonical label.
+
+    The user's own choice on this page wins; until there is one, the session's
+    task (set by Home's Quick panel), and RUL when neither names a task.
+    """
+    return (
+        config_task.canonical_task(st.session_state.get(RUN_MODEL_TASK_KEY))
+        or config_task.canonical_task(st.session_state.get("selected_task"))
+        or config_task.TASK_RUL
+    )
+
+
 def render_run_model_page():
     st.header("🚀 Run Model", anchor=False)
     st.caption("Configure dataset, prediction task, model, device, and execute the deterministic BatteryML workflow.")
     configs = _discover_run_configs()
     datasets = _ui_dataset_options()
-    tasks = ["RUL prediction", "SOH estimation"]
+    tasks = list(config_task.SUPPORTED_TASK_LABELS)
     readiness = {ds: _dataset_card(ds) for ds in datasets}
 
     # Checked once, here, rather than inside each tab: every tab below reads a
@@ -2366,12 +2388,17 @@ def render_run_model_page():
             ds_idx = datasets.index(st.session_state.get("selected_dataset", "MATR")) if st.session_state.get("selected_dataset", "MATR") in datasets else 0
             ds = st.selectbox("Dataset", datasets, index=ds_idx, key="run_dataset_select")
             st.session_state["selected_dataset"] = ds
-            task_choice = st.radio("Task", tasks, index=0 if st.session_state.get("selected_task", "RUL") == "RUL" else 1, key="run_task_radio", horizontal=True)
+            task_choice = st.radio("Task", tasks, index=tasks.index(_run_model_initial_task()), key="run_task_radio", horizontal=True, on_change=_remember_run_model_task)
             st.session_state["selected_task"] = task_choice
             available_models = sorted({entry.model_key for entry in get_config_registry(str(REPO_ROOT)).get_entries(ds, task_choice)})
             if not available_models:
                 st.warning("No configured model is available for this dataset/task. Please add a valid YAML config.")
                 available_models = []
+            # A model with no config for this task is not kept: cleared before
+            # the selectbox is drawn, so it opens on the task's first model.
+            # The config below is looked up from (dataset, task, model).
+            if st.session_state.get("run_model_select") not in (available_models or [""]):
+                st.session_state.pop("run_model_select", None)
             model = st.selectbox("Model", options=available_models or [""], index=0, key="run_model_select", disabled=not available_models)
             st.session_state["selected_model"] = model if available_models else ""
             device = st.selectbox("Device", ["cpu", "cuda"], index=0 if st.session_state.get("selected_device", "cpu") == "cpu" else 1, key="run_device_select")
@@ -2452,7 +2479,7 @@ def render_run_model_page():
 
     with tabs[2]:
         ds = st.session_state.get("selected_dataset", "MATR")
-        task_choice = st.session_state.get("selected_task", "RUL prediction")
+        task_choice = st.session_state.get("selected_task", config_task.TASK_RUL)
         model = st.session_state.get("selected_model", "")
         config_paths = configs.get((ds, task_choice, model), [])
         config_path = config_paths[0] if config_paths else None
