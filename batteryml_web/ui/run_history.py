@@ -109,6 +109,25 @@ def load_history(project_root: str) -> List[Dict[str, Any]]:
     return rm.list_runs(project_root, live_run_ids=get_run_manager().live_run_ids())
 
 
+def projects_with_runs(projects_root: Path, *, exclude: str = "") -> List[tuple]:
+    """``[(project name, run count)]`` for every other project that has runs.
+
+    Read-only and name-sorted; used only to tell a reader of an empty history
+    where runs actually are. ``rm.list_runs`` is the same reader the history
+    uses, so a folder that is not a project yields nothing.
+    """
+    root = Path(projects_root)
+    if not root.is_dir():
+        return []
+    found = []
+    for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+        if child.is_dir() and child.name != exclude:
+            count = len(rm.list_runs(child))
+            if count:
+                found.append((child.name, count))
+    return found
+
+
 def render_run_history(project_root: str, *, project_name: str = "") -> Optional[str]:
     """Draw the history table and return the run the user opened, if any."""
     st.subheader(HISTORY_TITLE, anchor=False)
@@ -118,6 +137,15 @@ def render_run_history(project_root: str, *, project_name: str = "") -> Optional
             f"No runs recorded yet for this project ({project_root}). A run "
             "appears here as soon as it is started."
         )
+        others = projects_with_runs(Path(project_root).parent, exclude=Path(project_root).name)
+        if others:
+            # Runs are never pulled in from another project; the reader is
+            # told where they are and how to open them.
+            listed = ", ".join(f"{name} ({count})" for name, count in others)
+            st.caption(
+                f"Runs are recorded in other projects: {listed}. Load one from "
+                "Home → Existing project to review its runs here."
+            )
         return None
 
     st.caption(

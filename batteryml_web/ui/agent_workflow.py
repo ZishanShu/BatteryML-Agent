@@ -35,7 +35,7 @@ import json
 import time
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import streamlit as st
 
@@ -85,6 +85,7 @@ from ..agent.provenance import (
     build_run_context,
     context_rows,
 )
+from ..core import quick_experience
 from ..core.device_inventory import (
     build_device_selection,
     describe_selection,
@@ -268,6 +269,44 @@ def has_runnable_model(context: dict[str, Any]) -> bool:
 def run_is_enabled(plan: dict[str, Any] | None) -> bool:
     """The single gate behind the Run button: the backend planner must allow it."""
     return isinstance(plan, dict) and plan.get("can_execute") is True
+
+
+#: GPU mode with nothing to run on. Blocks Run; the CPU is not substituted.
+NO_GPU_ENUMERATED = (
+    "No CUDA device was enumerated on this machine, so GPU mode cannot run. "
+    "Choose CPU to run on the CPU."
+)
+
+
+def gpu_mode_block(
+    *,
+    mode: str,
+    gpu_options: Sequence[str],
+    chosen_gpu: Optional[str],
+    cuda_status: Tuple[bool, str],
+) -> Optional[str]:
+    """Why the chosen compute mode cannot run here, or None. Pure.
+
+    An enumerated GPU is not necessarily a usable one: ``cuda_status`` is
+    :func:`quick_experience.cuda_available`, which also refuses a GPU the
+    installed PyTorch build was not compiled for. The answer is a reason to
+    block Run — never a reason to switch the run to the CPU.
+    """
+    if mode != "GPU":
+        return None
+    if not gpu_options:
+        return NO_GPU_ENUMERATED
+    ok, detail = cuda_status
+    if chosen_gpu and not ok:
+        return quick_experience.device_problem("cuda", cuda_ok=False, cuda_detail=detail)
+    return None
+
+
+def block_plan(plan: Optional[Dict[str, Any]], reason: Optional[str]) -> Optional[Dict[str, Any]]:
+    """``plan`` marked not executable for ``reason``; unchanged when there is none."""
+    if not reason or not run_is_enabled(plan):
+        return plan
+    return {**plan, "can_execute": False, "reason": reason}
 
 
 def smoke_epochs_value(enabled: bool) -> int | None:
@@ -1876,12 +1915,6 @@ def render_agent_workflow() -> None:
             label_visibility="collapsed",
             key=f"agent_compute_mode_{selected_key}_{int(bool(smoke))}",
         )
-        if mode == "GPU" and not gpu_options:
-            st.warning(
-                "No CUDA device was enumerated on this machine, so GPU mode is "
-                "unavailable. Runs will use the CPU."
-            )
-            mode = "CPU"
 
         chosen_gpu: str | None = None
         if mode == "GPU":
@@ -1904,6 +1937,17 @@ def render_agent_workflow() -> None:
         # The readable form for the provenance block ("CPU", "GPU 3"), which
         # is separate from the executable --device string below.
         device_label_text = describe_selection(selection)
+
+        # Why GPU mode cannot run here, if it cannot. It blocks Run; the CPU
+        # is never substituted for an explicit GPU choice (EXEC-09).
+        gpu_block = gpu_mode_block(
+            mode=mode,
+            gpu_options=gpu_options,
+            chosen_gpu=chosen_gpu,
+            cuda_status=quick_experience.cuda_available() if chosen_gpu else (True, ""),
+        )
+        if gpu_block:
+            st.warning(gpu_block)
 
         if chosen_gpu:
             # One compact line. A warning box only when the figure deserves
@@ -1999,6 +2043,7 @@ def render_agent_workflow() -> None:
                 # refuses anything outside them.
                 config_path=explicit_config,
             )
+            plan = block_plan(plan, gpu_block)
             _store_json_state("agent_execution_plan", plan)
             run_context = build_run_context(
                 project=project,

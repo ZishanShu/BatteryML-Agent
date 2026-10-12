@@ -36,6 +36,7 @@ No Streamlit import, no subprocess, no BatteryML run.
 
 from __future__ import annotations
 
+import functools
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -206,19 +207,56 @@ reconcile_config = reconcile_selection
 # --- device --------------------------------------------------------------------
 
 def cuda_available(probe: Optional[Callable[[], bool]] = None) -> Tuple[bool, str]:
-    """``(available, detail)``. Never raises: a probe failure means "not available"."""
+    """``(available, detail)``. Never raises: a probe failure means "not available".
+
+    Available means PyTorch sees a CUDA device **and** this PyTorch build can
+    run kernels on it. A GPU the build was not compiled for (measured on the
+    server: PyTorch 1.6 / CUDA 10.2 on RTX 3090, sm_86) is reported as not
+    available with the reason, so the page blocks cuda instead of offering a
+    run that would fail — and never swaps in the CPU.
+    """
     try:
         if probe is not None:
             available = bool(probe())
-        else:
-            import torch
-
-            available = bool(torch.cuda.is_available())
+            return (True, "") if available else (False, NO_CUDA_DETAIL)
+        return _torch_cuda_status()
     except Exception as exc:  # noqa: BLE001 - a CPU machine must still render
         return False, f"CUDA availability could not be determined ({type(exc).__name__}: {exc})."
-    if available:
+
+
+NO_CUDA_DETAIL = "This machine has no CUDA device that PyTorch can use."
+
+
+@functools.lru_cache(maxsize=1)
+def _torch_cuda_status() -> Tuple[bool, str]:
+    """The machine's answer, computed once per process (driver and build do not change).
+
+    Reads only compile-time facts from torch (its architecture list and CUDA
+    version) and the GPUs' compute capability from ``nvidia-smi``; it does
+    not initialise CUDA or allocate memory on a shared GPU.
+    """
+    import torch
+
+    from .device_inventory import gpu_build_incompatibilities, query_compute_capabilities
+
+    if not torch.cuda.is_available():
+        return False, NO_CUDA_DETAIL
+    if hasattr(torch.cuda, "get_arch_list"):
+        arch_list: Optional[List[str]] = list(torch.cuda.get_arch_list())
+    elif hasattr(torch._C, "_cuda_getArchFlags"):
+        arch_list = str(torch._C._cuda_getArchFlags() or "").split()
+    else:
+        arch_list = None
+    devices, _why = query_compute_capabilities()
+    if not devices:
+        return True, ""          # cannot be decided here; PyTorch says CUDA is usable
+    bad = gpu_build_incompatibilities(devices, arch_list=arch_list, torch_cuda=torch.version.cuda)
+    if not bad:
         return True, ""
-    return False, "This machine has no CUDA device that PyTorch can use."
+    built = ", ".join(a for a in (arch_list or []) if a.startswith("sm_")) or f"CUDA {torch.version.cuda}"
+    return False, (f"PyTorch {torch.__version__} (built for {built}) cannot run on "
+                   f"{', '.join(sorted(set(bad)))}, so a GPU run would fail here. Install a "
+                   "PyTorch build that supports this GPU.")
 
 
 def device_problem(requested: str, *, cuda_ok: bool, cuda_detail: str = "") -> Optional[str]:

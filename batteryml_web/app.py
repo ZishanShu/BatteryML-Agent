@@ -534,8 +534,16 @@ def _refresh_data_manifests() -> tuple[bool, str]:
 
 
 def _data_action_root() -> Path:
-    """Use the selected project for logs, with a visible quick-workspace fallback."""
-    root = _project_root() or (REPO_ROOT / DEFAULT_BASE_DIR / "quick_experience")
+    """The selected project, or — with none selected — the default project.
+
+    The same resolution Run Model and Review Results use (``resolve_project``),
+    so a Quick experience run made without a project is listed by Review
+    Results in any later session. It used to fall back to
+    ``runs/web_projects/quick_experience``, a folder no other page looked in:
+    a fresh session's Review Results opened on the empty default project and
+    said "No run is selected" (server acceptance, PR #13).
+    """
+    root = _project_root() or (REPO_ROOT / _project_for_runs()["root"])
     return root if root.is_absolute() else REPO_ROOT / root
 
 
