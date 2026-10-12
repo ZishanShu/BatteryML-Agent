@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -101,6 +102,7 @@ from batteryml_web.ui.scroll import render_scroll_to_top
 from batteryml_web.ui.surfaces import (
     NAV_ROLE,
     PRIMARY_ROLE,
+    SECONDARY_ROLE,
     command_viewport,
     log_viewport,
     render_info_card,
@@ -115,7 +117,7 @@ from batteryml_web.ui.tab_navigation import (
 )
 from batteryml_web.ui.errors import error_boundary, render_copy_control
 from batteryml_web.ui.workflow_sidebar import NAV_STEPS, get_current_step_index, render_sidebar_workflow, set_current_step
-from batteryml_web.core.readiness import assess_dataset
+from batteryml_web.core.readiness import assess_dataset, list_dataset_readiness
 from batteryml_web.core.config_registry import get_config_registry
 
 st.set_page_config(
@@ -916,21 +918,53 @@ def _quick_readiness(dataset: str) -> dict[str, Any]:
     ).to_dict()
 
 
-def _quick_config_entries(task: str) -> list[Any]:
+def _quick_config_entries(dataset: str, task: str) -> list[Any]:
     try:
-        return get_config_registry(str(REPO_ROOT)).get_entries("MATR", task)
+        return get_config_registry(str(REPO_ROOT)).get_entries(dataset, task)
     except Exception:  # noqa: BLE001 - an empty selector is safer than a crash
         return []
 
 
-def _quick_failure_reason(result: dict[str, Any]) -> str:
+def _quick_default_dataset() -> str:
+    """The dataset of the page's default protocol (``QUICKSTART_CONFIG``): MATR."""
+    dataset = load_config_semantics(_home_resolve_path(QUICKSTART_CONFIG)).dataset
+    if not dataset:
+        raise ValueError(f"{QUICKSTART_CONFIG} names no dataset; Quick experience has no default.")
+    return str(dataset)
+
+
+def _quick_dataset_choices(default: str) -> list[quick_experience.DatasetChoice]:
+    """Every dataset the readiness layer knows, with the tasks the registry can run on it.
+
+    No list of names lives here: the datasets come from
+    ``readiness.list_dataset_readiness`` (platform datasets plus anything on
+    disk) and the runnable tasks from the config registry. A dataset the
+    registry has configs for but readiness did not list is assessed too.
+    """
+    raw_root, processed_root = REPO_ROOT / "data" / "raw", REPO_ROOT / "data" / "processed"
+    statuses = {
+        report.dataset: report.status.value
+        for report in list_dataset_readiness(raw_root=raw_root, processed_root=processed_root)
+    }
+    pairs = [(entry.dataset, entry.task) for entry in get_config_registry(str(REPO_ROOT)).entries]
+    for name in sorted({str(dataset) for dataset, _task in pairs if dataset} - set(statuses)):
+        statuses[name] = assess_dataset(name, raw_root=raw_root, processed_root=processed_root).status.value
+    return quick_experience.dataset_choices(statuses, pairs, default=default)
+
+
+def _md_text(text: Any) -> str:
+    """``text`` safe inside Streamlit markdown: ``*.pkl`` stays literal, ``$`` is not maths."""
+    return re.sub(r"([\\`*_$\[\]])", r"\\\1", str(text))
+
+
+def _quick_failure_reason(result: dict[str, Any], *, dataset: str) -> str:
     """Turn a command result into a concise, specific result-page message."""
     code = result.get("return_code")
     tail = str(result.get("output_tail") or "").strip()
     lower_tail = tail.lower()
     if "truncated file" in lower_tail or "incomplete or corrupt" in lower_tail:
         return (
-            "MATR 原始文件不完整或已损坏。请删除日志中指出的文件，"
+            f"{dataset} 原始文件不完整或已损坏。请删除日志中指出的文件，"
             "重新下载并保持文件名不变，然后再次处理。"
         )
     # The host the failing download itself named — never an assumed one.
@@ -1058,7 +1092,7 @@ def _run_home_experiment(
         rm.update_manifest(
             run_dir,
             {"failure": {"category": "execution_failed",
-                         "message": _quick_failure_reason(result)}},
+                         "message": _quick_failure_reason(result, dataset=dataset)}},
         )
     result["command"] = command
     return result, run_dir, run_dir, run_id
@@ -1095,8 +1129,9 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
     st.subheader("Quick experience", anchor=False)
     st.caption("A guided local run with MATR as the default dataset. You can edit the configuration before running.")
 
+    default_dataset = _quick_default_dataset()
     if "quick_dataset" not in st.session_state:
-        st.session_state["quick_dataset"] = "MATR"
+        st.session_state["quick_dataset"] = default_dataset
     if "quick_task_selector" not in st.session_state:
         st.session_state["quick_task_selector"] = "RUL prediction"
     if "quick_device_selector" not in st.session_state:
@@ -1116,102 +1151,132 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
         st.session_state["quick_uploaded_notice"] = pending_upload["path"]
 
     st.markdown("#### 1 · Prepare data")
-    # Keep the raw dataset choice in the Prepare Data step.  The built-in Quick
-    # configuration is currently the MATR protocol, so exposing other download
-    # sources here would let the selector disagree with the config that runs.
-    # The selectbox still makes the selected raw dataset explicit and leaves a
-    # natural place to add more dataset-specific Quick configs later.
-    dataset_options = ["MATR"]
-    current_dataset = str(st.session_state.get("quick_dataset") or "MATR")
-    if current_dataset not in dataset_options:
-        current_dataset = dataset_options[0]
-        st.session_state["quick_dataset"] = current_dataset
-    if st.session_state.get("quick_dataset_selector") not in dataset_options:
-        st.session_state["quick_dataset_selector"] = current_dataset
+    # Every dataset the platform knows is offered (readiness layer), with the
+    # tasks the config registry can run on each; the default protocol's
+    # dataset (MATR) comes first and stays the default. A dataset without a
+    # registered config is listed and explained, never hidden, and nothing is
+    # downloaded, processed or run by selecting one.
+    choices = {choice.name: choice for choice in _quick_dataset_choices(default_dataset)}
+    if st.session_state.get("quick_dataset_selector") not in choices:
+        st.session_state["quick_dataset_selector"] = default_dataset if default_dataset in choices else next(iter(choices))
     dataset = st.selectbox(
         "Raw dataset",
-        dataset_options,
-        index=dataset_options.index(current_dataset),
+        list(choices),
+        format_func=lambda name: name if choices[name].runnable else f"{name} · no run configuration",
         key="quick_dataset_selector",
         help="Quick experience defaults to MATR. Choose the raw dataset before downloading or preprocessing.",
     )
+    choice = choices[dataset]
     st.session_state["quick_dataset"] = dataset
     readiness = _quick_readiness(dataset)
     raw_path = _home_resolve_path(readiness["raw_path"])
     processed_path = _home_resolve_path(readiness["processed_path"])
 
-    st.caption(f"Quick experience uses **{dataset}** by default. Download raw files first, then create processed records.")
+    if dataset == default_dataset:
+        st.caption(f"Quick experience uses **{dataset}** by default. Download raw files first, then create processed records.")
+    else:
+        st.caption(f"Quick experience will use **{dataset}**.")
+    status = str(readiness["status"])
+    downloadable = dataset.upper() in {name.upper() for name in _batteryml_downloadable_datasets()}
     raw_present = bool(readiness.get("raw_available"))
     raw_count, raw_expected, raw_complete = _raw_download_progress(dataset, raw_path)
     raw_ready = raw_present and raw_complete
-    processed_ready = bool(readiness.get("processed_available"))
+    processed_ready = status == quick_experience.STATUS_READY
     status_cols = st.columns(2, gap="medium")
     with status_cols[0]:
         st.markdown("**Raw data**")
         if raw_ready:
-            st.success(f"{dataset} selected · ready")
+            st.success("Available")
         elif raw_present and raw_expected:
             st.warning(f"Download incomplete ({raw_count}/{raw_expected} files)")
         else:
-            st.info(f"{dataset} not downloaded yet")
+            st.info(f"{dataset} not downloaded yet" if downloadable else "No raw files found")
         st.caption(_home_display_path(raw_path))
     with status_cols[1]:
         st.markdown("**Processed data**")
         if processed_ready:
             st.success("Ready")
+        elif status == quick_experience.STATUS_INCOMPLETE:
+            st.warning("Incomplete — no usable processed files")
         else:
             st.warning("Needs processing")
         st.caption(_home_display_path(processed_path))
+    # The readiness layer's own verdict and reason, word for word.
+    st.caption(f"Readiness: **{status}** — {_md_text(readiness['reason'])}")
 
-    data_action_surface = st.container()
-    data_cols = st.columns(2, gap="medium")
-    with data_cols[0]:
-        if st.button(
-            f"Download {dataset} data",
-            type=PRIMARY_ROLE,
-            use_container_width=True,
-            key="home_quick_download_data",
-            disabled=raw_complete,
-        ):
-            result = _run_home_data_action(
-                dataset=dataset,
-                action="download",
-                raw_path=raw_path,
-                processed_path=processed_path,
-                progress_host=data_action_surface,
-            )
-            st.session_state["quick_data_action_error"] = None if result["success"] else _quick_failure_reason(result)
-            if result["success"]:
-                synced, sync_detail = _refresh_data_manifests()
-                st.session_state["quick_manifest_sync_error"] = None if synced else sync_detail
-                notify_success("Raw data downloaded", event_key=EVENT_PREPROCESS_DONE, signature=[dataset, "download"])
-                st.rerun()
-    with data_cols[1]:
-        process_disabled = processed_ready or not raw_ready or not bool(readiness.get("preprocessing_supported"))
-        if st.button(
-            f"Process {dataset} data",
-            type=PRIMARY_ROLE,
-            use_container_width=True,
-            key="home_quick_process_data",
-            disabled=process_disabled,
-        ):
-            result = _run_home_data_action(
-                dataset=dataset,
-                action="preprocess",
-                raw_path=raw_path,
-                processed_path=processed_path,
-                progress_host=data_action_surface,
-            )
-            st.session_state["quick_data_action_error"] = None if result["success"] else _quick_failure_reason(result)
-            if result["success"]:
-                synced, sync_detail = _refresh_data_manifests()
-                st.session_state["quick_manifest_sync_error"] = None if synced else sync_detail
-                notify_success("Processed data is ready", event_key=EVENT_PREPROCESS_DONE, signature=[dataset, "preprocess"])
-                st.rerun()
-    if not raw_ready:
-        st.caption("Download is enabled. Processing becomes available after raw files are present.")
-    elif not processed_ready and not bool(readiness.get("preprocessing_supported")):
-        st.warning("This raw layout is detected, but BatteryML does not provide an automatic preprocessing route for it.")
+    limitation = quick_experience.quick_limitation(choice)
+    if limitation:
+        # Data actions for this dataset live in Prepare Data, which handles
+        # every dataset; offering them here would suggest a run follows.
+        st.info(limitation)
+        if st.button("Open Prepare Data", type=NAV_ROLE, key="home_quick_open_prepare"):
+            set_current_step("prepare_data")
+    else:
+        download = quick_experience.download_action(
+            dataset=dataset, downloadable=downloadable, raw_complete=raw_complete,
+            raw_count=raw_count, raw_expected=raw_expected,
+        )
+        process = quick_experience.process_action(
+            status=status, raw_ready=raw_ready,
+            preprocessing_supported=bool(readiness.get("preprocessing_supported")),
+        )
+        data_action_surface = st.container()
+        data_cols = st.columns(2, gap="medium")
+        with data_cols[0]:
+            if download.state == quick_experience.ACTION_COMPLETED:
+                # Done is a fact, not a control: no button is drawn for it.
+                st.caption(f":green[✓] {download.note}")
+            else:
+                download_clicked = st.button(
+                    f"Download {dataset} data",
+                    type=SECONDARY_ROLE,
+                    use_container_width=True,
+                    key="home_quick_download_data",
+                    disabled=download.state != quick_experience.ACTION_AVAILABLE,
+                )
+                if download.note:
+                    st.caption(download.note)
+                if download_clicked:
+                    result = _run_home_data_action(
+                        dataset=dataset,
+                        action="download",
+                        raw_path=raw_path,
+                        processed_path=processed_path,
+                        progress_host=data_action_surface,
+                    )
+                    st.session_state["quick_data_action_error"] = None if result["success"] else _quick_failure_reason(result, dataset=dataset)
+                    if result["success"]:
+                        synced, sync_detail = _refresh_data_manifests()
+                        st.session_state["quick_manifest_sync_error"] = None if synced else sync_detail
+                        notify_success("Raw data downloaded", event_key=EVENT_PREPROCESS_DONE, signature=[dataset, "download"])
+                        st.rerun()
+        with data_cols[1]:
+            if process.state == quick_experience.ACTION_COMPLETED:
+                st.caption(f":green[✓] {process.note}")
+            else:
+                process_clicked = st.button(
+                    f"Process {dataset} data",
+                    type=PRIMARY_ROLE,
+                    use_container_width=True,
+                    key="home_quick_process_data",
+                    disabled=process.state != quick_experience.ACTION_AVAILABLE,
+                )
+                if process.note:
+                    st.caption(process.note)
+                if process_clicked:
+                    result = _run_home_data_action(
+                        dataset=dataset,
+                        action="preprocess",
+                        raw_path=raw_path,
+                        processed_path=processed_path,
+                        progress_host=data_action_surface,
+                    )
+                    st.session_state["quick_data_action_error"] = None if result["success"] else _quick_failure_reason(result, dataset=dataset)
+                    if result["success"]:
+                        synced, sync_detail = _refresh_data_manifests()
+                        st.session_state["quick_manifest_sync_error"] = None if synced else sync_detail
+                        notify_success("Processed data is ready", event_key=EVENT_PREPROCESS_DONE, signature=[dataset, "preprocess"])
+                        st.rerun()
     if st.session_state.get("quick_data_action_error"):
         st.error(str(st.session_state["quick_data_action_error"]))
     if st.session_state.get("quick_manifest_sync_error"):
@@ -1221,22 +1286,27 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
         )
 
     st.markdown("#### 2 · Configure model")
-    task_options = ["RUL prediction", "SOH estimation"]
-    current_task = st.session_state.get("quick_task_selector", "RUL prediction")
-    if current_task not in task_options:
-        current_task = "RUL prediction"
-        st.session_state["quick_task_selector"] = current_task
+    # Dataset -> task -> model -> config, never the other way round: every
+    # option below is recomputed from the selection above it, and a choice the
+    # new options do not contain is cleared before its widget is drawn (with a
+    # note saying so), so nothing from the previous dataset, task or model can
+    # stay selected.
+    task_options = quick_experience.task_options(choice)
+    task_selected, task_cleared = quick_experience.reconcile_selection(
+        st.session_state.get("quick_task_selector"), task_options, default=config_task.TASK_RUL,
+    )
+    st.session_state["quick_task_selector"] = task_selected
     task_choice = st.selectbox("Prediction task", task_options, key="quick_task_selector")
-    # Task -> model -> config, never the other way round: every option below is
-    # recomputed from the task on screen, so a config that trains another task
-    # (or belongs to another model) cannot stay selected.
-    entries = _quick_config_entries(task_choice)
+    if task_cleared:
+        st.caption(f"{dataset} has no registered {task_cleared} configuration, so the task is now {task_choice}.")
+    entries = _quick_config_entries(dataset, task_choice)
     config_options = [
         quick_experience.ConfigOption(str(_home_resolve_path(entry.config_path)), entry.task, entry.model_key)
         for entry in entries
     ] + [
         quick_experience.ConfigOption(item["path"], item["task"], item["model_key"])
         for item in _quick_uploaded_configs()
+        if item.get("dataset") == dataset
     ]
     model_options = list(dict.fromkeys(
         option.model_key for option in config_options
@@ -1244,14 +1314,21 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
     ))
     if not model_options:
         st.error(f"No {task_choice} configuration is registered for {dataset}.")
-    if st.session_state.get("quick_model_selector") not in model_options:
-        st.session_state["quick_model_selector"] = model_options[0] if model_options else None
+    model_selected, model_cleared = quick_experience.reconcile_selection(
+        st.session_state.get("quick_model_selector"), model_options,
+    )
+    st.session_state["quick_model_selector"] = model_selected
     model_key = st.selectbox(
         "Prediction model",
         model_options,
         format_func=lambda value: next((entry.model_display for entry in entries if entry.model_key == value), model_display_name(value) or value),
         key="quick_model_selector",
     )
+    if model_cleared and model_options:
+        st.caption(
+            f"{model_display_name(model_cleared) or model_cleared} has no {task_choice} configuration "
+            f"for {dataset}, so it is no longer selected."
+        )
     config_paths = quick_experience.config_choices(config_options, task=task_choice, model_key=model_key)
     selected_config, cleared_config = quick_experience.reconcile_config(
         st.session_state.get("quick_config_selector"),
@@ -1268,8 +1345,8 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
     )
     if cleared_config:
         st.caption(
-            f"{_home_display_path(cleared_config)} is not a {task_choice} configuration for this "
-            "model, so it is no longer selected."
+            f"{_home_display_path(cleared_config)} is not a {dataset} · {task_choice} configuration "
+            "for this model, so it is no longer selected."
         )
     config_path = _home_resolve_path(config_choice) if config_choice else None
     cuda_ok, cuda_detail = quick_experience.cuda_available()
@@ -1291,11 +1368,12 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
             uploaded.name,
             managed_root=_data_action_root(),
             repo_root=REPO_ROOT,
-            allowed_datasets=dataset_options,
+            allowed_datasets=[dataset],
             allowed_tasks=task_options,
         )
         if outcome.ok:
-            record = {"path": str(outcome.path), "task": outcome.task, "model_key": outcome.model_key}
+            record = {"path": str(outcome.path), "task": outcome.task, "model_key": outcome.model_key,
+                      "dataset": outcome.dataset}
             st.session_state.setdefault("quick_uploaded_configs", []).append(record)
             # Widgets above are already drawn: the selection is applied at the
             # top of the next run, before they are instantiated.
@@ -1315,7 +1393,8 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
         config_path=config_path,
         device=device,
         repo_root=REPO_ROOT,
-        allowed_datasets=dataset_options,
+        # Only the dataset on screen: a config of another dataset never runs here.
+        allowed_datasets=[dataset],
         cuda_ok=cuda_ok,
         cuda_detail=cuda_detail,
         uploaded=bool(config_path) and config_upload.is_managed_upload(config_path, _data_action_root()),
@@ -1379,7 +1458,7 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
         st.session_state["last_run_status"] = "success" if result["success"] else "failed"
         st.session_state["last_run_time"] = result["elapsed"]
         st.session_state["last_run_code"] = result["return_code"]
-        st.session_state["last_run_error"] = None if result["success"] else _quick_failure_reason(result)
+        st.session_state["last_run_error"] = None if result["success"] else _quick_failure_reason(result, dataset=str(final_plan.dataset))
         st.session_state["last_run_log_path"] = str(run_dir / "run.log")
         st.session_state["last_run_command"] = " ".join(str(part) for part in result.get("command") or [])
         st.session_state["last_run_id"] = run_id

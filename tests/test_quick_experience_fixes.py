@@ -388,10 +388,22 @@ class _ReadyMATR:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._report, name)
 
+    @property
+    def _is_matr(self) -> bool:
+        return str(getattr(self._report, "dataset", "")).upper() == "MATR"
+
+    @property
+    def status(self) -> Any:
+        """READY for MATR, consistently with :meth:`to_dict` (processed data present)."""
+        from batteryml_web.core.readiness import DatasetStatus
+
+        return DatasetStatus.READY if self._is_matr else self._report.status
+
     def to_dict(self) -> Dict[str, Any]:
         data = dict(self._report.to_dict())
-        if str(getattr(self._report, "dataset", "")).upper() == "MATR":
-            data.update(raw_available=True, processed_available=True, preprocessing_supported=True,
+        if self._is_matr:
+            data.update(status="READY", raw_available=True, processed_available=True,
+                        preprocessing_supported=True,
                         raw_path=str(self._root / "raw"), processed_path=str(self._root / "processed"))
         return data
 
@@ -561,7 +573,8 @@ class TestQuickExperiencePage(_PageHarness, unittest.TestCase):
             _yaml_bytes(SOH_XGB, task=None), "my_soh.yaml", managed_root=self.project,
             repo_root=REPO_ROOT, allowed_datasets=["MATR"], allowed_tasks=TASKS)
         self.assertTrue(outcome.ok, outcome.errors)
-        record = {"path": str(outcome.path), "task": outcome.task, "model_key": outcome.model_key}
+        record = {"path": str(outcome.path), "task": outcome.task, "model_key": outcome.model_key,
+                  "dataset": outcome.dataset}
         at = self.app()
         at.session_state["quick_uploaded_configs"] = [record]
         at.session_state["quick_pending_upload"] = record
@@ -665,18 +678,6 @@ class TestResultViewsTaskAgreement(unittest.TestCase):
         self.assertLessEqual({"RUL", "SOH"}, families)
 
 
-class _ReadyMATRStatus(_ReadyMATR):
-    """As :class:`_ReadyMATR`, and READY to Run Model, which reads ``status``."""
-
-    @property
-    def status(self) -> Any:
-        from batteryml_web.core.readiness import DatasetStatus
-
-        if str(getattr(self._report, "dataset", "")).upper() == "MATR":
-            return DatasetStatus.READY
-        return self._report.status
-
-
 class _RunModelHarness(_PageHarness):
     """The page harness with MATR listed and READY on Run Model.
 
@@ -690,12 +691,6 @@ class _RunModelHarness(_PageHarness):
 
     def setUp(self) -> None:
         super().setUp()
-        from batteryml_web.core import readiness
-
-        harness_assess = readiness.assess_dataset
-        self.stack.enter_context(mock.patch.object(
-            readiness, "assess_dataset",
-            lambda *a, **k: _ReadyMATRStatus(harness_assess(*a, **k)._report, self.tmp)))
         # Run Model lists the datasets the (gitignored) manifest marks present;
         # only that one file's content is replaced, never written.
         manifest, read_text, exists = self.MANIFEST, Path.read_text, Path.exists

@@ -4,10 +4,19 @@ The page (``batteryml_web/app.py``, ``_render_home_quickstart_panel``) keeps
 its design; this module owns the decisions behind it so they can be tested
 without Streamlit:
 
-* :func:`config_choices` / :func:`reconcile_config` — the protocol configs
-  offered for the selected task and model. A config that belongs to another
-  task or model is never kept selected: it is cleared, and the caller says so
-  (switching RUL → SOH can no longer leave an RUL config behind).
+* :func:`dataset_choices` — the datasets the panel offers: every dataset the
+  readiness layer knows (``readiness.list_dataset_readiness``) together with
+  the tasks the config registry has protocol configs for. A dataset without
+  one stays listed but is marked not runnable here (:func:`quick_limitation`)
+  instead of being hidden or hardcoded away.
+* :func:`download_action` / :func:`process_action` — whether each data action
+  is available, already done, or unavailable (and why), from the readiness
+  report alone. Nothing is downloaded or processed by deciding.
+* :func:`config_choices` / :func:`reconcile_selection` — the protocol configs
+  offered for the selected dataset, task and model. A task, model or config
+  that the new selection does not offer is never kept selected: it is
+  cleared, and the caller says so (switching RUL → SOH, or MATR → HUST, can no
+  longer leave a config of the previous selection behind).
 * :func:`device_problem` — a requested device that this machine cannot
   provide is reported, never silently replaced.
 * :func:`build_quick_plan` — the execution gate. The page calls it to draw the
@@ -30,16 +39,127 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 import yaml
 
-from .config_task import SHORT_TASK, resolve_config_task
+from .config_task import SHORT_TASK, SUPPORTED_TASK_LABELS, canonical_task, resolve_config_task
 
 CPU = "cpu"
 CUDA = "cuda"
 DEVICE_OPTIONS = (CPU, CUDA)
+
+#: Readiness verdicts (``readiness.DatasetStatus`` values), repeated as plain
+#: strings so this module stays importable without the readiness layer.
+STATUS_READY = "READY"
+STATUS_INCOMPLETE = "INCOMPLETE_PROCESSED"
+
+
+# --- datasets ------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DatasetChoice:
+    """One dataset the platform knows, and what Quick experience can do with it."""
+
+    name: str
+    #: Readiness verdict: READY, RAW_ONLY, INCOMPLETE_PROCESSED or MISSING.
+    status: str
+    #: Canonical tasks the config registry has a protocol config for, in
+    #: ``SUPPORTED_TASK_LABELS`` order. Empty: nothing here can run on it.
+    tasks: Tuple[str, ...]
+
+    @property
+    def runnable(self) -> bool:
+        """Whether a registered protocol config exists for it (data aside)."""
+        return bool(self.tasks)
+
+
+def dataset_choices(
+    statuses: Mapping[str, str],
+    config_pairs: Iterable[Tuple[Optional[str], Optional[str]]],
+    *,
+    default: str,
+) -> List[DatasetChoice]:
+    """Every known dataset, the default first, then runnable ones, then the rest.
+
+    ``statuses`` maps each dataset the readiness layer reports to its verdict;
+    ``config_pairs`` are the registry's ``(dataset, task)`` pairs. A dataset
+    the registry names but ``statuses`` lacks is an error, not a guess: the
+    caller must assess it.
+    """
+    tasks: Dict[str, set] = {}
+    for dataset, task in config_pairs:
+        label = canonical_task(task)
+        if dataset and label:
+            tasks.setdefault(str(dataset), set()).add(label)
+    unassessed = sorted(set(tasks) - set(statuses))
+    if unassessed:
+        raise ValueError(f"dataset_choices: no readiness verdict for {', '.join(unassessed)}; "
+                         "assess every registry dataset before offering it.")
+    choices = [
+        DatasetChoice(name, str(status), tuple(t for t in SUPPORTED_TASK_LABELS if t in tasks.get(name, ())))
+        for name, status in statuses.items()
+    ]
+    return sorted(choices, key=lambda c: (c.name != default, not c.runnable, c.name.lower()))
+
+
+def task_options(choice: DatasetChoice) -> List[str]:
+    """The tasks offered for ``choice``: its configured ones, or all when it has none."""
+    return list(choice.tasks) or list(SUPPORTED_TASK_LABELS)
+
+
+def quick_limitation(choice: DatasetChoice) -> Optional[str]:
+    """Why Quick experience cannot run ``choice``, or None when it can."""
+    if choice.runnable:
+        return None
+    return (f"{choice.name} is known to the platform, but no protocol configuration is "
+            "registered for it, so Quick experience cannot run a model on it. Its data can "
+            "still be checked and prepared in Prepare Data; adding a configuration for it "
+            "(the extension route) makes it runnable.")
+
+
+# --- data actions ----------------------------------------------------------------
+
+ACTION_AVAILABLE = "available"
+ACTION_COMPLETED = "completed"
+ACTION_UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class DataAction:
+    """What one data action can do now: ``state`` plus one line for the page."""
+
+    state: str
+    note: str = ""
+
+
+def download_action(*, dataset: str, downloadable: bool, raw_complete: bool,
+                    raw_count: int = 0, raw_expected: int = 0) -> DataAction:
+    """Download: done when the raw files are all present, else offered if BatteryML can."""
+    if raw_complete:
+        return DataAction(ACTION_COMPLETED, "Raw files present — no download needed.")
+    if not downloadable:
+        return DataAction(ACTION_UNAVAILABLE,
+                          f"BatteryML has no automatic download for {dataset}. Place its raw "
+                          f"files under data/raw/{dataset}/, or see Prepare Data.")
+    if raw_count and raw_expected:
+        return DataAction(ACTION_AVAILABLE, f"{raw_count} of {raw_expected} files present; "
+                                            "downloading fetches the rest.")
+    return DataAction(ACTION_AVAILABLE)
+
+
+def process_action(*, status: str, raw_ready: bool, preprocessing_supported: bool) -> DataAction:
+    """Preprocess: done when READY, offered only for raw data BatteryML can preprocess."""
+    if status == STATUS_READY:
+        return DataAction(ACTION_COMPLETED, "Processed data ready — no processing needed.")
+    if not raw_ready:
+        return DataAction(ACTION_UNAVAILABLE, "Available once the raw files are present.")
+    if not preprocessing_supported:
+        return DataAction(ACTION_UNAVAILABLE,
+                          "This raw layout is detected, but BatteryML does not provide an "
+                          "automatic preprocessing route for it.")
+    return DataAction(ACTION_AVAILABLE)
 
 
 # --- configs -------------------------------------------------------------------
@@ -60,14 +180,14 @@ def config_choices(options: Sequence[ConfigOption], *, task: str, model_key: str
     ))
 
 
-def reconcile_config(current: Optional[str], choices: Sequence[str],
-                     default: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
-    """``(selected, cleared)``.
+def reconcile_selection(current: Optional[str], choices: Sequence[str],
+                        default: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+    """``(selected, cleared)`` — one rule for a dataset-, task-, model- or config choice.
 
     ``current`` survives only if it is still one of ``choices``. Otherwise it
     is cleared (returned as ``cleared`` so the page can say so) and the
-    task's own default — or its first config — is selected instead. With no
-    choice at all, nothing is selected.
+    default — or the first choice — is selected instead. With no choice at
+    all, nothing is selected.
     """
     if current and current in choices:
         return current, None
@@ -77,6 +197,10 @@ def reconcile_config(current: Optional[str], choices: Sequence[str],
     if default and default in choices:
         return default, cleared
     return choices[0], cleared
+
+
+#: The name the config selector has always used for :func:`reconcile_selection`.
+reconcile_config = reconcile_selection
 
 
 # --- device --------------------------------------------------------------------
@@ -289,18 +413,29 @@ def download_failure_host(output: str) -> Optional[str]:
 
 
 __all__ = [
+    "ACTION_AVAILABLE",
+    "ACTION_COMPLETED",
+    "ACTION_UNAVAILABLE",
     "CPU",
     "CUDA",
     "DEVICE_OPTIONS",
     "ConfigOption",
+    "DataAction",
+    "DatasetChoice",
     "QuickPlan",
     "build_quick_plan",
     "config_choices",
     "cuda_available",
+    "dataset_choices",
     "device_problem",
+    "download_action",
     "download_failure_host",
     "plan_command",
+    "process_action",
+    "quick_limitation",
     "reconcile_config",
+    "reconcile_selection",
     "run_metrics",
     "sync_manifests",
+    "task_options",
 ]
