@@ -26,6 +26,8 @@ from typing import Any, Dict, List
 
 import yaml
 
+from .config_task import SHORT_TASK, TASK_BY_LABEL_ANNOTATOR
+
 #: Sections a run config must declare, each carrying a ``name``.
 REQUIRED_SECTIONS = ("model", "train_test_split", "feature", "label")
 
@@ -46,10 +48,11 @@ SECTION_REGISTRY = {
 SUPPORTED_TASKS = ("RUL", "SOH")
 
 #: Label annotator -> the task it implies. Used to derive the task from the
-#: config itself rather than trusting the caller's label.
+#: config itself rather than trusting the caller's label. Derived from the
+#: platform's one annotator table (``config_task``), which also covers the
+#: cycle-level ``CycleSOHLabelAnnotator`` every SOH preset uses.
 TASK_BY_ANNOTATOR = {
-    "RULLabelAnnotator": "RUL",
-    "SOHLabelAnnotator": "SOH",
+    annotator: SHORT_TASK[task] for annotator, task in TASK_BY_LABEL_ANNOTATOR.items()
 }
 
 #: BatteryData files that preprocessing writes into ``data/processed/<DATASET>``.

@@ -8,6 +8,8 @@ from typing import Any
 
 import yaml
 
+from .config_task import resolve_config_task
+
 
 MODEL_DISPLAY_NAMES = {
     "batlinet": "BatLiNet — Inter-cell Lifetime Prediction",
@@ -245,15 +247,6 @@ class ConfigRegistry:
                 return ds
         return None
 
-    #: Label annotator class name -> canonical task. This is the authoritative
-    #: signal: the annotator *is* what the config trains against, so it cannot
-    #: disagree with the task the way a filename or a stray parameter can.
-    _TASK_BY_ANNOTATOR = {
-        "sohlabelannotator": "SOH estimation",
-        "cyclesohlabelannotator": "SOH estimation",
-        "rullabelannotator": "RUL prediction",
-    }
-
     #: Parameter names that contain a task word but say nothing about the task.
     #: ``eol_soh`` is RUL's end-of-life *threshold* — the SOH value at which a
     #: cell is declared dead — and every RUL baseline config carries it.
@@ -270,25 +263,28 @@ class ConfigRegistry:
 
         The hierarchy is now:
 
-        1. an explicit ``task:`` field, when a config declares one;
-        2. the label annotator's registered class name;
-        3. the ``configs/<task>/`` directory, documented as a fallback for a
-           config that names neither.
+        1. :func:`config_task.resolve_config_task` — the platform's one rule:
+           the registered label annotator, cross-checked against an explicit
+           ``task:`` field. A declared task that is unsupported or contradicts
+           the annotator classifies the config as nothing;
+        2. for a repository config that states neither, an unregistered
+           annotator whose own class name states the task, then the
+           ``configs/<task>/`` directory — catalog fallbacks only. The Quick
+           experience execution gate (``quick_experience``) still requires
+           the structural rule of step 1 before anything runs.
 
         A parameter name is never a signal.
         """
-        if isinstance(data, dict):
-            declared = str(data.get("task", "") or "").strip()
-            if declared:
-                canonical = self._canonical_task(declared)
-                if canonical:
-                    return canonical
+        resolution = resolve_config_task(data if isinstance(data, dict) else {})
+        if resolution.task is not None:
+            return resolution.task
+        if resolution.declared is not None:
+            return None
 
+        if isinstance(data, dict):
             label = data.get("label", {})
             if isinstance(label, dict):
                 annotator = str(label.get("name", "") or "").strip().lower()
-                if annotator in self._TASK_BY_ANNOTATOR:
-                    return self._TASK_BY_ANNOTATOR[annotator]
                 # An unregistered annotator whose own name states the task.
                 if annotator.startswith("soh") or "stateofhealth" in annotator:
                     return "SOH estimation"
@@ -303,15 +299,6 @@ class ConfigRegistry:
         if "configs/soh/" in path_hay or "configs\\soh\\" in path_hay:
             return "SOH estimation"
         if "configs/rul/" in path_hay or "configs\\rul\\" in path_hay:
-            return "RUL prediction"
-        return None
-
-    @staticmethod
-    def _canonical_task(declared: str) -> str | None:
-        lowered = declared.strip().lower()
-        if lowered.startswith("soh") or "state of health" in lowered:
-            return "SOH estimation"
-        if lowered.startswith("rul") or "remaining useful life" in lowered:
             return "RUL prediction"
         return None
 

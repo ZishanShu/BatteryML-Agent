@@ -29,7 +29,7 @@ from .config_registry import (
     ConfigEntry,
     normalize_model_token,
 )
-from .readiness import TASK_RUL, TASK_SOH, TASK_TRAJECTORY
+from .config_task import resolve_config_task
 
 
 _UNKNOWN_DATASET = "Unknown dataset"
@@ -218,35 +218,14 @@ def _dataset_leaf(value: Any) -> str | None:
 
 
 def _task_from_yaml(data: Mapping[str, Any]) -> str | None:
-    declared = _clean_optional(data.get("task"))
-    if declared:
-        canonical = _canonical_task(declared)
-        return canonical or declared
+    """The task the config trains for, by the platform's one rule.
 
-    label = data.get("label")
-    label_name = label.get("name") if isinstance(label, Mapping) else label
-    name = _clean_optional(label_name)
-    if not name:
-        return None
-    token = re.sub(r"[^a-z0-9]", "", name.lower())
-    if token.startswith("rul") or "remainingusefullife" in token:
-        return TASK_RUL
-    if token.startswith("soh") or "stateofhealth" in token:
-        return TASK_SOH
-    if "trajectory" in token or "forecast" in token:
-        return TASK_TRAJECTORY
-    return name
-
-
-def _canonical_task(value: str) -> str | None:
-    token = re.sub(r"[^a-z0-9]", "", value.lower())
-    if token.startswith("rul") or "remainingusefullife" in token:
-        return TASK_RUL
-    if token.startswith("soh") or "stateofhealth" in token:
-        return TASK_SOH
-    if "trajectory" in token or "forecast" in token:
-        return TASK_TRAJECTORY
-    return None
+    Delegates to :func:`config_task.resolve_config_task` (registered label
+    annotator, cross-checked with an explicit ``task:``). A config whose
+    task cannot be established — or whose declared task contradicts its
+    annotator — reports no task rather than a guess.
+    """
+    return resolve_config_task(data).task
 
 
 def _model_from_yaml(data: Mapping[str, Any]) -> tuple[str | None, str | None]:
