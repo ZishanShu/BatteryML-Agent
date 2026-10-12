@@ -92,7 +92,7 @@ from batteryml_web.ui.run_history import (
     render_run_location,
 )
 from batteryml_web.ui.settings_panel import render_configure_in_settings_notice
-from batteryml_web.ui.home_style import render_home_style
+from batteryml_web.ui.home_style import render_home_style, render_site_style
 from batteryml_web.ui.progress_utils import (
     get_safe_runtime_env,
     run_command_with_progress,
@@ -3184,6 +3184,8 @@ render_sidebar_workflow()
 # its own module rather than an addition to ui/styles.py, which owns the
 # sidebar's tuned spacing and is deliberately left alone.
 render_surface_css()
+# The mentor's visual language on every page, not only Home (ui/home_style.py).
+render_site_style()
 
 current_step = st.session_state.get("current_step", "home")
 

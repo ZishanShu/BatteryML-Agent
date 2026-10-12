@@ -1,17 +1,47 @@
-"""Visual treatment for the BatteryML home workspace.
+"""The BatteryML visual language: the mentor's design, on every page.
 
-The home page keeps Streamlit's native controls and the existing workflow
-logic.  This module only adds the visual language: a bright canvas, light
-cards, cobalt actions, and a restrained glass-like hero surface.
+Two stylesheets, both from the mentor's Home (``codex/ui-optimization``):
+
+* :data:`SITE_STYLE_CSS` — the shared language every page uses: the bright
+  canvas, the content width, ink headings and muted body copy, the cobalt
+  primary action, rounded inputs, and calm disclosures and tables. Injected
+  once per run by ``app.py`` right after ``surfaces.render_surface_css``, so
+  it refines that sheet's role rules rather than replacing them. It used to
+  ship only with Home, which is why every other page looked like a different
+  application (measured: neutral 8px buttons, grey captions, Streamlit's
+  default canvas and width there; cobalt 12px buttons on Home).
+* :data:`HOME_STYLE_CSS` — what only Home has: the hero, the start-path
+  cards and the four-step overview. Injected by ``render_home_page``.
+
+The rules keep Streamlit's native controls and the existing workflow logic,
+and select only stable ``data-testid``/``data-baseweb`` attributes and the
+app's own ``bml-``/``st-key-`` names — never Streamlit's generated classes.
+
+Interaction hierarchy, one appearance per role (``surfaces.py`` names them):
+
+=================  ===============================================
+primary            filled cobalt gradient, white label
+secondary          white surface, cobalt hairline and label
+navigation         tinted cobalt wash, no outline
+disabled (any)     neutral, dashed outline, muted label, no lift
+information        flat panels (4px, left rule, no hover, no shadow)
+=================  ===============================================
+
+The sidebar is styled by ``sidebar_style.py`` and is not touched here: every
+rule below is scoped to the main column (``stMain``) or to page-level
+tokens.
 """
 
 from __future__ import annotations
 
 import streamlit as st
 
+#: Present in :data:`SITE_STYLE_CSS` so a page test can tell it was injected.
+SITE_STYLE_MARKER = "bml-site-style"
 
-HOME_STYLE_CSS = """
+SITE_STYLE_CSS = """
 <style>
+/* bml-site-style: the mentor's visual language, shared by every page. */
 :root {
     --bml-ink: #14224a;
     --bml-muted: #66728b;
@@ -20,6 +50,13 @@ HOME_STYLE_CSS = """
     --bml-mint: #31c79b;
     --bml-line: rgba(53, 83, 135, 0.13);
     --bml-soft: rgba(238, 246, 255, 0.76);
+    /* The app's read-out tokens (app.py: dataset, pipeline and assistant
+       tiles) take the same palette; their flat, passive shape is unchanged. */
+    --app-border: rgba(53, 83, 135, 0.24);
+    --app-border-soft: rgba(53, 83, 135, 0.13);
+    --app-muted: #66728b;
+    --app-card-bg: rgba(255, 255, 255, 0.78);
+    --app-card-bg-strong: rgba(238, 246, 255, 0.76);
 }
 
 [data-testid="stAppViewContainer"] {
@@ -33,6 +70,8 @@ HOME_STYLE_CSS = """
     padding-left: clamp(1.2rem, 4vw, 4.5rem);
     padding-right: clamp(1.2rem, 4vw, 4.5rem);
 }
+
+/* ------------------------------------------------------------ typography */
 
 [data-testid="stMain"] h1,
 [data-testid="stMain"] h2,
@@ -48,6 +87,170 @@ HOME_STYLE_CSS = """
     color: var(--bml-muted);
 }
 
+/* A status message keeps its own colour: READY, RAW_ONLY, FAILED must not
+   all fade to the same muted grey-blue as body copy. */
+[data-testid="stMain"] [data-testid="stAlert"] p {
+    color: inherit;
+}
+
+/* A metric value is a result, not body copy: it stays in ink. */
+[data-testid="stMain"] [data-testid="stMetricValue"],
+[data-testid="stMain"] [data-testid="stMetricValue"] * {
+    color: var(--bml-ink);
+}
+
+/* --------------------------------------------------------------- actions */
+
+[data-testid="stMain"] [data-testid="stButton"] > button,
+[data-testid="stMain"] [data-testid="stDownloadButton"] > button,
+[data-testid="stMain"] [data-testid="stFormSubmitButton"] > button {
+    min-height: 2.75rem;
+    border-radius: 12px;
+    border-color: rgba(40,123,245,0.24);
+    color: var(--bml-blue-deep);
+    font-weight: 700;
+    transition: transform 140ms ease, box-shadow 140ms ease, background 140ms ease;
+}
+
+/* Lift and glow only for a control that can act. */
+[data-testid="stMain"] [data-testid="stButton"] > button:hover:enabled,
+[data-testid="stMain"] [data-testid="stDownloadButton"] > button:hover:enabled,
+[data-testid="stMain"] [data-testid="stFormSubmitButton"] > button:hover:enabled {
+    border-color: rgba(40,123,245,0.42);
+    background: rgba(40,123,245,0.06);
+    box-shadow: 0 7px 18px rgba(40,123,245,0.12);
+    transform: translateY(-1px);
+}
+
+/* PRIMARY: the one filled control in a section. */
+[data-testid="stMain"] [data-testid="stBaseButton-primary"],
+[data-testid="stMain"] [data-testid="stBaseButton-primaryFormSubmit"] {
+    border-color: var(--bml-blue);
+    background: linear-gradient(135deg, var(--bml-blue), var(--bml-blue-deep));
+    color: #ffffff !important;
+    box-shadow: 0 8px 18px rgba(40,123,245,0.22);
+}
+
+[data-testid="stMain"] [data-testid="stBaseButton-primary"],
+[data-testid="stMain"] [data-testid="stBaseButton-primary"] *,
+[data-testid="stMain"] [data-testid="stBaseButton-primaryFormSubmit"],
+[data-testid="stMain"] [data-testid="stBaseButton-primaryFormSubmit"] * {
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff;
+    fill: currentColor;
+}
+
+[data-testid="stMain"] [data-testid="stBaseButton-primary"]:hover:enabled,
+[data-testid="stMain"] [data-testid="stBaseButton-primary"]:active:enabled,
+[data-testid="stMain"] [data-testid="stBaseButton-primary"]:focus-visible,
+[data-testid="stMain"] [data-testid="stBaseButton-primaryFormSubmit"]:hover:enabled {
+    border-color: var(--bml-blue-deep);
+    background: linear-gradient(135deg, #3a8aff, var(--bml-blue-deep));
+    color: #ffffff !important;
+}
+
+/* SECONDARY (Download, Refresh, Explain) is the shared rule above, as the
+   mentor wrote it: an outlined surface with a cobalt hairline and label. */
+
+/* NAVIGATION: goes to another page. A tinted wash with no outline — quieter
+   than secondary, still visibly pressable. One step more specific than the
+   shared rule above, which would otherwise outline it like a secondary. */
+[data-testid="stMain"] [data-testid="stButton"] > [data-testid="stBaseButton-tertiary"] {
+    border-color: transparent;
+    background: rgba(40,123,245,0.07);
+    font-weight: 650;
+}
+
+[data-testid="stMain"] [data-testid="stButton"] > [data-testid="stBaseButton-tertiary"]:hover:enabled {
+    border-color: transparent;
+    background: rgba(40,123,245,0.13);
+    box-shadow: none;
+    transform: none;
+}
+
+[data-testid="stMain"] [data-testid="stButton"] > button:focus-visible,
+[data-testid="stMain"] [data-testid="stDownloadButton"] > button:focus-visible,
+[data-testid="stMain"] [data-testid="stFormSubmitButton"] > button:focus-visible {
+    outline: 2px solid var(--bml-blue-deep);
+    outline-offset: 2px;
+}
+
+/* DISABLED, any role: neutral, not a pale version of the action. The
+   dashed outline comes from surfaces.py and is kept, so "not now" reads
+   without colour; the fill and the lift are removed. The reason sits
+   beneath the control on the page. */
+[data-testid="stMain"] [data-testid="stButton"] > button:disabled,
+[data-testid="stMain"] [data-testid="stDownloadButton"] > button:disabled,
+[data-testid="stMain"] [data-testid="stFormSubmitButton"] > button:disabled {
+    border-style: dashed !important;
+    border-color: rgba(102,114,139,0.38) !important;
+    background: rgba(20,34,74,0.035) !important;
+    color: #7a8599 !important;
+    -webkit-text-fill-color: #7a8599;
+    box-shadow: none !important;
+    transform: none !important;
+    cursor: not-allowed;
+}
+
+/* The label inside takes the muted colour and no fill of its own, so the
+   control reads as one flat surface rather than a band behind the text. */
+[data-testid="stMain"] [data-testid="stButton"] > button:disabled *,
+[data-testid="stMain"] [data-testid="stDownloadButton"] > button:disabled *,
+[data-testid="stMain"] [data-testid="stFormSubmitButton"] > button:disabled * {
+    background: transparent !important;
+    color: #7a8599 !important;
+    -webkit-text-fill-color: #7a8599;
+}
+
+/* ---------------------------------------------------------- selection */
+
+[data-testid="stMain"] [data-testid="stTextInput"] input,
+[data-testid="stMain"] [data-testid="stTextArea"] textarea,
+[data-testid="stMain"] [data-testid="stNumberInput"] input,
+[data-testid="stMain"] [data-testid="stSelectbox"] [data-baseweb="select"] > div,
+[data-testid="stMain"] [data-testid="stMultiSelect"] [data-baseweb="select"] > div,
+/* Streamlit 1.5x+ draws a selectbox as a react-aria combobox group, which the
+   BaseWeb selector above (the mentor's, for older builds) no longer reaches. */
+[data-testid="stMain"] [data-testid="stSelectbox"] [role="group"] {
+    border-color: var(--bml-line);
+    border-radius: 12px;
+    background: rgba(255,255,255,0.76);
+}
+
+/* -------------------------------------------- information and disclosure */
+
+[data-testid="stMain"] [data-testid="stDataFrame"] {
+    border-color: var(--bml-line);
+    border-radius: 16px;
+    background: rgba(255,255,255,0.72);
+}
+
+/* A disclosure is calmer than a control: a hairline panel with a smaller
+   radius than a button (10px against 12px) and no lift. */
+[data-testid="stMain"] [data-testid="stExpander"] details {
+    border-color: var(--bml-line);
+    border-radius: 10px;
+    background: rgba(255,255,255,0.72);
+}
+
+[data-testid="stMain"] [data-testid="stExpander"] summary {
+    color: var(--bml-ink);
+    font-weight: 600;
+}
+
+/* Information cards keep their flat read-out shape (surfaces.py: 4px, left
+   rule, no hover); only the palette follows the mentor's. */
+[data-testid="stMain"] .bml-info-card {
+    border-color: var(--bml-line);
+    border-left-color: rgba(40,123,245,0.32);
+    background: rgba(255,255,255,0.78);
+    color: var(--bml-ink);
+}
+</style>
+"""
+
+HOME_STYLE_CSS = """
+<style>
 .bml-home-hero {
     position: relative;
     overflow: hidden;
@@ -363,86 +566,15 @@ HOME_STYLE_CSS = """
     .bml-process-steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .bml-process-step::after { content: ""; }
 }
-
-[data-testid="stMain"] [data-testid="stButton"] > button {
-    min-height: 2.75rem;
-    border-radius: 12px;
-    border-color: rgba(40,123,245,0.24);
-    color: var(--bml-blue-deep);
-    font-weight: 700;
-    transition: transform 140ms ease, box-shadow 140ms ease, background 140ms ease;
-}
-
-[data-testid="stMain"] [data-testid="stButton"] > button:hover {
-    border-color: rgba(40,123,245,0.42);
-    background: rgba(40,123,245,0.06);
-    box-shadow: 0 7px 18px rgba(40,123,245,0.12);
-    transform: translateY(-1px);
-}
-
-[data-testid="stMain"] [data-testid="stBaseButton-primary"] {
-    border-color: var(--bml-blue);
-    background: linear-gradient(135deg, var(--bml-blue), var(--bml-blue-deep));
-    color: #ffffff !important;
-    box-shadow: 0 8px 18px rgba(40,123,245,0.22);
-}
-
-[data-testid="stMain"] [data-testid="stBaseButton-primary"],
-[data-testid="stMain"] [data-testid="stBaseButton-primary"] * {
-    color: #ffffff !important;
-    -webkit-text-fill-color: #ffffff;
-    fill: currentColor;
-}
-
-[data-testid="stMain"] [data-testid="stBaseButton-primary"]:hover,
-[data-testid="stMain"] [data-testid="stBaseButton-primary"]:active,
-[data-testid="stMain"] [data-testid="stBaseButton-primary"]:focus,
-[data-testid="stMain"] [data-testid="stBaseButton-primary"]:focus-visible {
-    border-color: var(--bml-blue-deep);
-    background: linear-gradient(135deg, #3a8aff, var(--bml-blue-deep));
-    color: #ffffff !important;
-}
-
-[data-testid="stMain"] [data-testid="stBaseButton-primary"]:hover *,
-[data-testid="stMain"] [data-testid="stBaseButton-primary"]:active *,
-[data-testid="stMain"] [data-testid="stBaseButton-primary"]:focus *,
-[data-testid="stMain"] [data-testid="stBaseButton-primary"]:focus-visible * {
-    color: #ffffff !important;
-    -webkit-text-fill-color: #ffffff;
-}
-
-/* A disabled action uses a soft surface so it reads as unavailable while
-   retaining sufficient contrast.  Disabled text is intentionally dark here;
-   the white-label rule above applies to filled blue states only. */
-[data-testid="stMain"] [data-testid="stBaseButton-primary"]:disabled,
-[data-testid="stMain"] [data-testid="stBaseButton-primary"]:disabled * {
-    border-color: rgba(40,123,245,0.18) !important;
-    background: #eaf3ff !important;
-    color: #586b86 !important;
-    -webkit-text-fill-color: #586b86;
-    box-shadow: none;
-    cursor: not-allowed;
-}
-
-[data-testid="stMain"] [data-testid="stTextInput"] input,
-[data-testid="stMain"] [data-testid="stTextArea"] textarea,
-[data-testid="stMain"] [data-testid="stSelectbox"] [data-baseweb="select"] > div {
-    border-color: var(--bml-line);
-    border-radius: 12px;
-    background: rgba(255,255,255,0.76);
-}
-
-[data-testid="stMain"] [data-testid="stExpander"],
-[data-testid="stMain"] [data-testid="stDataFrame"] {
-    border-color: var(--bml-line);
-    border-radius: 16px;
-    background: rgba(255,255,255,0.72);
-}
 </style>
 """
 
 
-def render_home_style() -> None:
-    """Inject the home visual language after the shared surface styles."""
-    st.markdown(HOME_STYLE_CSS, unsafe_allow_html=True)
+def render_site_style() -> None:
+    """Inject the shared visual language. Every page, after the surface styles."""
+    st.markdown(SITE_STYLE_CSS, unsafe_allow_html=True)
 
+
+def render_home_style() -> None:
+    """Inject Home's own components (hero, start paths, step overview)."""
+    st.markdown(HOME_STYLE_CSS, unsafe_allow_html=True)
