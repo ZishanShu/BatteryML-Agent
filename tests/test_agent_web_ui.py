@@ -2148,7 +2148,7 @@ class TestTheLlmResolverIsOnTheRealPath(unittest.TestCase):
         self._real_resolve = ui.resolve_workflow_intent_with_llm
         self._real_context = ui.build_agent_workflow_context
         self._real_catalog = ui.build_intent_catalog
-        self._real_guide = ui.guide_workflow
+        self._real_guide = ui.explain_workflow_state
         self.calls: list[dict] = []
 
         def stub_resolve(request, **kwargs):
@@ -2167,13 +2167,13 @@ class TestTheLlmResolverIsOnTheRealPath(unittest.TestCase):
         ui.resolve_workflow_intent_with_llm = stub_resolve
         ui.build_agent_workflow_context = lambda dataset, task, **kw: _MATR_CONTEXT
         ui.build_intent_catalog = lambda **kw: _FAKE_CATALOG
-        ui.guide_workflow = lambda *a, **kw: {"guidance": "explained"}
+        ui.explain_workflow_state = lambda *a, **kw: {"guidance": "explained"}
 
     def tearDown(self) -> None:
         ui.resolve_workflow_intent_with_llm = self._real_resolve
         ui.build_agent_workflow_context = self._real_context
         ui.build_intent_catalog = self._real_catalog
-        ui.guide_workflow = self._real_guide
+        ui.explain_workflow_state = self._real_guide
 
     def _analyze(self, session: dict, request: str) -> None:
         fake = FakeStreamlit(session)

@@ -180,6 +180,94 @@ def guide_workflow(
     }
 
 
+#: Added to the system prompt when the page asks for an explanation of the
+#: workflow it is showing, which may be one that cannot run at all.
+EXPLAIN_STATE_RULES = (
+    " The request may not be runnable. Explain it anyway, as an explanation and "
+    "never as an execution plan: say why the combination cannot run using the "
+    "backend diagnosis, and mention only alternatives the backend lists as "
+    "runnable. Never claim that any other model, dataset or task can run; never "
+    "invent configuration files or YAML paths; never quote a benchmark value; "
+    "never offer to start training — the user decides and presses Run."
+)
+
+
+def build_workflow_state_prompt(
+    user_request: str,
+    workflow_context: Dict[str, Any],
+    *,
+    model_request: Optional[Dict[str, Any]] = None,
+    alternatives: Optional[Dict[str, Any]] = None,
+) -> str:
+    """The prompt for "Explain this workflow": exactly what the page shows.
+
+    Built from the page's own resolved context, the requested model's status
+    and the deterministic alternatives — not by resolving the request again,
+    which could disagree with the page and knew nothing of alternatives.
+    """
+    from .alternatives import alternatives_prompt_block
+
+    request = model_request if isinstance(model_request, dict) else {}
+    requested = (
+        f"requested model: {request.get('requested')} -> {request.get('status')}"
+        + (f" ({request.get('model_key')})" if request.get("model_key") else "")
+        + (f"; {request.get('reason')}" if request.get("reason") else "")
+        if request.get("requested")
+        else "requested model: none named"
+    )
+    return (
+        f"User request:\n{str(user_request).strip()}\n\n"
+        f"{_render_context_block(workflow_context)}\n"
+        f"{requested}\n"
+        f"{alternatives_prompt_block(alternatives)}\n\n"
+        "Explain, for a run that has NOT happened: how the request was resolved; "
+        "the difference between dataset readiness and whether this dataset, task "
+        "and model combination can run; why it can or cannot run; and the "
+        "backend's runnable alternatives with the next step for each. Keep it "
+        "short and plain. Report no result, metric or performance of any kind."
+    )
+
+
+def explain_workflow_state(
+    user_request: str,
+    workflow_context: Dict[str, Any],
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    model_request: Optional[Dict[str, Any]] = None,
+    alternatives: Optional[Dict[str, Any]] = None,
+    timeout: int = 60,
+    llm_call: Optional[Callable[..., str]] = None,
+) -> Dict[str, Any]:
+    """One LLM explanation of the workflow on screen. Explanation only.
+
+    Uses the shared client (:func:`run_llm_prompt`) unless ``llm_call`` is
+    injected. Returns ``{"guidance", "prompt_messages"}``; raises whatever
+    the client raises, for the caller to report.
+    """
+    prompt = build_workflow_state_prompt(
+        user_request, workflow_context, model_request=model_request, alternatives=alternatives
+    )
+    system_prompt = SYSTEM_PROMPT + EXPLAIN_STATE_RULES
+    caller = llm_call if llm_call is not None else run_llm_prompt
+    guidance = caller(
+        prompt,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        system_prompt=system_prompt,
+        timeout=timeout,
+    )
+    return {
+        "guidance": str(guidance),
+        "prompt_messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+    }
+
+
 def workflow_guidance_preview(
     user_request: str,
     *,
