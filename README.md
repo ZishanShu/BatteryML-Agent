@@ -1,731 +1,452 @@
 <div align="center">
 
-# BatteryML-Agent — Installation Guide
+# BatteryML-Agent — User Guide
 
 **English** · [简体中文](./README.zh-CN.md)
 
+Previous guides (archived, V1): [English](./README_v1.md) · [简体中文](./README_v1.zh-CN.md)
+
 </div>
 
-BatteryML-Agent is a web application for battery lifetime (RUL) and
-state-of-health (SOH) prediction, built on
-[BatteryML](https://github.com/microsoft/BatteryML). This guide installs it
-from an empty machine to a running website, one command at a time.
+BatteryML-Agent is a web application and command-line toolkit for predicting
+battery **remaining useful life (RUL)** and **state of health (SOH)**. It is
+built on [BatteryML](https://github.com/microsoft/BatteryML): BatteryML does
+all the preprocessing, training, prediction and scoring, and this repository
+adds a step-by-step website, safety checks around every run, and an optional
+AI assistant that explains things but never computes a number.
 
-When you finish, you will have:
+This guide assumes **no prior experience** with conda, Python or Streamlit.
+Every command can be copied as it is. Every button is named exactly as it
+appears on screen.
 
-- a conda environment called `batteryml` with BatteryML and all its dependencies;
-- the MATR battery dataset downloaded and preprocessed;
-- the website running at `http://localhost:8501`;
-- one model trained and evaluated on MATR, with its results on disk and on screen.
-
-Follow the steps **in order**. Every step ends with a check: do not go on until
-the check passes. Every command is run from a terminal (Linux / macOS
-Terminal; on Windows use WSL2 — see §0).
+> **Tip.** If you only want to see a first result, read §2, §3, §4 (MATR
+> only), §6 and §7. That path needs no API key and no GPU.
 
 ---
 
-## Steps
+## Contents
 
-0. [What you need](#0-what-you-need)
-1. [Check the machine](#1-check-the-machine)
-2. [Install Miniconda](#2-install-miniconda)
-3. [Download the code](#3-download-the-code)
-4. [Create the Python environment](#4-create-the-python-environment)
-5. [Install PyTorch](#5-install-pytorch)
-6. [Install the remaining dependencies](#6-install-the-remaining-dependencies)
-7. [Run the health check](#7-run-the-health-check)
-8. [Download the MATR dataset](#8-download-the-matr-dataset)
-9. [Preprocess the dataset](#9-preprocess-the-dataset)
-10. [Check dataset readiness](#10-check-dataset-readiness)
-11. [Start the website](#11-start-the-website)
-12. [Your first run in the website](#12-your-first-run-in-the-website)
-13. [Running from the command line instead](#13-running-from-the-command-line-instead)
-14. [Where the results are](#14-where-the-results-are)
-15. [Optional: connect an LLM assistant](#15-optional-connect-an-llm-assistant)
-16. [Every time you come back](#16-every-time-you-come-back)
-17. [Updating to a newer version](#17-updating-to-a-newer-version)
-18. [Troubleshooting](#18-troubleshooting)
-19. [Known limitations](#19-known-limitations)
-20. [Tested versions and what was verified](#20-tested-versions-and-what-was-verified)
+1. [What BatteryML-Agent is](#1-what-batteryml-agent-is)
+2. [Requirements and installation](#2-requirements-and-installation)
+3. [The conda / Python environment](#3-the-conda--python-environment)
+4. [Datasets: download and preprocessing](#4-datasets-download-and-preprocessing)
+5. [Dataset readiness statuses](#5-dataset-readiness-statuses)
+6. [Starting the website](#6-starting-the-website)
+7. [Home page and Quick experience, step by step](#7-home-page-and-quick-experience-step-by-step)
+8. [Prepare Data and Dataset Overview](#8-prepare-data-and-dataset-overview)
+9. [Run Model: choosing a configuration](#9-run-model-choosing-a-configuration)
+10. [Uploading your own YAML configuration safely](#10-uploading-your-own-yaml-configuration-safely)
+11. [Agent Workflow and model recommendations](#11-agent-workflow-and-model-recommendations)
+12. [Optional LLM assistant: Save, Connect, Explain](#12-optional-llm-assistant-save-connect-explain)
+13. [CPU and GPU](#13-cpu-and-gpu)
+14. [Review Results: run history, results and metrics](#14-review-results-run-history-results-and-metrics)
+15. [Scientific figures and figure export](#15-scientific-figures-and-figure-export)
+16. [Benchmark comparison and smoke-test limits](#16-benchmark-comparison-and-smoke-test-limits)
+17. [Command line: copyable commands](#17-command-line-copyable-commands)
+18. [Troubleshooting and known limitations](#18-troubleshooting-and-known-limitations)
+19. [Reproducibility, verification status and citation](#19-reproducibility-verification-status-and-citation)
 
 ---
 
-## 0. What you need
+## 1. What BatteryML-Agent is
+
+### 1.1 What it does for you
+
+You give it battery cycling data (for example the public **MATR** dataset of
+180 LFP/graphite cells). It then:
+
+1. converts the raw files into BatteryML's format (**preprocessing**);
+2. trains a model you choose (for example **XGBoost**) and evaluates it on a
+   held-out test set (**run**);
+3. shows the scores (RMSE, MAE, MAPE), the predictions and scientific figures,
+   and lets you download everything (**review**).
+
+Two prediction tasks are supported:
+
+| Task | What is predicted | Unit of the error |
+| --- | --- | --- |
+| **RUL prediction** | how many cycles a cell has left | cycles |
+| **SOH estimation** | the remaining capacity as a fraction of the initial capacity | capacity ratio |
+
+### 1.2 Three ways to use it
+
+| Route | For whom | Needs an API key? |
+| --- | --- | --- |
+| **Quick experience / Protocol Workflow** (§7–§9, §14) | Everyone. Fully deterministic and works offline. This is the reference route. | No |
+| **Agent Workflow** (§11) | Describe the job in one sentence; the website works out the dataset, task and model and checks that they can run. | No (an LLM is optional) |
+| **Command line** (§17) | Scripts, servers, batch jobs. | No |
+
+### 1.3 Architecture, in one picture
+
+```
+            ┌──────────────────────── your browser ───────────────────────┐
+            │  Home · Agent Workflow · Prepare Data · Run Model · Review  │
+            └───────────────────────────────┬─────────────────────────────┘
+                                            │  (Streamlit website: batteryml_web/app.py)
+     optional LLM ─ explains only ─┐        ▼
+                                   │   validators  ── refuse anything that cannot run safely
+                                   │        │
+                                   └──▶ suggestions are shown to you; nothing runs without your click
+                                            ▼
+             batteryml_web/core/run_batteryml_cli.py   (the one wrapper around BatteryML)
+                                            ▼
+                    BatteryML: preprocess · train · predict · evaluate (RMSE / MAE / MAPE)
+                                            ▼
+      data/raw/<DATASET> → data/processed/<DATASET> → runs/web_projects/<project>/…
+```
+
+Rules the code enforces:
+
+- **All numbers come from BatteryML.** Predictions, metrics and benchmark
+  values are never produced by the LLM.
+- **Nothing runs until you press a Run button.** Analysing, recommending and
+  explaining never start training.
+- **Training reads processed data, never raw data.** Preprocess first (§4).
+
+### 1.4 Folder layout
+
+| Folder | Content |
+| --- | --- |
+| `batteryml/` | The BatteryML library (upstream code, not modified for this platform). |
+| `batteryml_web/` | The website, the safety checks and the command-line wrapper. |
+| `configs/` | Ready-made run configurations (YAML files), one per dataset × model. |
+| `data/raw/<DATASET>/` | Raw files you download. Not stored in git. |
+| `data/processed/<DATASET>/` | Preprocessed files (one `.pkl` per cell). Not stored in git. |
+| `runs/` | Everything the runs write. Not stored in git. |
+| `scripts/` | Health check, readiness inspection, figure export and other tools. |
+| `docs/` | Technical documentation. |
+
+---
+
+## 2. Requirements and installation
+
+### 2.1 What you need
 
 | Item | Requirement |
 | --- | --- |
-| Operating system | **Linux x86_64** (tested). macOS: not tested. Windows: install [WSL2 with Ubuntu](https://learn.microsoft.com/windows/wsl/install) and follow the Linux steps inside it — not tested. |
-| Disk space | **12 GB** for the software (measured: Miniconda + environment 8.0 GB, pip download cache 3.5 GB), **plus** space for the raw and processed battery data. |
-| Internet | Needed during installation and data download. Hosts used: `repo.anaconda.com`, `pypi.org`, `files.pythonhosted.org`, `github.com`, `data.matr.io`. |
-| GPU | **Not required.** Everything runs on CPU. An NVIDIA GPU is used if present (§5). |
-| Admin rights | Not required. Everything installs into your home directory. |
+| Operating system | **Linux x86_64** (tested). macOS: not tested. Windows: use [WSL2 with Ubuntu](https://learn.microsoft.com/windows/wsl/install) and follow the Linux steps inside it (not tested). |
+| Disk space | About **12 GB** for the software (measured in the V1 test install: Miniconda + environment 8.0 GB, pip download cache 3.5 GB), plus room for the battery data. |
+| Internet | During installation and data download. Hosts used: `repo.anaconda.com`, `pypi.org`, `files.pythonhosted.org`, `github.com`, `data.matr.io`. |
+| GPU | **Not required.** Everything works on CPU. An NVIDIA GPU can be used (§13). |
+| Admin rights | Not required. Everything installs into your home folder. |
+| API key | **Not required.** Only the optional LLM assistant (§12) uses one. |
 
----
-
-## 1. Check the machine
+### 2.2 Check the machine
 
 ```bash
 git --version
 curl --version
 ```
 
-**Check:** both print a version. If `git` is missing, install it with your
-system's package manager (on Ubuntu: `sudo apt-get install -y git`). If
-`curl` is missing, install it the same way (`sudo apt-get install -y curl`).
+Both must print a version. If one is missing, install it with your system's
+package manager (Ubuntu: `sudo apt-get install -y git curl`).
 
-Optional — only if the machine has an NVIDIA GPU:
+Only if the machine has an NVIDIA GPU:
 
 ```bash
 nvidia-smi
 ```
 
-**Check:** a table appears. Note the **`CUDA Version`** printed in its top-right
-corner; you need it in §5. If the command is not found, the machine has no
-usable NVIDIA driver and everything will run on CPU — that is fine.
+A table appears; note the `CUDA Version` in its top-right corner (needed in
+§3.3). "Command not found" means no usable NVIDIA driver; everything will run
+on CPU, which is fine.
 
----
+### 2.3 Install Miniconda
 
-## 2. Install Miniconda
+Miniconda provides `conda`, which creates an isolated Python environment, so
+nothing else on your machine is changed.
 
-Miniconda provides `conda`, which creates an isolated Python environment for
-BatteryML so nothing else on your machine is changed.
+> Already have conda or Anaconda? Run `conda --version`. If it prints a
+> version, skip to **step 4** below.
 
-> **Already have conda or Anaconda?** Run `conda --version`. If it prints a
-> version, skip 2.1–2.3 and go straight to **2.4**.
+1. Download the installer:
 
-### 2.1 Download the installer
+   ```bash
+   cd ~
+   curl -LO https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+   ```
 
-```bash
-cd ~
-curl -LO https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
-```
+   Other platforms use another file name in the URL:
+   `Miniconda3-latest-Linux-aarch64.sh` (Linux ARM),
+   `Miniconda3-latest-MacOSX-arm64.sh` (Apple Silicon),
+   `Miniconda3-latest-MacOSX-x86_64.sh` (Intel Mac).
 
-On other platforms, replace the file name in the URL:
+2. Install it into `~/miniconda3` without questions:
 
-| Platform | File name |
-| --- | --- |
-| Linux, ARM (aarch64) | `Miniconda3-latest-Linux-aarch64.sh` |
-| macOS, Apple Silicon (M1/M2/M3/M4) | `Miniconda3-latest-MacOSX-arm64.sh` |
-| macOS, Intel | `Miniconda3-latest-MacOSX-x86_64.sh` |
+   ```bash
+   bash Miniconda3-latest-Linux-x86_64.sh -b -p $HOME/miniconda3
+   ```
 
-**Check:** `ls -lh Miniconda3-latest-*.sh` shows a file of roughly 120–190 MB.
+   The output ends with `installation finished.`
 
-### 2.2 Run the installer
+3. Connect conda to your terminal, then **close the terminal and open a new
+   one** (required):
 
-```bash
-bash Miniconda3-latest-Linux-x86_64.sh -b -p $HOME/miniconda3
-```
+   ```bash
+   $HOME/miniconda3/bin/conda init bash
+   ```
 
-`-b` installs without questions; `-p` sets the install folder to
-`~/miniconda3`.
+   On macOS (zsh) use `$HOME/miniconda3/bin/conda init zsh`. In the new
+   terminal the prompt starts with `(base)` and `conda --version` prints a
+   version.
 
-**Check:** the output ends with `installation finished.`
+4. Accept the Anaconda Terms of Service. Without this, creating the
+   environment fails with `CondaToSNonInteractiveError`:
 
-### 2.3 Connect conda to your terminal
+   ```bash
+   conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+   conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+   ```
 
-```bash
-$HOME/miniconda3/bin/conda init bash
-```
+   Expected: `accepted Terms of Service for https://repo.anaconda.com/pkgs/main`
+   and the same line for `…/pkgs/r`.
 
-(On macOS, whose default shell is zsh, run `$HOME/miniconda3/bin/conda init zsh` instead.)
-
-Now **close the terminal and open a new one.** This step is required: the
-change only takes effect in a new terminal.
-
-**Check:** in the new terminal, the prompt starts with `(base)`, and
-
-```bash
-conda --version
-```
-
-prints a version (the test install printed `conda 26.7.1`).
-
-### 2.4 Accept the Anaconda Terms of Service
-
-Current Miniconda versions refuse to create environments until you accept
-the Terms of Service of the default channels. Without this step, §4 fails
-with `CondaToSNonInteractiveError: Terms of Service have not been accepted`.
-
-```bash
-conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
-conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
-```
-
-**Check:** the two lines printed are
-`accepted Terms of Service for https://repo.anaconda.com/pkgs/main` and
-`accepted Terms of Service for https://repo.anaconda.com/pkgs/r`.
-
----
-
-## 3. Download the code
+### 2.4 Download the code
 
 ```bash
 cd ~
 git clone https://github.com/ZishanShu/BatteryML-Agent.git
 cd BatteryML-Agent
-```
-
-**Check:**
-
-```bash
 ls
 ```
 
 The list includes `batteryml`, `batteryml_web`, `configs`, `requirements.txt`
 and `README.md`.
 
-> **Important:** from here on, every command in this guide is run **inside the
-> `BatteryML-Agent` folder**. Whenever you open a new terminal, run
-> `cd ~/BatteryML-Agent` first.
+> **Important:** every command in this guide is run **inside the
+> `BatteryML-Agent` folder**. In every new terminal, run `cd ~/BatteryML-Agent`
+> first.
 
 ---
 
-## 4. Create the Python environment
+## 3. The conda / Python environment
+
+### 3.1 Create and activate the environment
 
 ```bash
 conda create -n batteryml python=3.10 -y
 conda activate batteryml
-```
-
-**Check:** the prompt now starts with `(batteryml)` instead of `(base)`, and
-
-```bash
 python --version
 ```
 
-prints `Python 3.10.x`.
+The prompt now starts with `(batteryml)` and Python prints `Python 3.10.x`.
+Use Python 3.10: `requirements.txt` needs `numpy<2.0`, which has no builds for
+Python 3.13.
 
-Python 3.10 is the version this guide was tested with. Do not use Python 3.13:
-`requirements.txt` requires `numpy<2.0`, which has no Python 3.13 builds.
+> Every time you open a new terminal: `cd ~/BatteryML-Agent` and
+> `conda activate batteryml`. Most "module not found" errors come from
+> forgetting this.
 
----
-
-## 5. Install PyTorch
-
-PyTorch is installed on its own first, so you can check the GPU before
-installing everything else.
+### 3.2 Install PyTorch
 
 ```bash
 python -m pip install --upgrade pip
 pip install torch
 ```
 
-This is the largest download of the whole installation (in the test install:
-PyTorch 2.14.0 plus its NVIDIA CUDA libraries, about 5.5 GB on disk, 222 s on
-a fast connection). The same package works on machines **with and without**
-a GPU.
-
-**Check:**
+This is the biggest download (about 5.5 GB on disk in the V1 test install).
+The same package works with and without a GPU. Check it:
 
 ```bash
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
-| What it prints | Meaning |
+| Output | Meaning |
 | --- | --- |
-| `2.14.0+cu130 13.0 False` on a machine **without** a GPU | Correct. Everything will run on CPU. |
+| `… False` on a machine **without** a GPU | Correct. Everything runs on CPU. |
 | `… True` on a machine **with** a GPU | Correct. The GPU can be used. |
-| `… False` on a machine **with** a GPU | Your NVIDIA driver is older than the CUDA version PyTorch was built for. See below. |
+| `… False` on a machine **with** a GPU | The NVIDIA driver is older than PyTorch's CUDA version. See §3.3. |
 
-Two lines may appear **above** the version line:
-`UserWarning: Failed to initialize NumPy: No module named 'numpy'` and
-`cpu = _conversion_method_template(device=torch.device("cpu"))`. This is
-expected at this point — numpy is installed in §6. Ignore it; it disappears
-after §6.
+A warning `Failed to initialize NumPy: No module named 'numpy'` can appear at
+this point. It is expected and disappears after §3.4.
 
-**Only if you have a GPU and it printed `False`:** compare the second number
-(the CUDA version PyTorch was built for, e.g. `13.0`) with the `CUDA Version`
-that `nvidia-smi` showed in §1. If `nvidia-smi` shows a lower number, either
-update the NVIDIA driver, or replace PyTorch with a build for your CUDA
-version. Get the exact command from the selector at
-<https://pytorch.org/get-started/locally/> (choose *Pip*, *Linux*, your CUDA
-version). It has this form — `cu126` means CUDA 12.6:
+### 3.3 Only for a GPU that printed `False`
+
+Compare the second number (PyTorch's CUDA version, for example `13.0`) with
+the `CUDA Version` from `nvidia-smi`. If the driver's number is lower, update
+the driver, or install a PyTorch build that matches it. Take the exact
+command from <https://pytorch.org/get-started/locally/> (Pip, Linux, your CUDA
+version). It has this form (`cu126` = CUDA 12.6):
 
 ```bash
 pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu126
 ```
 
-Then run the check above again.
-
----
-
-## 6. Install the remaining dependencies
+### 3.4 Install the remaining packages
 
 ```bash
 pip install -r requirements.txt
-```
-
-This installs numpy, scipy, pandas, numba, scikit-learn, xgboost, h5py,
-matplotlib, streamlit and the other packages BatteryML needs (53 s in the
-test install).
-
-If you are logged in as `root`, pip prints a warning that starts with
-`WARNING: Running pip as the 'root' user`. Inside the conda environment this
-warning is harmless.
-
-**Check:**
-
-```bash
 python -c "import numpy, pandas, sklearn, xgboost, torch, streamlit; print('all imports OK')"
 ```
 
-prints `all imports OK`.
+Expected last line: `all imports OK`.
 
-> **Do not run `pip install .`** The upstream BatteryML README asks for it, but
-> BatteryML-Agent does not need it: the website and the command-line tool
-> always load BatteryML from this folder. A `pip install .` would copy a
-> snapshot of the code into the environment, and that copy would **not** be
-> updated when you later run `git pull`.
+> **Do not run `pip install .`** The website and the command-line wrapper load
+> BatteryML from this folder. An installed copy would not follow `git pull`.
 
-Optional — free 3.5 GB of disk by deleting pip's download cache:
+Optional, frees about 3.5 GB: `pip cache purge`.
 
-```bash
-pip cache purge
-```
-
----
-
-## 7. Run the health check
+### 3.5 Run the health check
 
 ```bash
 python -m scripts.verify.run_all
 ```
 
-It runs 13 checks and prints one line per check. On a new installation
-without data, the last line is exactly:
+It runs 13 checks and prints one line per check, then a summary line. On a
+fresh installation **without data**, the V1 guide recorded this summary:
 
 ```
 10 passed, 1 failed, 2 skipped of 13 check(s)
 ```
 
-**This result is correct.** The command also exits with code `1` because of
-the one failure; that is expected. What each line should say:
-
-| Check | Expected | Why |
+| Check | Expected without data | Why |
 | --- | --- | --- |
 | `ENV-01` `CLI-01` `CFG-01` `VAL-01` `EXT-01` `DEV-01` `INTENT-01` `RUN-01` `UI-01` `FIG-01` | `[PASS]` | The installation is complete. |
-| `DATA-01` `SPLIT-01` | `[SKIP]` | No data has been downloaded yet (§8). |
-| `REG-01` | `[FAIL]` | Upstream BatteryML lists six cycler formats (`BATTERYARCHIVE`, `BIOLOGIC`, `INDIGO`, `LANDT`, `MACCOR`, `NOVONIX`) that have no preprocessor. It does not affect anything in this guide. |
+| `DATA-01` `SPLIT-01` | `[SKIP]` | No data has been downloaded yet. |
+| `REG-01` | `[FAIL]` | Expected. Upstream BatteryML lists six cycler formats without a preprocessor. It does not affect this guide. |
 
-The first time it runs, two lines starting with a date may appear between
-the checks: `INFO - Failed to extract font properties from …` and
-`INFO - generated new fontManager`. Matplotlib is building its font cache;
-this happens once and is not an error.
-
-If any check other than `REG-01` says `[FAIL]`, read its message — it names
-the problem — and see §18. The full report is written to
-`runs/verify/verification_report.json`.
+The command exits with code `1` because of `REG-01`; that is expected. Any
+other `[FAIL]` names its problem; see §18. Once a `data/` folder exists,
+`DATA-01` no longer says `[SKIP]`. The full report is written to
+`runs/verify/verification_report.json`. What each check tests:
+[`docs/VERIFY.md`](./docs/VERIFY.md).
 
 ---
 
-## 8. Download the MATR dataset
+## 4. Datasets: download and preprocessing
 
-MATR contains 180 LFP/graphite cells and is the reference dataset of this
-guide.
+Data always flows in this order:
+
+```
+data/raw/<DATASET>  ──preprocess──▶  data/processed/<DATASET>  ──run──▶  results
+```
+
+You can do both steps **in the website** (§7 step 1, or §8) or **on the
+command line** (below). They run the same BatteryML commands.
+
+> After a download or preprocessing on the **command line**, open
+> **Prepare Data → Dataset Overview** and click **Refresh datasets**, so that
+> Prepare Data and Run Model list the dataset. The **Download …** and
+> **Process …** buttons of Quick experience refresh this list automatically.
+
+### 4.1 Which datasets can be downloaded automatically
+
+| Dataset | Automatic download | Preprocessing |
+| --- | --- | --- |
+| `MATR` (reference dataset, 180 cells) | Yes | Yes |
+| `HUST`, `CALCE`, `RWTH` | Yes | Yes |
+| `HNEI`, `SNL`, `UL_PUR`, `OX` | **No.** Download by hand as described in [`dataprepare.md`](./dataprepare.md) and place the files in `data/raw/<NAME>/`. | Yes |
+
+### 4.2 Download MATR
 
 ```bash
 python batteryml_web/core/run_batteryml_cli.py download MATR data/raw/MATR
 ```
 
-This downloads four large `.mat` files from `data.matr.io`. It takes a long
-time; leave it running.
+This downloads four large `.mat` files from `data.matr.io`; it takes a long
+time. Running it again is always safe: complete files are skipped
+(`[INFO] … already exists and is complete (… bytes). Skip it.`); missing or
+incomplete files are fetched again. Files are written to a temporary `.part`
+file first and renamed only when complete.
 
-If the machine cannot reach `data.matr.io`, the command stops with one line
-that starts with `error: Could not download data/raw/MATR/MATR_batch_….mat`
-and contains `ProxyError`, `ConnectionError` or `403 Forbidden`, and it
-writes **nothing** for that file. Fix the network first (open
-<https://data.matr.io> in a browser on the same machine; a university or
-company proxy may block it), then run the same command again.
-
-Running the command again is always safe. Files that are already complete
-are skipped (`[INFO] … already exists and is complete (… bytes). Skip it.`);
-files that are missing, empty or cut off are downloaded again.
-
-> Always start BatteryML through `batteryml_web/core/run_batteryml_cli.py`.
-> Running `python bin/batteryml.py` directly fails with
-> `ModuleNotFoundError: No module named 'batteryml.…'; 'batteryml' is not a package`.
-
-**Check:**
+Check:
 
 ```bash
 ls -lh data/raw/MATR
 find data/raw/MATR -type f -size 0
 ```
 
-The first command lists exactly these four files, each much larger than zero:
-`MATR_batch_20170512.mat`, `MATR_batch_20170630.mat`,
-`MATR_batch_20180412.mat`, `MATR_batch_20190124.mat`.
-The second command must print **nothing**.
+The first command lists `MATR_batch_20170512.mat`, `MATR_batch_20170630.mat`,
+`MATR_batch_20180412.mat` and `MATR_batch_20190124.mat`. The second prints
+**nothing**.
 
-> **If a file is missing or the second command printed a file name:** run the
-> download command above again; it replaces empty and incomplete files. Only
-> if it then stops with `… already exists (… bytes), but whether it is
-> complete cannot be checked` (the server could not be reached to compare
-> sizes), delete the folder and download again:
->
-> ```bash
-> rm -rf data/raw/MATR
-> python batteryml_web/core/run_batteryml_cli.py download MATR data/raw/MATR
-> ```
->
-> Folders downloaded with an older version of this repository can still hold
-> an empty or cut-off file: that version created each file *before*
-> downloading it and then skipped it on the next run. The download command
-> now writes to a temporary `.part` file and renames it only when it is
-> complete, so it no longer leaves broken files behind.
+If the machine cannot reach `data.matr.io`, the command stops with one line
+`error: Could not download data/raw/MATR/MATR_batch_….mat` containing
+`ProxyError`, `ConnectionError` or `403 Forbidden`, and writes nothing for
+that file. Fix the network (try <https://data.matr.io> in a browser on the same
+machine), then run the command again.
 
-Other datasets:
+For `HUST`, `CALCE` or `RWTH`, replace `MATR` in **both** places of the command.
 
-- `HUST`, `CALCE` and `RWTH` can be downloaded the same way — replace `MATR`
-  in both places of the command.
-- `HNEI`, `SNL`, `UL_PUR` and `OX` cannot be downloaded by this command.
-  Download them by hand as described in [`dataprepare.md`](./dataprepare.md)
-  and put the files in `data/raw/<NAME>/`.
-
----
-
-## 9. Preprocess the dataset
-
-The models do not read the raw files. Preprocessing converts them into
-BatteryML's own format, one `.pkl` file per cell.
+### 4.3 Preprocess MATR
 
 ```bash
 python batteryml_web/core/run_batteryml_cli.py preprocess MATR data/raw/MATR data/processed/MATR
-```
-
-**Check:**
-
-```bash
 ls data/processed/MATR | wc -l
 ```
 
-prints `180`.
+The count printed for MATR is `180` (one `.pkl` per cell; observed on the
+project's server).
 
-If preprocessing stops with
-`FileNotFoundError: Batch file not found: data/raw/MATR/MATR_batch_….mat`,
-the download in §8 is incomplete: redo §8, then run this step again.
-
-If it stops with `OSError: Unable to synchronously open file (file signature
-not found)`, one of the `.mat` files is empty or cut off — a file left by an
-older version of the download command (see the box in §8). Run the download
-command in §8 again (it replaces such files), then this step again.
-
-A failed preprocessing run leaves an **empty** `data/processed/MATR` folder
-behind. That is why §10 then reports `INCOMPLETE_PROCESSED`, and a model run
-fails with `KeyError: 'b1c1'`. Running this step again successfully fixes both.
-
----
-
-## 10. Check dataset readiness
+For another dataset, replace `MATR` in all three places. Many datasets at once:
 
 ```bash
-python -c "
-from batteryml_web.core.readiness import list_dataset_readiness
-for r in list_dataset_readiness():
-    print(f'{r.dataset:<12} {r.status.value}')
-"
+python scripts/preprocess_sweep.py --dry-run
+python scripts/preprocess_sweep.py --only HUST
 ```
 
-It prints one line per dataset. **Check:** the line for MATR is
+`--dry-run` prints the command for each dataset and runs nothing (it still
+writes its report, `logs/preprocess/sweep_report.csv`). Other options: `--skip`, `--force`,
+`--timeout` (see `python scripts/preprocess_sweep.py --help`).
 
-```
-MATR         READY
-```
+> Always use `batteryml_web/core/run_batteryml_cli.py`. Running
+> `python bin/batteryml.py` directly fails with
+> `ModuleNotFoundError: … 'batteryml' is not a package`.
 
-The four possible states:
+### 4.4 Common data errors
 
-| State | Meaning | What to do |
+| Message | Cause | Fix |
 | --- | --- | --- |
-| `READY` | Preprocessed `.pkl` files are present. | Nothing. It can be used. |
-| `RAW_ONLY` | Raw files are present, preprocessed files are not. | Run §9 for this dataset. |
-| `INCOMPLETE_PROCESSED` | `data/processed/<NAME>` exists but contains no `.pkl` files — preprocessing failed or was interrupted. | Run §9 again. |
-| `MISSING` | Neither raw nor preprocessed files. | Run §8 for this dataset. |
-
-Datasets you did not download are listed as `MISSING`. That is normal.
+| `FileNotFoundError: Batch file not found: data/raw/MATR/…` | The download is incomplete. | Run §4.2 again, then §4.3. |
+| `OSError: Unable to synchronously open file (file signature not found)` | A `.mat` file is empty or cut off. | Run §4.2 again (it replaces such files), then §4.3. |
+| `AssertionError: data/processed/MATR` (during a run) | Preprocessing was never run. | Run §4.3. It does **not** mean the website is broken. |
+| `KeyError: 'b1c1'` (during a run) | `data/processed/MATR` exists but is empty (preprocessing failed). | Fix the preprocessing error, run §4.3 again. |
 
 ---
 
-## 11. Start the website
+## 5. Dataset readiness statuses
+
+The website and the scripts classify every dataset into one of four states:
+
+| Status | Meaning | What to do |
+| --- | --- | --- |
+| `READY` | Preprocessed `.pkl` files are present. | Nothing; it can be used for runs. |
+| `RAW_ONLY` | Raw files are present; processed files are not. | Preprocess it (§4.3, or **Process … data** / **Run preprocessing** in the website). |
+| `INCOMPLETE_PROCESSED` | `data/processed/<NAME>` exists but has no `.pkl` file; preprocessing failed or was interrupted. | Preprocess it again. |
+| `MISSING` | Neither raw nor processed files. | Download it (§4.2), or place raw files by hand. |
+
+Datasets you never downloaded show `MISSING`. That is normal.
+
+Check readiness from the command line (read-only; changes nothing):
 
 ```bash
-python -m streamlit run batteryml_web/app.py
+python -m scripts.inspect_dataset_readiness MATR
 ```
 
-Start it from the `BatteryML-Agent` folder — the settings in
-`.streamlit/config.toml` are only read from there.
-
-**Check:** the terminal prints
+For each dataset it prints the raw and processed folders it looked at and a
+`status` line, then a summary. Example on a machine **without** data:
 
 ```
-  You can now view your Streamlit app in your browser.
+MATR
+    raw native                    absent  not present
+        …/data/raw/MATR
+    …
+    processed                     absent  not present
+        …/data/processed/MATR
+    status                        MISSING
 
-  Local URL: http://localhost:8501
+summary: MISSING 1
 ```
 
-Open `http://localhost:8501` in a browser. The page title is
-**LLM-guided BatteryML Protocol Platform**.
+After §4.3 the status line reads `READY`. Without arguments it lists every
+dataset; `--json` prints JSON instead.
 
-The website runs until you press `Ctrl+C` in this terminal (it prints
-`Stopping...`). Closing the terminal stops it too.
-
-While you use the website, this terminal prints lines starting with a date,
-such as ``Please replace `use_container_width` with `width`.`` or
-``Please replace `st.components.v1.html` with `st.iframe`.``. These are
-Streamlit deprecation warnings, not errors; the website keeps working. Errors
-that matter are shown on the web page itself.
-
-### If the code runs on a remote server
-
-The browser runs on your own computer, so forward the port. On **your own
-computer**, open a new terminal and run (replace `user@server` with how you log
-in to the server):
-
-```bash
-ssh -L 8501:localhost:8501 user@server
-```
-
-Keep that terminal open and open `http://localhost:8501` in your local
-browser.
-
-> The website has no login. Anyone who can reach port 8501 can use it. Prefer
-> the SSH tunnel above over opening the port to a network.
+Readiness describes **the data only**. A model also needs a registered,
+validated configuration for that dataset and task (§9, §11).
 
 ---
 
-## 12. Your first run in the website
-
-The website has a sidebar on the left. The steps below use the exact names of
-its buttons and tabs.
-
-### 12.1 Create a project
-
-1. On the **Home** page, under **Create New Project**, keep the default
-   **Project name** `my_battery_project` (or type your own).
-2. Keep **Projects base directory** as `runs/web_projects`.
-3. Click **Create New Project**.
-
-**Check:** the sidebar shows your project under **Current project**, and the
-folder `runs/web_projects/my_battery_project/` now exists. All runs of this
-project are saved inside it.
-
-### 12.2 Register the data with the website
-
-1. In the sidebar, click **1. 🧪 Prepare Data**.
-2. On the **Dataset Overview** tab, click **Refresh datasets**.
-
-**Check:** a card for **MATR** appears. Its last two lines read
-`Status: READY` and **Ready**. (Clicking **Refresh datasets** runs
-`tools/sync_data_and_config_manifests.py`, which writes the two files in
-`data/metadata/` that the website reads. Click it again whenever you add or
-preprocess a dataset.)
-
-If the card instead ends with `Status: INCOMPLETE_PROCESSED` and
-**Processed incomplete**, or `Status: RAW_ONLY` and
-**Preprocessing required**, go back to §9, then click **Refresh datasets**
-again.
-
-### 12.3 Train and evaluate a model
-
-Use the **Agent Workflow** page: it shows live progress and has **Stop run**.
-Its runs appear on the **Review Results** page (so do runs from the Run Model
-page and the Home page's **Run MATR Demo**, §12.5).
-It does **not** need an API key — the request is interpreted by fixed rules.
-
-1. In the sidebar, click **Agent Workflow**.
-2. In **Workflow request**, type:
-
-   ```text
-   Use XGBoost on MATR to predict RUL.
-   ```
-
-   (**Use template** fills in an example of the form
-   `Use [Model] on [dataset] to predict [task].`, for example
-   `Use CNN on HUST to predict battery lifetime.`. If you click it, replace
-   the text with the line above.)
-3. Click **Analyze**. Under **Workflow analysis** the page shows
-   **Dataset** `MATR`, **Task** `RUL prediction` and **Dataset readiness**
-   `READY`, followed by the models that can run.
-
-   If it shows **Dataset readiness** `INCOMPLETE_PROCESSED` (or `RAW_ONLY`)
-   and the message `xgb cannot run for this dataset and task.`, MATR has not
-   been preprocessed: go back to §9, then **Prepare Data → Refresh datasets**,
-   then click **Analyze** again. No model can be selected until then.
-4. In **Model (runnable models only; blocked models cannot be selected)**, choose **XGBoost**.
-5. In **Config — evaluation protocol (validated only)**, choose
-   `configs/baselines/sklearn/xgb/matr_1.yaml`. The list also offers
-   `clo.yaml` and `matr_2.yaml`: they are different test splits of the same
-   MATR data, so pick one and keep it when comparing runs.
-6. Leave **1-epoch smoke test — workflow validation only; not benchmark
-   performance.** unticked. (It only matters for neural-network models; see §13.)
-7. Under **Compute device**, choose **CPU**, or **GPU** if you have one.
-8. Click **Run**. Progress is shown live on the page. While it runs, **Stop run**
-   cancels it.
-
-**Check:** the run finishes with a success message and shows RMSE, MAE and
-MAPE.
-
-### 12.4 Look at the results
-
-1. In the sidebar, click **3. 📈 Review Results**.
-2. Under **Run history**, choose your run in **Open a run** (the newest run is
-   selected by default).
-3. Use the tabs **Summary**, **Metrics**, **Predictions**, **Logs** and
-   **Files**.
-
-The **Predictions** tab shows observed vs. predicted values, the residuals
-and the prediction table.
-
-### 12.5 The Run Model page
-
-The sidebar entry **2. 🚀 Run Model** runs the same BatteryML command through
-a form: tabs **Configuration** (choose **Dataset**, **Task**, **Model**,
-**Device**, **Seed**), **Dataset Readiness**, **Command & Run** (shows the
-exact command, then **Run BatteryML**) and **Logs / Debug**.
-
-Each run started there gets its own folder (§14) and is listed on
-**Review Results** like an Agent Workflow run. The **Workspace dir** and the
-command shown before you press **Run BatteryML** already contain that run's
-folder, `runs/web_projects/<project>/run_model/<run_id>`. Unlike Agent
-Workflow, this page has no **Stop run** button: the run ends when BatteryML
-finishes.
-
----
-
-## 13. Running from the command line instead
-
-Everything the website runs is one BatteryML command. You can run it
-directly (with the `batteryml` environment active, inside the
-`BatteryML-Agent` folder).
-
-**A full run** — trains and evaluates XGBoost on MATR, on CPU:
-
-```bash
-python batteryml_web/core/run_batteryml_cli.py run configs/baselines/sklearn/xgb/matr_1.yaml --workspace runs/cli_matr_xgb --train --eval --device cpu --seed 0
-```
-
-**A smoke test** — one training epoch of the CNN model, only to confirm that
-training works on this machine:
-
-```bash
-python batteryml_web/core/run_batteryml_cli.py run configs/baselines/nn_models/cnn/matr_1.yaml --workspace runs/smoke_matr_cnn --train --eval --device cpu --seed 0 --epochs 1
-```
-
-Use `--device cuda:0` instead of `--device cpu` to use the first GPU.
-
-Three rules for this command:
-
-- The config file is given **without** `--config` in front of it. `run --config …`
-  fails with `unrecognized arguments: --config`.
-- `--train` and `--eval` are both required. Without them the command only
-  prints the workspace path and does nothing.
-- Always give `--seed`, so the run can be repeated with the same result.
-
-When the run ends, the last line printed is the scores, for example
-`{'RMSE': …, 'MAE': …, 'MAPE': …}`.
-
-> **A smoke-test score is not a result.** One epoch trains almost nothing; it
-> only shows that data loading, training and evaluation work. Do not compare
-> it with anything. The published BatteryML benchmark (RMSE in cycles; lower
-> is better; MATR1 and MATR2 are different test sets) is in
-> [`README_BATTERYML.md`](./README_BATTERYML.md).
-
----
-
-## 14. Where the results are
-
-BatteryML does not write a metrics spreadsheet. It prints the scores at the
-end of the run and saves them, together with the predictions, in one `.pkl`
-file.
-
-**Runs from Agent Workflow** (§12.3):
-
-```
-runs/web_projects/<project>/agent_<dataset>_<model>/<run_id>/
-├── run.json                                  run record: command, status, seed, device, git commit, scores
-├── run.log   stdout.log   stderr.log         everything the run printed
-├── config_<timestamp>.yaml                   the config as BatteryML used it
-└── predictions_seed_<seed>_<timestamp>.pkl   predictions and scores
-```
-
-**Runs from the Run Model page or the Home page's Run MATR Demo button**
-(§12.5):
-
-```
-runs/web_projects/<project>/run_model/<run_id>/    Run Model page
-runs/web_projects/<project>/quickstart/<run_id>/   Run MATR Demo
-├── run.json                                  run record: command, status, seed, device, git commit, scores
-├── output.log                                everything the run printed
-├── config_<timestamp>.yaml                   the config as BatteryML used it
-└── predictions_seed_<seed>_<timestamp>.pkl   predictions and scores
-```
-
-The pages also still write `runs/web_projects/<project>/logs/run_model.log`
-(Run Model) and `runs/web_projects/<project>/logs/matr_demo.log` (demo), which
-hold the most recent run's output.
-
-**Runs from the command line with `--workspace <folder>`** (§13):
-
-```
-<folder>/
-├── config_<timestamp>.yaml
-└── predictions_seed_<seed>_<timestamp>.pkl
-```
-
-To print the scores saved in a `.pkl` file (run inside the `BatteryML-Agent`
-folder; replace the path with your file):
-
-```bash
-python -c "import pickle; print(pickle.load(open('runs/cli_matr_xgb/predictions_seed_0_TIMESTAMP.pkl', 'rb'))['scores'])"
-```
-
-To export the result figures of one `.pkl` file for a paper — separate SVG and
-PNG panels, the exact plotted values as CSV, and `figure_sources.json`
-recording where every number came from — first look at what it holds
-(`--inspect` writes nothing), then export into a **new** folder. The command
-only draws; it never trains or evaluates.
-
-```bash
-python -m scripts.export_result_figures --artifact runs/cli_matr_xgb/predictions_seed_0_TIMESTAMP.pkl --inspect
-python -m scripts.export_result_figures --artifact runs/cli_matr_xgb/predictions_seed_0_TIMESTAMP.pkl --output runs/figure_exports/cli_matr_xgb
-```
-
-The folder then contains `parity.svg`/`.png`, `residuals.svg`/`.png`, their
-`_zoom` versions, `plotted_samples.csv`, `figure_sources.json` and
-`figure_notes.md`; an SOH result also gets `soh_cycle_<cell>.svg`/`.png`/`.csv`
-and `per_cell_errors.csv`. The same export is in the website under
-**Export figures** below each result. Details: `docs/VISUALIZATION.md`.
-
----
-
-## 15. Optional: connect an LLM assistant
-
-Skip this if you do not have an API key. Steps 1–14 do not use it.
-
-With a key, the website can additionally explain configs, errors and
-results in plain language. It never computes numbers; all numbers come from
-BatteryML.
-
-1. In the sidebar, open **Settings**.
-2. **Provider**: choose a preset (OpenAI, Gemini, Claude, Kimi / Moonshot,
-   GLM / Zhipu), or **Custom OpenAI-compatible** for any other
-   OpenAI-compatible service. A preset only fills in the Base URL.
-3. **Base URL**: your provider's API address (filled in by the preset).
-4. **API key**: your key.
-5. **Model**: a model name your key is allowed to use.
-6. Click **Save**, then **Connect**.
-
-**Check:** the status line at the bottom of the sidebar changes from
-**LLM: Not connected** to **LLM: Connected**.
-
-The API key is kept only in the open browser session. It is not written to
-any file, log, run record or export, and it is gone when the session ends.
-Never put an API key in a file inside this repository.
-
----
-
-## 16. Every time you come back
-
-After a restart, or in any new terminal:
+## 6. Starting the website
 
 ```bash
 cd ~/BatteryML-Agent
@@ -733,12 +454,667 @@ conda activate batteryml
 python -m streamlit run batteryml_web/app.py
 ```
 
-Then open `http://localhost:8501` (on a remote server, start the SSH tunnel
-from §11 first). Your projects, data and runs are still on disk.
+Use exactly `python -m streamlit run …` from the `BatteryML-Agent` folder.
+(A plain `streamlit run …` can fail with
+`ModuleNotFoundError: No module named 'batteryml_web'`, and
+`.streamlit/config.toml` is only read from this folder.)
+
+The terminal prints:
+
+```
+  You can now view your Streamlit app in your browser.
+
+  Local URL: http://localhost:8501
+```
+
+Open `http://localhost:8501`. The browser tab is titled
+**BatteryML Protocol Platform**. Stop the website with `Ctrl+C` in the
+terminal.
+
+Lines starting with a date that mention `use_container_width` or similar are
+Streamlit deprecation warnings, not errors. Errors that matter appear on the
+web page.
+
+**On a remote server**, forward the port from **your own computer** (replace
+`user@server`), keep that terminal open, and open `http://localhost:8501`
+locally:
+
+```bash
+ssh -L 8501:localhost:8501 user@server
+```
+
+> The website has no login. Anyone who can reach port 8501 can use it. Prefer
+> the SSH tunnel to opening the port to a network.
+
+### 6.1 The sidebar (on every page)
+
+| Element | What it is |
+| --- | --- |
+| **🔋 BatteryML / Protocol Navigator** | The brand tile. |
+| **Current project** | The loaded project, or `(no project loaded)`. Runs made without a project go to `runs/web_projects/default`. |
+| **🏠 Home** | Start page (§7). |
+| **Agent Workflow** | "Describe a task in plain language; nothing runs until you press Run." (§11). |
+| **Protocol Workflow** → **1. 🧪 Prepare Data**, **2. 🚀 Run Model**, **3. 📈 Review Results** | The manual protocol (§8, §9, §14). |
+| **← Prev** / **Next →** | Move one step backward or forward in the protocol. |
+| **Settings** | Opens the LLM settings (§12). |
+| **LLM: …** status line | `Not connected`, `Configured / Not tested`, `Connected` or `Connection failed`. |
 
 ---
 
-## 17. Updating to a newer version
+## 7. Home page and Quick experience, step by step
+
+The Home page shows the title **BatteryML workspace** and the question
+**How would you like to start?** with three cards:
+
+| Card | Use it to |
+| --- | --- |
+| **⚡ Quick experience** ("Use the built-in MATR demo", "No API key required") | Get a first result with one dataset, one model, no project setup. |
+| **✦ Create new project** | Make a named project folder for your own work. |
+| **↗ Existing project** | Reopen a project you made earlier. |
+
+Click a card to open its panel. **← Choose another start path** below the
+panel closes it. Further down the page: **Your BatteryML workflow** (an
+overview of the four steps), a note about the optional LLM if none is
+configured, the **Agent Workflow** box (§11), and **Start workflow →**, which
+opens **Prepare Data**.
+
+### 7.1 Quick experience
+
+Click **⚡ Quick experience**. The panel has four numbered steps. The default
+is **MATR · RUL prediction · XGBoost · cpu**, using
+`configs/baselines/sklearn/xgb/matr_1.yaml`.
+
+#### Step 1 · Prepare data
+
+1. **Where:** the **Raw dataset** drop-down. **Select:** `MATR` (default).
+   A dataset with no run configuration shows `· no run configuration`; it
+   cannot be run here (use **Open Prepare Data** instead).
+2. **Read the status:** "Raw data" and "Processed data" each show their state,
+   plus a line `Readiness: STATUS — reason` (statuses: §5). An unfinished
+   download shows `Download incomplete (x/y files)`.
+3. **If raw data is missing:** click **Download MATR data**.
+   - **What happens:** BatteryML's download command runs with a progress bar.
+     The log is saved to `runs/web_projects/<project>/logs/download_matr.log`.
+   - **Expected:** the raw status changes to present, and the panel shows
+     `✓ Raw files present — no download needed.`
+   - **Errors:** a network failure shows the error on the page (see §4.2). For
+     a dataset BatteryML cannot download, the panel says
+     `BatteryML has no automatic download for X. Place its raw files under data/raw/X/, or see Prepare Data.`
+4. **If processed data is missing:** click **Process MATR data**.
+   - **What happens:** BatteryML's preprocessing runs; log in
+     `runs/web_projects/<project>/logs/preprocess_matr.log`.
+   - **Expected:** `✓ Processed data ready — no processing needed.` and
+     readiness `READY`.
+   - **Errors:** `FileNotFoundError` / `OSError` → the download is
+     incomplete; download again (§4.4).
+
+#### Step 2 · Configure model
+
+| Control | What to choose |
+| --- | --- |
+| **Prediction task** | `RUL prediction` or `SOH estimation` (only tasks with a configuration for this dataset). |
+| **Prediction model** | A model that has a configuration for this dataset and task, e.g. XGBoost. |
+| **Protocol configuration** | The configuration file, shown as `name · path`. |
+| **Compute device** | `cpu` or `cuda`. `cuda` shows `(not available on this machine)` when it cannot be used (§13). |
+| **Upload YAML configuration (optional)** | Your own config file (§10). |
+
+An info box confirms the choice:
+`This configuration means: Dataset … · Task … · Prediction model … · Device … · Config file …`.
+Read it before running.
+
+#### Step 3 · Run training
+
+1. **Read** "Run location": the folder the run will write.
+2. If the data is not processed, the page warns
+   `Process the dataset in step 1 before starting a model run.` and the run
+   cannot start.
+3. Click **Run experiment**.
+   - **What happens:** BatteryML trains and evaluates with seed `0`. A progress
+     bar shows the stages (initialize, check processed data, load
+     configuration, training and evaluation, collect outputs).
+   - **Output folder:** `runs/web_projects/<project>/quickstart/<run_id>/` with
+     `run.json`, `run.log`, `output.log`, `config_<timestamp>.yaml` and
+     `predictions_seed_0_<timestamp>.pkl`.
+   - **Errors:** a failed run shows BatteryML's exit code and points to the
+     run log. `AssertionError: data/processed/…` or `KeyError: 'b1c1'` →
+     back to step 1.
+
+#### Step 4 · Review results
+
+The metrics BatteryML saved are shown. Click **Open Review Results** for the
+full result (§14). The first time, if no LLM is configured, the LLM settings
+dialog opens once; close it with **Close** if you do not use an LLM.
+
+### 7.2 Create new project
+
+1. Click **✦ Create new project**.
+2. **Project name:** type a name (default `my_battery_project`).
+3. **Projects base directory:** keep `runs/web_projects`.
+4. Click **Create project and continue**. The sidebar's **Current project**
+   shows the new name, and the workspace folder is shown.
+5. Under **Workflow steps** open the step you need: **1 · Prepare data** →
+   **Open Prepare Data**; **2 · Configure model** / **3 · Run training** →
+   **Open Run Model**; **4 · Review results** → **Open Review Results**.
+
+### 7.3 Existing project
+
+1. Click **↗ Existing project**.
+2. **Select existing project** from the list, then
+   **Load project and continue**.
+3. If the list is empty, the panel says `No existing project found yet…`;
+   create one first (§7.2).
+
+---
+
+## 8. Prepare Data and Dataset Overview
+
+Open **1. 🧪 Prepare Data** in the sidebar. The page shows
+`Raw data → Preprocessing → Processed records → Feature inspection → Ready for model`
+and has three tabs.
+
+### 8.1 Tab "Dataset Overview"
+
+1. Click **Refresh datasets**.
+   - **What happens:** `tools/sync_data_and_config_manifests.py` re-reads the
+     data folders and the configuration list (written to `data/metadata/`),
+     and the page reloads.
+   - **Expected:** every dataset that has files under `data/raw/<NAME>/` is
+     listed. A dataset without raw files is not listed.
+   - **Error:** if the tool fails, its error output is shown in red.
+2. **Status cards** count datasets as **Ready**, **Preprocessing required**,
+   **Processed incomplete** and **Missing** (= §5's `READY`, `RAW_ONLY`,
+   `INCOMPLETE_PROCESSED`, `MISSING`).
+3. The table lists every dataset with its paths and state. **Preparation
+   Pipeline** shows the five stages.
+
+If the page says `No datasets are available yet. Click Refresh datasets after generating manifests.`,
+click **Refresh datasets**. If the message stays, no raw data is present yet:
+download it (§4.2, or Quick experience step 1) and refresh again.
+
+### 8.2 Tab "Preprocess & Inspect"
+
+1. **Dataset:** choose a dataset. The page shows Selected dataset, Dataset
+   readiness, Raw path, Processed path and Processed file count, and the exact
+   command it will run.
+2. Click **Run preprocessing** (or **Re-run preprocessing** if processed files
+   exist).
+   - The button is disabled with `Raw data missing` when there are no raw
+     files, or with a warning when the raw source is not one BatteryML can
+     preprocess.
+   - **Log:** `runs/web_projects/<project>/logs/preprocess_<dataset>.log`,
+     shown under **Latest preprocessing log**.
+   - **Expected:** the processed file count grows (MATR: 180) and readiness
+     becomes `READY`.
+3. **Feature / artifact inspection** lets you look at the processed records.
+4. **Go to Run Model** continues; **View Dataset Overview** goes back.
+
+### 8.3 Tab "Custom Dataset / Schema Mapping" (your own cycler data)
+
+1. **Dataset name:** a short name for your data.
+2. **Source format:** `ARBIN`, `BIOLOGIC`, `LANDT`, `MACCOR` or `NEWARE`.
+3. **Task type:** the task you intend to run.
+4. **Upload training raw files** and **Upload validation/test raw files**;
+   optionally **Optional cycler config file**.
+5. Click **Save uploads**, then **Preprocess training split**,
+   **Preprocess validation/test split** and **Validate processed outputs**.
+
+Each preprocessing step writes its log next to the uploads
+(`preprocess_train.log`, `preprocess_valid.log`). A run configuration for a
+custom dataset is not created automatically; see
+[`docs/EXTENDING_MODELS.md`](./docs/EXTENDING_MODELS.md) for extension.
+
+---
+
+## 9. Run Model: choosing a configuration
+
+Open **2. 🚀 Run Model**. Use this page for full control over dataset, task,
+model, device and seed.
+
+If no dataset is listed yet, the page shows only
+`No datasets are currently available. Prepare or upload a dataset first.` with
+**Go to Prepare Data** and **Go to Home**. Get raw data first (§4, §7) and click
+**Refresh datasets** (§8.1); then the four tabs below appear.
+
+### 9.1 Tab "Configuration"
+
+| Control | What to choose |
+| --- | --- |
+| **Dataset** | A dataset (only datasets with configurations are offered). |
+| **Task** | `RUL prediction` or `SOH estimation`. |
+| **Model** | A model with a configuration for this dataset and task. |
+| **Device** | `cpu` or `cuda`. A problem with `cuda` is shown as a warning (§13). |
+| **Seed** | An integer, default `0`. Same config + seed + data → same result. |
+
+The right-hand column, **Selected config summary**, shows the configuration
+file chosen for you: the **first registered configuration** for that dataset,
+task and model. It cannot be picked by hand here (use §10 or the command line
+for a different file). **Workspace dir** shows where the run will be written.
+
+Configurations available in this repository (examples):
+
+| Dataset · task | Models |
+| --- | --- |
+| MATR · RUL | 23 models, including `xgb`, `rf`, `ridge`, `lasso`, `elastic_net`, `svm`, `gpr`, `mlp`, `cnn`, `lstm`, `transformer`, `batlinet`, `cptransformer`, `dummy` |
+| HUST · RUL, SNL · RUL | 21 models each (no `batlinet`, no `cptransformer`) |
+| MATR · SOH | `elastic_net`, `lasso`, `rf`, `ridge`, `xgb` (`configs/soh/<model>/matr.yaml`) |
+
+With a connected LLM (§12), **Explain this config** and **Suggest model/config**
+describe the choice in words. They never change it.
+
+### 9.2 Tab "Dataset Readiness"
+
+Cards **Ready**, **Need preprocess** and **Missing raw**. **Select <dataset>**
+picks a ready dataset; **Go Prepare Data** opens §8.
+
+### 9.3 Tab "Command & Run"
+
+1. Read the exact BatteryML command shown. (**Explain this command** needs an
+   LLM.)
+2. Warnings block the run when something is missing:
+   `Processed dataset missing. Go to Prepare Data and run preprocessing first.`
+   or `Config missing…`.
+3. Click **Run BatteryML**.
+   - **What happens:** BatteryML trains and evaluates with your seed and
+     device. The website adds `--metric RMSE,MAE,MAPE` for RUL and
+     `--metric MAE,RMSE` for SOH.
+   - **Output:** `runs/web_projects/<project>/run_model/<run_id>/` with
+     `run.json`, `output.log`, `config_<timestamp>.yaml` and
+     `predictions_seed_<seed>_<timestamp>.pkl`. The latest output is also in
+     `runs/web_projects/<project>/logs/run_model.log`.
+   - **Expected:** a success message, **Review Results →**, and the
+     **Output workspace** section.
+4. A Run Model run cannot be stopped from the website (only Agent Workflow has
+   **Stop run**). Stop the website with `Ctrl+C` if you must.
+
+### 9.4 Tab "Logs / Debug"
+
+Shows Last command, Return code, Log path and the end of the log. A crash of
+the Python process (segmentation fault) is explained in plain words. With an
+LLM, **Explain last error** and **Suggest next action** help diagnose; any fix
+is up to you.
+
+---
+
+## 10. Uploading your own YAML configuration safely
+
+Where: **Home → ⚡ Quick experience → Step 2 · Configure model →
+Upload YAML configuration (optional)**.
+
+1. Click the upload box and choose a `.yaml` or `.yml` file. A good starting
+   point is a copy of a file from `configs/`, e.g.
+   `configs/baselines/sklearn/xgb/matr_1.yaml`.
+2. Click **Apply uploaded configuration**.
+3. **What happens:** the file is checked. Applying only **selects** the
+   configuration; it never starts a run.
+4. **Expected:** the Protocol configuration and the info box switch to your
+   file, and a caption `Uploaded configuration: …` appears. A validated copy
+   is stored as `runs/web_projects/<project>/uploads/configs/<random id>.yaml`
+   (your file name never chooses the path; nothing is overwritten).
+
+The upload is refused, with the reasons listed under
+`The uploaded configuration was not applied; the previous selection is unchanged.`, when:
+
+| Rule | Example message |
+| --- | --- |
+| File name must be a plain `.yaml`/`.yml` name, no folders | `The file name … contains a path; upload a plain .yaml file.` |
+| At most 256 KB, UTF-8 text, not empty | `The file is empty.` |
+| Plain YAML only (no `!!python/…` tags) | `The file uses a YAML tag that is not allowed in a config …` |
+| Must be a mapping of sections | `… a run config must be a mapping of sections (model, train_test_split, feature, label).` |
+| Every class name must exist in BatteryML; the task must match the dataset on screen | the validator's message naming the field |
+| No file/directory options except `train_test_split.cell_data_path`, which must stay inside `data/processed/` | `` `train_test_split.cell_data_path` = … resolves outside data/processed/ … `` |
+| No device options (the device is chosen on the page) | `` `…` chooses a compute device; the device is selected on the page (Compute device) … `` |
+
+Fix the file and upload again. On the command line you can run any
+configuration file directly (§17); the same validators run in the website only.
+
+---
+
+## 11. Agent Workflow and model recommendations
+
+Agent Workflow turns one sentence into a checked run plan. **No API key is
+needed**: without an LLM the request is resolved deterministically against
+the catalog of datasets, tasks and models. With an LLM configured, the LLM
+may help read the request, but its answer is checked against the same
+catalog.
+
+### 11.1 Write the request
+
+1. Open **Agent Workflow** in the sidebar (or type into the **Agent Workflow**
+   box on Home and click **Analyze with Agent**).
+2. In **Workflow request**, write a sentence following the pattern
+   `Use [Model] on [dataset] to predict [task].`, for example
+   `Use XGBoost on MATR to predict RUL.`
+   While the box is empty, **Use template** fills in a sentence built from
+   this installation's catalog (it never overwrites text you typed).
+3. Click **Analyze**. Analysing never runs anything.
+
+### 11.2 Read the analysis
+
+**Workflow analysis** shows three values: **Dataset**, **Task** and
+**Dataset readiness**, and a caption like
+`N model(s) runnable, M blocked for this dataset and task.`
+
+- **If the request can run**, **Backend recommended next steps** is a
+  collapsed section you can open.
+- **If the data is not ready**, a warning names the problem, for example
+  `RUL prediction configurations are registered for MATR, but its data is MISSING; models run on processed data only. Prepare the dataset in Prepare Data first, then analyze again.`
+  and `No model can be executed for this dataset/task.` Prepare the data (§7
+  step 1 or §8), then click **Analyze** again.
+- **If the combination has no configuration** (for example
+  `Use ElasticNet on HUST to predict soh.`: there is no SOH configuration for
+  HUST), the page explains why and lists alternatives, grouped as
+  **<dataset> · <task>**, **<task> on other datasets** and
+  **Other tasks on <dataset>**. An alternative whose model can run right now
+  is a button, such as `Use Elastic Net Regression on MATR for SOH estimation`
+  (this needs MATR to be `READY`). Clicking it **replaces the request** and
+  analyses it again; nothing runs until you press Run. **Readiness details**
+  lists the dataset states.
+- **Explain this workflow** writes a plain-language explanation directly
+  below the button. It needs a connected LLM; otherwise the page says so and
+  offers **Open LLM settings**.
+
+### 11.3 Choose and run
+
+| Control | What to choose |
+| --- | --- |
+| **Model (runnable models only; blocked models cannot be selected)** | One of the runnable models. |
+| **1-epoch smoke test — workflow validation only; not benchmark performance.** | Tick to train for one epoch only, to check the pipeline quickly (§16). |
+| **Compute device** | **CPU** or **GPU**; with GPU, pick the **GPU**. |
+| **Config — evaluation protocol (validated only)** | One of the validated configurations. |
+
+Click **Run**.
+
+- **What happens:** BatteryML trains and evaluates with seed `0` (fixed in
+  this route). The live log is shown. **Stop run** stops it.
+- **Output:** `runs/web_projects/<project>/agent_<dataset>_<model>/<run_id>/`
+  (with `_smoke` appended for a smoke test), containing `run.json`, `run.log`,
+  `stdout.log`, `stderr.log`, `config_<timestamp>.yaml` and
+  `predictions_seed_0_<timestamp>.pkl`.
+- **Expected:** the saved metrics; **Run again** repeats; with an LLM,
+  **Explain computed result** describes the result in words.
+- **Errors:** a dataset that is not `READY` blocks the run; preprocess it (§8).
+
+---
+
+## 12. Optional LLM assistant: Save, Connect, Explain
+
+Skip this section if you have no API key. **Nothing else in this guide needs
+one.** The assistant only explains and suggests; it never computes a
+prediction, metric or benchmark value, never edits data, and never applies a
+change without your click.
+
+### 12.1 Configure it
+
+1. Open **Settings** in the sidebar (or **Configure LLM** / **Open LLM
+   settings** on a page; these open the **LLM settings** dialog).
+2. **Provider:** `OpenAI`, `Gemini (OpenAI-compatible)`,
+   `Claude (OpenAI-compatible)`, `Kimi / Moonshot`, `GLM / Zhipu`, or
+   `Custom OpenAI-compatible`. A preset fills in the Base URL.
+3. **Base URL:** your provider's OpenAI-compatible API address.
+4. **API key:** your key (hidden while typing).
+5. **Model:** a model name your key may use.
+6. Click **Save** to store the settings without any network call
+   (message `LLM settings saved. Connection not tested yet.`; sidebar
+   `LLM: Configured / Not tested`), or **Connect** to store **and test** them.
+
+**Expected after Connect:** the sidebar line changes from `LLM: Not connected`
+to `LLM: Connected`. If the test fails, it shows `LLM: Connection failed`;
+check the Base URL, key and model name, then **Connect** again.
+
+The key lives **only in the open browser session**. It is not written to any
+file, log, run record or export, and it is gone when the session ends. Never
+put an API key into a file in this repository.
+
+### 12.2 Where explanations are available
+
+| Page | Buttons (need `Connected`) |
+| --- | --- |
+| Run Model | **Explain this config**, **Suggest model/config**, **Explain this command**, **Explain last error**, **Suggest next action** |
+| Agent Workflow | **Explain this workflow**, **Explain computed result** |
+| Review Results | **Summarize results**, **Explain metrics** (under **Optional LLM interpretation**) |
+
+Without a connection, these buttons open the LLM settings dialog instead of
+calling anything.
+
+---
+
+## 13. CPU and GPU
+
+- **CPU always works** and is the default (`cpu` in Quick experience and Run
+  Model, **CPU** in Agent Workflow, `--device cpu` on the command line).
+- **GPU:** choose `cuda` (Quick experience, Run Model), **GPU** + a **GPU**
+  number (Agent Workflow), or `--device cuda:0` on the command line.
+- The website checks the GPU **before** running. If CUDA is unavailable, or the
+  installed PyTorch was not built for your GPU's architecture (for example an
+  old PyTorch on an RTX 3090), the GPU option is refused with the reason.
+  **There is no automatic fallback to CPU**: choose CPU yourself.
+- One device per run. Multi-GPU training is not offered in the website.
+- Classical models (XGBoost, random forest, ridge, …) gain little from a GPU;
+  neural networks (CNN, LSTM, Transformer) gain more.
+- `CUDA out of memory` → use CPU or a smaller model.
+
+---
+
+## 14. Review Results: run history, results and metrics
+
+Open **3. 📈 Review Results**. It lists the runs of the current project (or of
+`runs/web_projects/default`) from Quick experience, Run Model and Agent
+Workflow.
+
+### 14.1 Run history
+
+A compact table: **Run** (end of the run id), **Started**
+(`YYYY-MM-DD HH:MM UTC`), **Experiment** (model · dataset · task), **Seed**,
+**Device**, **Status**, **Duration**, **Metrics**.
+
+Statuses: `COMPLETED`, `FAILED`, `RUNNING`, `PLANNED`, `CANCELLED`,
+`INTERRUPTED`.
+
+### 14.2 Open a run
+
+1. **Open a run:** choose a run from the list.
+2. **Run details · …** (expandable) shows a status pill, the full run id and a
+   table: Run ID, Started, Project, Run directory, Dataset, Task, Model,
+   Config, Seed, Epochs, Device, Status, Duration, Return code, Git commit.
+3. **Metrics** shows exactly what BatteryML saved (RUL: RMSE, MAE, MAPE in
+   cycles; SOH: MAE, RMSE). A failed run records no metrics.
+4. **Scientific plots** (§15).
+5. **Prepare run bundle** then **Download run bundle** downloads the whole run.
+   **Artifacts** lists the files; **Download a file** / **Download selected
+   file** downloads one.
+6. **Resume training** appears only for neural-network models that saved a
+   checkpoint.
+
+### 14.3 Selected result
+
+Tabs **Summary**, **Metrics**, **Predictions**, **Logs** and **Files**, then
+**Benchmark reference** (§16) and **Optional LLM interpretation** (§12).
+
+If the page says
+`No runs recorded yet for this project (runs/web_projects/default). A run appears here as soon as it is started.`
+and `No run is selected. Choose one in Run History above.`, the project has no
+run yet: run one (§7, §9 or §11) and come back. Check that the sidebar shows
+the project you ran in.
+
+### 14.4 Reading the numbers
+
+- **RMSE** and **MAE** are in the task's unit (cycles for RUL). Lower is better.
+- **MAPE** is a relative error. Lower is better.
+- A smoke-test result (one epoch) is **not** a performance result (§16).
+
+From the command line, a project's runs and their states:
+
+```bash
+python -m scripts.inspect_run_state runs/web_projects/default
+```
+
+---
+
+## 15. Scientific figures and figure export
+
+Under **Scientific plots** for a run:
+
+- **Prediction artifact:** the `.pkl` the figures are drawn from.
+- **Axis range:** **Full range** or **Zoomed view**.
+- **Cell** (SOH): choose a cell to plot its SOH over cycles.
+- Parity plot (predicted vs. true) and residuals, a
+  **Per-cell error summary (display diagnostic)** and an
+  **Estimate range check**.
+
+**Export figures** (expandable):
+
+1. Read the equivalent command shown.
+2. Click **Prepare figure package**, then
+   **Download figure package (.zip)**.
+
+The same export from the command line (replace the path with your file):
+
+```bash
+python -m scripts.export_result_figures --artifact runs/web_projects/default/quickstart/<run_id>/predictions_seed_0_<timestamp>.pkl --inspect
+python -m scripts.export_result_figures --artifact runs/web_projects/default/quickstart/<run_id>/predictions_seed_0_<timestamp>.pkl --output runs/figure_exports/my_run
+```
+
+`--inspect` only describes the file. The export folder (must be new) holds
+`parity.svg`/`.png`, `residuals.svg`/`.png`, their `_zoom` versions,
+`plotted_samples.csv`, `figure_sources.json` and `figure_notes.md`; an SOH
+result also gets `soh_cycle_<cell>.svg`/`.png`/`.csv` and `per_cell_errors.csv`.
+Options: `--cell-id`, `--list-cells`, `--dpi`. The command only draws; it never
+trains or evaluates. Details: [`docs/VISUALIZATION.md`](./docs/VISUALIZATION.md).
+
+---
+
+## 16. Benchmark comparison and smoke-test limits
+
+**Benchmark reference** (Review Results) places a run beside the published
+BatteryML RUL benchmark (RMSE in cycles, from
+[`README_BATTERYML.md`](./README_BATTERYML.md)) **only when the comparison is
+fair**. Otherwise it says why, with one of these reasons:
+
+- the published benchmark covers RUL prediction only (every SOH run);
+- the run's train/test split does not identify a published subset
+  (`MATR1`, `MATR2`, …);
+- the model has no corresponding published baseline;
+- the metric or unit is not RMSE in cycles;
+- it is a **1-epoch smoke run**;
+- the published value is a threshold (`>1000`), not a number;
+- the run saved no RMSE.
+
+**Smoke tests** (Agent Workflow checkbox, or `--epochs 1` on the command line)
+train for one epoch. They prove that loading, training and evaluation work on
+your machine. **Their scores are not results**: do not report or compare
+them.
+
+---
+
+## 17. Command line: copyable commands
+
+Run these inside `BatteryML-Agent` with `conda activate batteryml`.
+
+```bash
+# Health check (13 checks)
+python -m scripts.verify.run_all
+
+# Download (MATR, HUST, CALCE, RWTH)
+python batteryml_web/core/run_batteryml_cli.py download MATR data/raw/MATR
+
+# Preprocess
+python batteryml_web/core/run_batteryml_cli.py preprocess MATR data/raw/MATR data/processed/MATR
+
+# Readiness (read-only)
+python -m scripts.inspect_dataset_readiness MATR
+
+# Full run: XGBoost on MATR, CPU, seed 0
+python batteryml_web/core/run_batteryml_cli.py run configs/baselines/sklearn/xgb/matr_1.yaml --workspace runs/cli_matr_xgb --train --eval --device cpu --seed 0
+
+# Smoke test: one epoch of CNN (not a result)
+python batteryml_web/core/run_batteryml_cli.py run configs/baselines/nn_models/cnn/matr_1.yaml --workspace runs/smoke_matr_cnn --train --eval --device cpu --seed 0 --epochs 1
+
+# SOH run: XGBoost on MATR
+python batteryml_web/core/run_batteryml_cli.py run configs/soh/xgb/matr.yaml --workspace runs/cli_matr_soh_xgb --train --eval --device cpu --seed 0
+
+# Start the website
+python -m streamlit run batteryml_web/app.py
+```
+
+Rules for `run`:
+
+- The configuration file is **positional**. `run --config …` fails with
+  `unrecognized arguments: --config`.
+- `--train` and `--eval` are both required. Without them the command prints
+  the workspace path and exits.
+- Always give `--seed`.
+- `--device cuda:0` uses the first GPU.
+- Other options: `--metric`, `--epochs`, `--ckpt-to-resume`,
+  `--skip_if_executed` (see `python batteryml_web/core/run_batteryml_cli.py run --help`).
+
+The run ends by printing the scores, e.g. `{'RMSE': …, 'MAE': …, 'MAPE': …}`.
+The workspace holds `config_<timestamp>.yaml` and
+`predictions_seed_<seed>_<timestamp>.pkl`. To print the saved scores:
+
+```bash
+python -c "import pickle; print(pickle.load(open('runs/cli_matr_xgb/predictions_seed_0_TIMESTAMP.pkl', 'rb'))['scores'])"
+```
+
+Preprocessing input types: datasets `CALCE HNEI HUST MATR OX RWTH SNL UL_PUR`;
+cycler formats `ARBIN BATTERYARCHIVE BIOLOGIC INDIGO LANDT MACCOR NEWARE NOVONIX`
+(some cycler formats have no preprocessor; see `REG-01` in §3.5).
+
+---
+
+## 18. Troubleshooting and known limitations
+
+### 18.1 Troubleshooting
+
+| Message or symptom | Cause | Fix |
+| --- | --- | --- |
+| `conda: command not found` | The terminal was not reopened after `conda init`. | Open a new terminal; if needed, run `$HOME/miniconda3/bin/conda init bash` again. |
+| `CondaToSNonInteractiveError` | Terms of Service not accepted. | §2.3 step 4. |
+| Prompt shows `(base)`, not `(batteryml)` | Environment not active. | `conda activate batteryml` |
+| `ModuleNotFoundError: No module named 'numpy'` (or `torch`, `streamlit`) | Environment not active, or installation incomplete. | `conda activate batteryml`, then §3.2 and §3.4. |
+| `ModuleNotFoundError: No module named 'batteryml_web'` | Started outside the folder, or with plain `streamlit run`. | `cd ~/BatteryML-Agent`; use `python -m streamlit run batteryml_web/app.py`. |
+| `ModuleNotFoundError: … 'batteryml' is not a package` | `python bin/batteryml.py` was used. | Use `python batteryml_web/core/run_batteryml_cli.py …`. |
+| `error: Could not download …` (`ProxyError`, `ConnectionError`, `403 Forbidden`) | Download server unreachable. | Fix the network; run the download again. |
+| `FileNotFoundError: Batch file not found` / `OSError: … file signature not found` | Incomplete raw files. | Download again, then preprocess again (§4.4). |
+| Dataset shows `INCOMPLETE_PROCESSED` | Preprocessing failed. | Preprocess again. |
+| `AssertionError: data/processed/MATR` | Not preprocessed. | §4.3. |
+| `KeyError: 'b1c1'` | Processed folder is empty. | Fix preprocessing, run it again. |
+| `unrecognized arguments: --config` | `--config` in front of the file. | Remove `--config`. |
+| Run prints a path and ends | `--train --eval` missing. | Add both. |
+| Health check `[FAIL] REG-01` | Expected upstream gap. | Nothing. |
+| `No datasets are available yet.` | The website has not re-read the data folders. | **Prepare Data → Refresh datasets**. |
+| `No run is selected…` in Review Results | No run in this project yet. | Run one (§7 or §9). |
+| Quick experience: `Process the dataset in step 1 before starting a model run.` | Data not processed. | Step 1 → **Process … data**. |
+| Run Model: `Processed dataset missing…` | Data not processed. | §8.2. |
+| Run Model: `No datasets are currently available. Prepare or upload a dataset first.` | No raw data, or the list was not refreshed. | Get raw data (§4), then **Prepare Data → Refresh datasets**. |
+| GPU option refused | No CUDA, or PyTorch not built for this GPU. | Choose CPU, or fix PyTorch (§3.3, §13). |
+| `CUDA out of memory` | Model does not fit on the GPU. | Choose CPU. |
+| LLM buttons open the settings dialog | LLM not connected. | §12, or ignore; nothing else needs it. |
+| `LLM: Connection failed` | Wrong Base URL, key or model, or no network. | Correct them, click **Connect**. |
+| Browser cannot open `localhost:8501` | Website runs on a remote server. | SSH tunnel (§6). |
+
+### 18.2 Known limitations
+
+- **CPTransformer** needs code from a separate repository placed in
+  `third_party/BatteryLife/`, which is not included; **PBT** needs
+  `third_party/PBT` assets, which are not included. All other models work
+  without them. The health check (`VAL-01`) mentions this.
+- BatteryLife datasets (`MICH`, `MICH_EXP`, `SDU`, `Stanford_2`, `Tongji`,
+  `XJTU`, `ISU_ILCC`) have no BatteryML preprocessor: they can be detected
+  (`RAW_ONLY`) but not preprocessed here.
+- `HNEI`, `SNL`, `UL_PUR` and `OX` must be downloaded by hand.
+- Not every dataset × task × model has a configuration; the website offers only
+  combinations that exist. SOH configurations exist for MATR only.
+- Quick experience and Run Model runs cannot be stopped from the website; only
+  Agent Workflow has **Stop run**.
+- One device per run; no multi-GPU training in the website.
+- In Agent Workflow and Quick experience the seed is fixed at `0`; use Run
+  Model or the command line for other seeds.
+- No login: protect port 8501 (§6).
+- Tested on Linux only.
+
+### Updating to a newer version
+
+Stop the website (`Ctrl+C`), then:
 
 ```bash
 cd ~/BatteryML-Agent
@@ -748,123 +1124,63 @@ pip install -r requirements.txt
 python -m scripts.verify.run_all
 ```
 
-Stop the website with `Ctrl+C` before updating and start it again afterwards.
+### Starting over
 
-`git pull` prints `Updating …` and `Fast-forward` and a list of changed files
-(or `Already up to date.`). `pip install -r requirements.txt` prints
-`Requirement already satisfied` for everything that did not change.
-
-Read the health check as in §7: `REG-01` stays `[FAIL]` (expected). Once you
-have data, `DATA-01` and `SPLIT-01` no longer say `[SKIP]`. Any other `[FAIL]`
-line names its problem; see §18.
-
----
-
-## 18. Troubleshooting
-
-| Message or symptom | Cause | Fix |
-| --- | --- | --- |
-| `conda: command not found` | The terminal was not reopened after §2.3. | Close the terminal, open a new one. If still missing, run `$HOME/miniconda3/bin/conda init bash` again. |
-| `CondaToSNonInteractiveError: Terms of Service have not been accepted` | §2.4 was skipped. | Run the two commands in §2.4. |
-| The prompt shows `(base)`, not `(batteryml)` | The environment is not active. | `conda activate batteryml` |
-| `ModuleNotFoundError: No module named 'numpy'` (or `torch`, `streamlit`, …) | The environment is not active, or §5/§6 did not finish. | `conda activate batteryml`, then repeat §5 and §6. |
-| `ModuleNotFoundError: … 'batteryml' is not a package` | `python bin/batteryml.py` was run directly. | Use `python batteryml_web/core/run_batteryml_cli.py …` |
-| `ModuleNotFoundError: No module named 'batteryml_web'` | The command was run outside the `BatteryML-Agent` folder. | `cd ~/BatteryML-Agent` and run it again. |
-| `torch.cuda.is_available()` prints `False` on a GPU machine | NVIDIA driver older than PyTorch's CUDA version. | §5, last part. |
-| `[INFO] data/raw/MATR/… already exists. Skip it.` (without `and is complete`) | The folder was downloaded with an older version, which skipped broken files. | Update (§17), then run §8 again. |
-| `error: Could not download …` with `ProxyError`, `ConnectionError` or `403 Forbidden` during §8 | The machine cannot reach the download server. Nothing was written. | Fix the network, then run §8 again. |
-| `error: … already exists (… bytes), but whether it is complete cannot be checked` | The server could not be reached to compare sizes. | If the earlier download ended without an error, the file is complete: go on to §9. Otherwise fix the network and run §8 again. |
-| `FileNotFoundError: Batch file not found: data/raw/MATR/…` | The download is incomplete. | §8 again, then §9. |
-| `OSError: Unable to synchronously open file (file signature not found)` in §9 | A `.mat` file is empty or cut off (left by an older version of the download). | Run §8 again, then §9. |
-| MATR shows `INCOMPLETE_PROCESSED` | Preprocessing failed or was interrupted. | §9 again. |
-| `AssertionError: data/processed/MATR` when running a model | §9 was not run. | Run §9. |
-| `KeyError: 'b1c1'` when running a model | `data/processed/MATR` exists but is empty — §9 failed. | Fix the cause of the §9 error, run §9 again. |
-| `unrecognized arguments: --config` | `--config` was typed in front of the config file. | Remove `--config`. |
-| The run only prints a path and ends | `--train --eval` are missing. | Add both. |
-| Health check: `[FAIL] REG-01 …` and exit code 1 | Upstream gap, expected. | Nothing. See §7. |
-| Health check: `[FAIL] DATA-01 … processed directory/directories exist but contain no *.pkl file: MATR` | §9 failed and left an empty `data/processed/MATR`. | Fix the cause of the §9 error, run §9 again. |
-| Website: **No datasets are available yet.** | The website has not re-read the data folder. | **Prepare Data → Refresh datasets**. |
-| Website: **No run is selected. Choose one in Run History above.** | No run has been started in this project yet. | Run a model (§12.3 or §12.5), then open **Review Results** again. |
-| Browser cannot open `localhost:8501` from your own computer | The website runs on a remote server. | Use the SSH tunnel in §11. |
-| `CUDA out of memory` | The model does not fit on the GPU. | Choose **CPU** / `--device cpu`. |
-
-**Starting over completely** — deletes the environment only; your code, data
-and runs stay:
+Removes only the environment; code, data and runs stay:
 
 ```bash
 conda deactivate
 conda env remove -n batteryml -y
 ```
 
-Then repeat from §4.
+Then repeat from §3.1.
 
 ---
 
-## 19. Known limitations
+## 19. Reproducibility, verification status and citation
 
-- **CPTransformer** needs source code from a separate repository placed in
-  `third_party/BatteryLife/`, which is not part of this repository. Without
-  it, this one model is unavailable; all other models work. The health check
-  (`VAL-01`) mentions it.
-- The BatteryLife datasets (`MICH`, `MICH_EXP`, `SDU`, `Stanford_2`, `Tongji`,
-  `XJTU`, `ISU_ILCC`) have no BatteryML preprocessor. They can be detected
-  (`RAW_ONLY`) but not preprocessed here.
-- Runs started on the **Run Model** page or with **Run MATR Demo** cannot be
-  stopped from the website; only **Agent Workflow** has **Stop run**.
-- Only one device per run: CPU, or one GPU. Multi-GPU training is not
-  supported in the website.
-- Not every dataset × model × task combination has a config. The website only
-  offers combinations that exist.
-- Tested on Linux only.
+### 19.1 What makes a run reproducible
 
----
+- Every run records its command, configuration, **seed**, **device**, git
+  commit, status, duration and saved metrics in `run.json`, next to the exact
+  configuration BatteryML used (`config_<timestamp>.yaml`).
+- Same configuration + seed + processed data → the same metrics for
+  deterministic models. Neural networks on GPU may differ slightly between
+  runs.
+- To repeat a website run on the command line, copy the command shown on the
+  Run Model **Command & Run** tab (or the command in `run.json`).
+- Report the dataset, task, model, configuration file, seed, device and the
+  git commit (`git rev-parse HEAD`) with your numbers.
 
-## 20. Tested versions and what was verified
+### 19.2 What was verified for this guide
 
-Installed by following this guide from §1 to §7 on a Linux x86_64 machine
-with no GPU, starting from an empty home directory:
-
-| Component | Version |
+| Item | Status |
 | --- | --- |
-| conda | 26.7.1 |
-| Python | 3.10.21 |
-| torch | 2.14.0+cu130 |
-| numpy | 1.26.4 |
-| scipy | 1.15.3 |
-| pandas | 2.3.3 |
-| numba | 0.67.0 |
-| scikit-learn | 1.7.2 |
-| xgboost | 3.2.0 |
-| h5py | 3.16.0 |
-| matplotlib | 3.10.9 |
-| streamlit | 1.64.0 |
+| Installation steps §2–§3 (Miniconda, environment, PyTorch CPU, requirements, health check), on Linux x86_64 without GPU | [VERIFIED] in the V1 install test; tested versions: conda 26.7.1, Python 3.10.21, torch 2.14.0+cu130, numpy 1.26.4, scipy 1.15.3, pandas 2.3.3, numba 0.67.0, scikit-learn 1.7.2, xgboost 3.2.0, h5py 3.16.0, matplotlib 3.10.9, streamlit 1.64.0 |
+| `python -m scripts.verify.run_all` in a fresh clone of the current `main` | [VERIFIED] `10 passed, 1 failed, 2 skipped of 13 check(s)`, exit code `1` (documentation environment: Linux, Python 3.11, no data, no GPU) |
+| `--help` of every command in §17; `run` without data (`AssertionError: data/processed/MATR`), with `--config` (`unrecognized arguments: --config`) and without `--train --eval` (prints the workspace path); `inspect_dataset_readiness` and `preprocess_sweep.py --dry-run` without data | [VERIFIED] in the documentation environment |
+| `download MATR` | [VERIFIED] only the failure path: `data.matr.io` was blocked (`ProxyError … 403 Forbidden`), one `error:` line, nothing written. A successful download was not possible here |
+| Starting the website from a fresh clone with `python -m streamlit run batteryml_web/app.py`; the labels of Home, the three start panels, Quick experience steps 1–4, Prepare Data, Run Model's empty state, Agent Workflow analysis, Review Results' empty state and the LLM settings fields | [VERIFIED] in a browser, without data |
+| Run Model's four tabs, Review Results with a run, figures, run bundles, YAML upload, LLM explanations | [STATIC] read from the current source code (`batteryml_web/`); they need data or an API key to reach |
+| MATR preprocessing gives 180 files | Observed on the project's server, not in the documentation environment |
+| A complete training run, metrics, figures | Not executed in the documentation environment (no data) |
+| GPU, real LLM providers, macOS, Windows/WSL2 | Not verified |
 
-What was actually executed, and what was not:
-
-| Step | Status |
-| --- | --- |
-| §1 `git`/`curl` check, §2 Miniconda (download, install, `conda init`, reopened terminal, Terms of Service), §3 clone, §4 environment, §5 `pip install torch` and the check (CPU), §6 requirements and import check, §7 health check (`10 passed, 1 failed, 2 skipped`) | Executed exactly as written, twice: the second time by copying every command block of this file, unchanged, into a new terminal with an empty home directory. |
-| §8 download command | Executed; the test machine's network policy refused the connection to `data.matr.io` (`403 Forbidden`), so no data was downloaded. With the current download command that failure exits with one `error:` line and leaves the folder empty; an empty file left by the older version is removed and fetched again. A successful download could not be run here. |
-| §9 preprocess, §10 readiness | Executed without data: the error messages for missing raw files (`FileNotFoundError`) and for an empty raw file (`OSError … file signature not found`), and the `INCOMPLETE_PROCESSED` state, were observed (the `OSError` with a 0-byte file from the older download command). The count `180` and `MATR READY` come from a separate server that holds the processed MATR data. |
-| §11 start the website, §12.1 create a project, §12.2 Refresh datasets, page and button names in §12 | Executed in a browser against this installation. |
-| §12.3–12.4 a run and its results in the website, §13 a completed run | Not executed here (no data). §12.3 steps 1–3 (request, **Use template**, **Analyze**, and the no-data message) were executed in the browser; the labels in steps 4–8 were taken from the code. The CLI commands in §13 were checked as far as the data step: they stop with `AssertionError: data/processed/MATR` when that folder does not exist, and with `KeyError: 'b1c1'` when it exists but is empty. A one-epoch MATR CNN run completed on the separate server. That Run Model and **Run MATR Demo** runs are listed in Review Results (§12.5) is covered by unit tests only; no such run could be started here. |
-| §5 GPU case, the `--index-url` command, `nvidia-smi` | Not executed (no GPU on the test machine; `download.pytorch.org` was blocked). |
-| §15 LLM assistant | Fields, buttons and the six provider presets checked in the browser; no connection was made. |
-| §16 coming back, §17 updating, §18 "Starting over" | Executed exactly as written (website started and stopped with `Ctrl+C`; `git pull` fast-forwarded; `conda env remove` left only `base`). |
-| macOS, Windows/WSL2 | Not tested. |
-
----
-
-## Further reading
+### 19.3 Further reading
 
 | Document | Content |
 | --- | --- |
 | [`README_BATTERYML.md`](./README_BATTERYML.md) | The original BatteryML README: paper, datasets, benchmark tables |
-| [`dataprepare.md`](./dataprepare.md) | Manual download instructions for every dataset |
-| [`docs/VERIFY.md`](./docs/VERIFY.md) | What each health-check line tests |
+| [`dataprepare.md`](./dataprepare.md) | Manual download of every dataset |
+| [`docs/VERIFY.md`](./docs/VERIFY.md) | What each health check tests |
+| [`docs/READINESS.md`](./docs/READINESS.md) | Readiness rules |
+| [`docs/AGENT_WORKFLOW.md`](./docs/AGENT_WORKFLOW.md) | Agent Workflow internals |
+| [`docs/SOH_PROTOCOL.md`](./docs/SOH_PROTOCOL.md) | SOH task protocol |
+| [`docs/VISUALIZATION.md`](./docs/VISUALIZATION.md) | Figures and export |
 | [`docs/EXTENDING_MODELS.md`](./docs/EXTENDING_MODELS.md) | Adding your own model |
+| [`README_v1.md`](./README_v1.md) / [`README_v1.zh-CN.md`](./README_v1.zh-CN.md) | Archived V1 installation guides |
 
-## Citation
+### 19.4 Citation
 
 BatteryML-Agent builds on BatteryML. If you use it, please cite:
 
