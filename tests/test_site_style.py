@@ -62,6 +62,30 @@ def _body(css: str, selector: str) -> str:
     return "\n".join(found)
 
 
+def tokens(css: str = SITE) -> Dict[str, str]:
+    """The ``:root`` custom properties, as written."""
+    root = "\n".join(body for sel, body in _rules(css) if sel.strip() == ":root")
+    return {m.group(1): m.group(2).strip() for m in re.finditer(r"(--[\w-]+)\s*:\s*([^;]+);", root)}
+
+
+def resolve(text: str, css: str = SITE) -> str:
+    """``text`` with every ``var(--token)`` replaced by its value, recursively.
+
+    The rules are written against tokens; the assertions below are about the
+    values a browser ends up with, so they compare resolved text. An unknown
+    token is a failure, not a pass-through.
+    """
+    table = tokens(css)
+    for _ in range(10):
+        found = re.search(r"var\((--[\w-]+)\)", text)
+        if not found:
+            return text
+        if found.group(1) not in table:
+            raise AssertionError(f"undefined token {found.group(1)}")
+        text = text.replace(found.group(0), table[found.group(1)])
+    raise AssertionError("token cycle")
+
+
 ROLE = '[data-testid="stMain"] [data-testid="stBaseButton-{}"]'
 
 
@@ -98,18 +122,18 @@ class TestOneLanguageEverywhere(unittest.TestCase):
 
 class TestInteractionHierarchy(unittest.TestCase):
     def test_primary_secondary_and_navigation_look_different(self) -> None:
-        shared = _body(SITE, '[data-testid="stMain"] [data-testid="stButton"] > button')
-        primary = _body(SITE, ROLE.format("primary"))
-        nav = _body(SITE, '[data-testid="stMain"] [data-testid="stButton"] > [data-testid="stBaseButton-tertiary"]')
+        shared = resolve(_body(SITE, '[data-testid="stMain"] [data-testid="stButton"] > button'))
+        primary = resolve(_body(SITE, ROLE.format("primary")))
+        nav = resolve(_body(SITE, '[data-testid="stMain"] [data-testid="stButton"] > [data-testid="stBaseButton-tertiary"]'))
         # Secondary is the shared rule as the mentor wrote it: outlined, no fill.
-        self.assertIn("border-color: rgba(40,123,245,0.24)", shared)
+        self.assertIn("border-color: rgba(40, 123, 245, 0.24)", shared)
         self.assertNotRegex(shared, r"(?m)^\s*background\s*:")
         self.assertEqual(_body(SITE, ROLE.format("secondary")), "", "secondary grew its own fill")
         self.assertIn("linear-gradient", primary)                       # filled
         # Navigation outranks the shared rule (one more attribute selector) and
         # drops its outline for a wash.
         self.assertIn("border-color: transparent", nav)
-        self.assertIn("background: rgba(40,123,245,0.07)", nav)
+        self.assertIn("background: rgba(40, 123, 245, 0.07)", nav)
         self.assertNotIn("gradient", nav)
 
     def test_only_a_control_that_can_act_reacts_to_the_pointer(self) -> None:
@@ -149,15 +173,15 @@ class TestInformationStaysPassive(unittest.TestCase):
         self.assertNotIn("--app-shadow", root)
 
     def test_a_disclosure_is_flatter_than_a_control(self) -> None:
-        expander = _body(SITE, '[data-testid="stMain"] [data-testid="stExpander"] details')
-        button = _body(SITE, '[data-testid="stMain"] [data-testid="stButton"] > button')
+        expander = resolve(_body(SITE, '[data-testid="stMain"] [data-testid="stExpander"] details'))
+        button = resolve(_body(SITE, '[data-testid="stMain"] [data-testid="stButton"] > button'))
         e = int(re.search(r"border-radius:\s*(\d+)px", expander).group(1))
         b = int(re.search(r"border-radius:\s*(\d+)px", button).group(1))
         self.assertLess(e, b)
 
     def test_status_messages_and_metric_values_keep_their_colour(self) -> None:
         self.assertIn("color: inherit", _body(SITE, '[data-testid="stMain"] [data-testid="stAlert"] p'))
-        self.assertIn("color: var(--bml-ink)", _body(SITE, '[data-testid="stMain"] [data-testid="stMetricValue"]'))
+        self.assertIn("color: #14224a", resolve(_body(SITE, '[data-testid="stMain"] [data-testid="stMetricValue"]')))
 
 
 class TestScopedAndStable(unittest.TestCase):
@@ -169,15 +193,32 @@ class TestScopedAndStable(unittest.TestCase):
                     self.assertNotIn(forbidden, css)
 
     def test_the_sidebar_is_left_to_its_own_sheet(self) -> None:
-        self.assertNotIn("stSidebar", SITE)
-        for selector, _ in _rules(SITE):
+        """Main column only — except the LLM settings form's controls.
+
+        The one settings form is rendered in the sidebar Settings block
+        (``st-key-sb_foot``) and in dialogs; its inputs and buttons take the
+        same colours and radii as the main column, and nothing else: no
+        sidebar layout, spacing or navigation rule lives here.
+        """
+        form_scopes = ('[data-testid="stSidebar"] .st-key-sb_foot ', '[role="dialog"] ')
+        spacing = re.compile(r"(?m)^\s*(margin|padding|gap|width|height|min-height|max-width|display|position)"
+                             r"[\w-]*\s*:")
+        for selector, body in _rules(SITE):
             for part in selector.split(","):
                 part = part.strip()
                 if part.startswith((":root", "[data-testid=\"stAppViewContainer\"]",
                                     "[data-testid=\"stMainBlockContainer\"]")):
                     continue
                 with self.subTest(selector=part):
-                    self.assertTrue(part.startswith('[data-testid="stMain"]'), part)
+                    if part.startswith(form_scopes):
+                        self.assertIsNone(spacing.search(body), f"{part} sets layout")
+                        self.assertRegex(part, r"(input|button|\[role=\"group\"\]|select\"\] > div"
+                                               r"|stBaseButton-[a-z]+\"\]( \*)?)")
+                    else:
+                        self.assertTrue(part.startswith('[data-testid="stMain"]'), part)
+        sidebar = [p.strip() for sel, _ in _rules(SITE) for p in sel.split(",") if "stSidebar" in p]
+        self.assertTrue(sidebar)
+        self.assertTrue(all(".st-key-sb_foot" in p for p in sidebar), sidebar)
 
 
 @unittest.skipIf(AppTest is None, "streamlit.testing is not available")

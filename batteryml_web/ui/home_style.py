@@ -23,13 +23,33 @@ Interaction hierarchy, one appearance per role (``surfaces.py`` names them):
 primary            filled cobalt gradient, white label
 secondary          white surface, cobalt hairline and label
 navigation         tinted cobalt wash, no outline
+interrupting       Stop run: red hairline and label on white
 disabled (any)     neutral, dashed outline, muted label, no lift
 information        flat panels (4px, left rule, no hover, no shadow)
+status             a pill with a dot and the word; no fill, no hover
+disclosure         hairline panel, 10px (calmer than a 12px control)
 =================  ===============================================
 
-The sidebar is styled by ``sidebar_style.py`` and is not touched here: every
-rule below is scoped to the main column (``stMain``) or to page-level
-tokens.
+Type scale (one hierarchy for every page; the Home hero keeps its own):
+
+=================  ======================================================
+page title         ``st.header`` (h2) / ``h1``: 2rem, 700
+section            ``st.subheader`` (h3): 1.5rem, 650
+subsection         ``####`` (h4): 1.25rem, 600 — the mentor's own component
+                   heading size
+body / label       1rem / 0.875rem, muted ink; captions 0.875rem
+metric value       1.75rem, ink, tabular digits
+code, run ids      the theme's monospace, wrapped
+family             the theme's (Source Sans), never overridden
+=================  ======================================================
+
+All values are ``--bml-*`` tokens in ``:root`` below, derived from the
+mentor's seven palette values; the rules use the tokens.
+
+Scope: the main column (``stMain``), plus — for form controls only — the
+sidebar Settings block (``st-key-sb_foot``) and dialogs, so the one LLM
+settings form looks the same wherever it is opened. The sidebar's layout,
+spacing and navigation stay with ``sidebar_style.py``/``styles.py``.
 """
 
 from __future__ import annotations
@@ -43,6 +63,8 @@ SITE_STYLE_CSS = """
 <style>
 /* bml-site-style: the mentor's visual language, shared by every page. */
 :root {
+    /* The mentor's palette (codex/ui-optimization, f058d51): the source of
+       every token below. */
     --bml-ink: #14224a;
     --bml-muted: #66728b;
     --bml-blue: #287bf5;
@@ -50,23 +72,80 @@ SITE_STYLE_CSS = """
     --bml-mint: #31c79b;
     --bml-line: rgba(53, 83, 135, 0.13);
     --bml-soft: rgba(238, 246, 255, 0.76);
+
+    /* Colour roles. A page uses these names and never invents its own
+       blue or grey. */
+    --bml-primary: var(--bml-blue);
+    --bml-primary-hover: var(--bml-blue-deep);
+    --bml-primary-muted: rgba(40, 123, 245, 0.07);
+    --bml-background: #fbfdff;
+    --bml-surface: rgba(255, 255, 255, 0.78);
+    --bml-surface-secondary: var(--bml-soft);
+    --bml-surface-selected: rgba(40, 123, 245, 0.13);
+    --bml-border: rgba(40, 123, 245, 0.24);
+    --bml-border-subtle: var(--bml-line);
+    --bml-text-primary: var(--bml-ink);
+    --bml-text-secondary: var(--bml-muted);
+    --bml-text-muted: #7a8599;
+    --bml-focus-ring: var(--bml-blue-deep);
+    --bml-success: #137a62;
+    --bml-warning: #8a5300;
+    --bml-error: #b42318;
+
+    /* Type. The family is the theme's (Streamlit's Source Sans) on every
+       page and no rule here overrides it; code and run ids use the theme's
+       monospace. */
+    --bml-font-mono: "Source Code Pro", monospace;
+    --bml-fs-page-title: 2rem;
+    --bml-fs-section-title: 1.5rem;
+    --bml-fs-subsection-title: 1.25rem;
+    --bml-fs-body: 1rem;
+    --bml-fs-label: 0.875rem;
+    --bml-fs-caption: 0.875rem;
+    --bml-fs-metric: 1.75rem;
+    --bml-fw-page-title: 700;
+    --bml-fw-section-title: 650;
+    --bml-fw-subsection-title: 600;
+
+    /* Geometry. Spacing stays the mentor's (Streamlit's 1rem block gap, the
+       clamp() side padding below); these are the only new measures. */
+    --bml-page-max-width: 1480px;
+    --bml-card-radius: 16px;
+    --bml-button-radius: 12px;
+    --bml-input-radius: 12px;
+    --bml-disclosure-radius: 10px;
+    --bml-control-height: 2.75rem;
+    --bml-section-gap: 1.5rem;
+    --bml-component-gap: 1rem;
+    --bml-card-padding: 0.75rem 0.9rem;
+
+    /* Interaction states. */
+    --bml-state-hover: rgba(40, 123, 245, 0.06);
+    --bml-state-hover-border: rgba(40, 123, 245, 0.42);
+    --bml-state-selected: var(--bml-surface-selected);
+    --bml-state-disabled-bg: rgba(20, 34, 74, 0.035);
+    --bml-state-disabled-border: rgba(102, 114, 139, 0.38);
+    --bml-state-loading: var(--bml-primary-hover);   /* 6.2:1 on white; the lighter blue is 4.0:1 */
+    --bml-state-completed: var(--bml-success);
+    --bml-state-failed: var(--bml-error);
+
     /* The app's read-out tokens (app.py: dataset, pipeline and assistant
        tiles) take the same palette; their flat, passive shape is unchanged. */
     --app-border: rgba(53, 83, 135, 0.24);
-    --app-border-soft: rgba(53, 83, 135, 0.13);
-    --app-muted: #66728b;
-    --app-card-bg: rgba(255, 255, 255, 0.78);
-    --app-card-bg-strong: rgba(238, 246, 255, 0.76);
+    --app-border-soft: var(--bml-border-subtle);
+    --app-muted: var(--bml-text-secondary);
+    --app-card-bg: var(--bml-surface);
+    --app-card-bg-strong: var(--bml-surface-secondary);
 }
 
 [data-testid="stAppViewContainer"] {
     background:
         radial-gradient(circle at 92% 4%, rgba(170, 222, 255, 0.24), transparent 25rem),
-        linear-gradient(180deg, #ffffff 0%, #fbfdff 58%, #f4f8ff 100%);
+        linear-gradient(180deg, #ffffff 0%, var(--bml-background) 58%, #f4f8ff 100%);
 }
 
 [data-testid="stMainBlockContainer"] {
-    max-width: 1480px;
+    max-width: var(--bml-page-max-width);
     padding-left: clamp(1.2rem, 4vw, 4.5rem);
     padding-right: clamp(1.2rem, 4vw, 4.5rem);
 }
@@ -77,14 +156,46 @@ SITE_STYLE_CSS = """
 [data-testid="stMain"] h2,
 [data-testid="stMain"] h3,
 [data-testid="stMain"] h4 {
-    color: var(--bml-ink);
+    color: var(--bml-text-primary);
     letter-spacing: -0.035em;
+}
+
+/* One hierarchy for every page. Measured before: page titles at 36px/600
+   beside 28px sections and 24px subsections, so Review Results stacked
+   three oversized headings. Home's own components (hero, start cards, step
+   overview) keep the mentor's sizes: their rules are more specific or come
+   later. */
+[data-testid="stMain"] h1:not(.bml-home-title),
+[data-testid="stMain"] h2 {
+    font-size: var(--bml-fs-page-title);
+    font-weight: var(--bml-fw-page-title);
+    line-height: 1.2;
+    letter-spacing: -0.04em;
+}
+
+[data-testid="stMain"] h3 {
+    font-size: var(--bml-fs-section-title);
+    font-weight: var(--bml-fw-section-title);
+    line-height: 1.3;
+}
+
+[data-testid="stMain"] h4 {
+    font-size: var(--bml-fs-subsection-title);
+    font-weight: var(--bml-fw-subsection-title);
+    line-height: 1.35;
 }
 
 [data-testid="stMain"] p,
 [data-testid="stMain"] label,
 [data-testid="stMain"] [data-testid="stCaptionContainer"] {
-    color: var(--bml-muted);
+    color: var(--bml-text-secondary);
+}
+
+/* Code, paths and run ids: one monospace token, wrapped rather than
+   pushing the page wider than the window. */
+[data-testid="stMain"] code {
+    font-family: var(--bml-font-mono);
+    overflow-wrap: anywhere;
 }
 
 /* A status message keeps its own colour: READY, RAW_ONLY, FAILED must not
@@ -93,10 +204,13 @@ SITE_STYLE_CSS = """
     color: inherit;
 }
 
-/* A metric value is a result, not body copy: it stays in ink. */
+/* A metric value is a result, not body copy: it stays in ink, one size on
+   every page, with digits that line up. */
 [data-testid="stMain"] [data-testid="stMetricValue"],
 [data-testid="stMain"] [data-testid="stMetricValue"] * {
-    color: var(--bml-ink);
+    color: var(--bml-text-primary);
+    font-size: var(--bml-fs-metric);
+    font-variant-numeric: tabular-nums;
 }
 
 /* --------------------------------------------------------------- actions */
@@ -104,10 +218,10 @@ SITE_STYLE_CSS = """
 [data-testid="stMain"] [data-testid="stButton"] > button,
 [data-testid="stMain"] [data-testid="stDownloadButton"] > button,
 [data-testid="stMain"] [data-testid="stFormSubmitButton"] > button {
-    min-height: 2.75rem;
-    border-radius: 12px;
-    border-color: rgba(40,123,245,0.24);
-    color: var(--bml-blue-deep);
+    min-height: var(--bml-control-height);
+    border-radius: var(--bml-button-radius);
+    border-color: var(--bml-border);
+    color: var(--bml-primary-hover);
     font-weight: 700;
     transition: transform 140ms ease, box-shadow 140ms ease, background 140ms ease;
 }
@@ -116,8 +230,8 @@ SITE_STYLE_CSS = """
 [data-testid="stMain"] [data-testid="stButton"] > button:hover:enabled,
 [data-testid="stMain"] [data-testid="stDownloadButton"] > button:hover:enabled,
 [data-testid="stMain"] [data-testid="stFormSubmitButton"] > button:hover:enabled {
-    border-color: rgba(40,123,245,0.42);
-    background: rgba(40,123,245,0.06);
+    border-color: var(--bml-state-hover-border);
+    background: var(--bml-state-hover);
     box-shadow: 0 7px 18px rgba(40,123,245,0.12);
     transform: translateY(-1px);
 }
@@ -125,8 +239,8 @@ SITE_STYLE_CSS = """
 /* PRIMARY: the one filled control in a section. */
 [data-testid="stMain"] [data-testid="stBaseButton-primary"],
 [data-testid="stMain"] [data-testid="stBaseButton-primaryFormSubmit"] {
-    border-color: var(--bml-blue);
-    background: linear-gradient(135deg, var(--bml-blue), var(--bml-blue-deep));
+    border-color: var(--bml-primary);
+    background: linear-gradient(135deg, var(--bml-primary), var(--bml-primary-hover));
     color: #ffffff !important;
     box-shadow: 0 8px 18px rgba(40,123,245,0.22);
 }
@@ -144,26 +258,27 @@ SITE_STYLE_CSS = """
 [data-testid="stMain"] [data-testid="stBaseButton-primary"]:active:enabled,
 [data-testid="stMain"] [data-testid="stBaseButton-primary"]:focus-visible,
 [data-testid="stMain"] [data-testid="stBaseButton-primaryFormSubmit"]:hover:enabled {
-    border-color: var(--bml-blue-deep);
-    background: linear-gradient(135deg, #3a8aff, var(--bml-blue-deep));
+    border-color: var(--bml-primary-hover);
+    background: linear-gradient(135deg, #3a8aff, var(--bml-primary-hover));
     color: #ffffff !important;
 }
 
-/* SECONDARY (Download, Refresh, Explain) is the shared rule above, as the
-   mentor wrote it: an outlined surface with a cobalt hairline and label. */
+/* SECONDARY (Download, Refresh, Summarize, Explain) is the shared rule
+   above, as the mentor wrote it: an outlined surface with a cobalt hairline
+   and label. */
 
 /* NAVIGATION: goes to another page. A tinted wash with no outline — quieter
    than secondary, still visibly pressable. One step more specific than the
    shared rule above, which would otherwise outline it like a secondary. */
 [data-testid="stMain"] [data-testid="stButton"] > [data-testid="stBaseButton-tertiary"] {
     border-color: transparent;
-    background: rgba(40,123,245,0.07);
+    background: var(--bml-primary-muted);
     font-weight: 650;
 }
 
 [data-testid="stMain"] [data-testid="stButton"] > [data-testid="stBaseButton-tertiary"]:hover:enabled {
     border-color: transparent;
-    background: rgba(40,123,245,0.13);
+    background: var(--bml-state-selected);
     box-shadow: none;
     transform: none;
 }
@@ -171,7 +286,7 @@ SITE_STYLE_CSS = """
 [data-testid="stMain"] [data-testid="stButton"] > button:focus-visible,
 [data-testid="stMain"] [data-testid="stDownloadButton"] > button:focus-visible,
 [data-testid="stMain"] [data-testid="stFormSubmitButton"] > button:focus-visible {
-    outline: 2px solid var(--bml-blue-deep);
+    outline: 2px solid var(--bml-focus-ring);
     outline-offset: 2px;
 }
 
@@ -183,10 +298,10 @@ SITE_STYLE_CSS = """
 [data-testid="stMain"] [data-testid="stDownloadButton"] > button:disabled,
 [data-testid="stMain"] [data-testid="stFormSubmitButton"] > button:disabled {
     border-style: dashed !important;
-    border-color: rgba(102,114,139,0.38) !important;
-    background: rgba(20,34,74,0.035) !important;
-    color: #7a8599 !important;
-    -webkit-text-fill-color: #7a8599;
+    border-color: var(--bml-state-disabled-border) !important;
+    background: var(--bml-state-disabled-bg) !important;
+    color: var(--bml-text-muted) !important;
+    -webkit-text-fill-color: var(--bml-text-muted);
     box-shadow: none !important;
     transform: none !important;
     cursor: not-allowed;
@@ -198,8 +313,28 @@ SITE_STYLE_CSS = """
 [data-testid="stMain"] [data-testid="stDownloadButton"] > button:disabled *,
 [data-testid="stMain"] [data-testid="stFormSubmitButton"] > button:disabled * {
     background: transparent !important;
-    color: #7a8599 !important;
-    -webkit-text-fill-color: #7a8599;
+    color: var(--bml-text-muted) !important;
+    -webkit-text-fill-color: var(--bml-text-muted);
+}
+
+/* INTERRUPTING (Stop run): clearly not a forward action, without alarm —
+   a red hairline and label on white, tinted only under the pointer. */
+[data-testid="stMain"] [class*="st-key-agent_cancel_"] [data-testid="stButton"] > button {
+    border-color: rgba(180, 35, 24, 0.38);
+    background: #ffffff;
+    color: var(--bml-error);
+}
+
+[data-testid="stMain"] [class*="st-key-agent_cancel_"] [data-testid="stButton"] > button:hover:enabled {
+    border-color: var(--bml-error);
+    background: rgba(180, 35, 24, 0.06);
+    box-shadow: none;
+}
+
+[data-testid="stMain"] [class*="st-key-agent_cancel_"] [data-testid="stButton"] > button *,
+[data-testid="stMain"] [class*="st-key-agent_cancel_"] [data-testid="stButton"] > button:hover:enabled * {
+    color: var(--bml-error) !important;
+    -webkit-text-fill-color: var(--bml-error);
 }
 
 /* ---------------------------------------------------------- selection */
@@ -212,40 +347,134 @@ SITE_STYLE_CSS = """
 /* Streamlit 1.5x+ draws a selectbox as a react-aria combobox group, which the
    BaseWeb selector above (the mentor's, for older builds) no longer reaches. */
 [data-testid="stMain"] [data-testid="stSelectbox"] [role="group"] {
-    border-color: var(--bml-line);
-    border-radius: 12px;
+    border-color: var(--bml-border-subtle);
+    border-radius: var(--bml-input-radius);
     background: rgba(255,255,255,0.76);
+}
+
+/* THE LLM SETTINGS FORM, wherever it is opened (sidebar Settings, dialog):
+   the same controls as the main column. Colours, borders and radii only —
+   the sidebar's spacing belongs to ui/styles.py. */
+[data-testid="stSidebar"] .st-key-sb_foot [data-testid="stTextInput"] input,
+[data-testid="stSidebar"] .st-key-sb_foot [data-testid="stSelectbox"] [role="group"],
+[data-testid="stSidebar"] .st-key-sb_foot [data-testid="stSelectbox"] [data-baseweb="select"] > div,
+[role="dialog"] [data-testid="stTextInput"] input,
+[role="dialog"] [data-testid="stSelectbox"] [role="group"],
+[role="dialog"] [data-testid="stSelectbox"] [data-baseweb="select"] > div {
+    border-color: var(--bml-border-subtle);
+    border-radius: var(--bml-input-radius);
+    background: #ffffff;
+}
+
+[data-testid="stSidebar"] .st-key-sb_foot [data-testid="stBaseButton-primary"],
+[role="dialog"] [data-testid="stBaseButton-primary"] {
+    border-color: var(--bml-primary);
+    border-radius: var(--bml-button-radius);
+    background: linear-gradient(135deg, var(--bml-primary), var(--bml-primary-hover));
+    color: #ffffff;
+}
+
+[data-testid="stSidebar"] .st-key-sb_foot [data-testid="stBaseButton-primary"] *,
+[role="dialog"] [data-testid="stBaseButton-primary"] * {
+    color: #ffffff !important;
+    -webkit-text-fill-color: #ffffff;
+}
+
+[data-testid="stSidebar"] .st-key-sb_foot [data-testid="stBaseButton-secondary"],
+[role="dialog"] [data-testid="stBaseButton-secondary"] {
+    border-color: var(--bml-border);
+    border-radius: var(--bml-button-radius);
+    background: #ffffff;
+    color: var(--bml-primary-hover);
+}
+
+[data-testid="stSidebar"] .st-key-sb_foot [data-testid="stBaseButton-primary"]:disabled,
+[data-testid="stSidebar"] .st-key-sb_foot [data-testid="stBaseButton-secondary"]:disabled,
+[role="dialog"] [data-testid="stBaseButton-primary"]:disabled,
+[role="dialog"] [data-testid="stBaseButton-secondary"]:disabled {
+    border-style: dashed;
+    border-color: var(--bml-state-disabled-border);
+    background: var(--bml-state-disabled-bg);
+    color: var(--bml-text-muted);
+}
+
+[data-testid="stSidebar"] .st-key-sb_foot [data-testid="stBaseButton-primary"]:disabled *,
+[data-testid="stSidebar"] .st-key-sb_foot [data-testid="stBaseButton-secondary"]:disabled *,
+[role="dialog"] [data-testid="stBaseButton-primary"]:disabled *,
+[role="dialog"] [data-testid="stBaseButton-secondary"]:disabled * {
+    color: var(--bml-text-muted) !important;
+    -webkit-text-fill-color: var(--bml-text-muted);
+}
+
+[data-testid="stSidebar"] .st-key-sb_foot [data-testid="stBaseButton-primary"]:focus-visible,
+[data-testid="stSidebar"] .st-key-sb_foot [data-testid="stBaseButton-secondary"]:focus-visible,
+[role="dialog"] [data-testid="stBaseButton-primary"]:focus-visible,
+[role="dialog"] [data-testid="stBaseButton-secondary"]:focus-visible {
+    outline: 2px solid var(--bml-focus-ring);
+    outline-offset: 2px;
 }
 
 /* -------------------------------------------- information and disclosure */
 
 [data-testid="stMain"] [data-testid="stDataFrame"] {
-    border-color: var(--bml-line);
-    border-radius: 16px;
+    border-color: var(--bml-border-subtle);
+    border-radius: var(--bml-card-radius);
     background: rgba(255,255,255,0.72);
 }
 
 /* A disclosure is calmer than a control: a hairline panel with a smaller
    radius than a button (10px against 12px) and no lift. */
 [data-testid="stMain"] [data-testid="stExpander"] details {
-    border-color: var(--bml-line);
-    border-radius: 10px;
+    border-color: var(--bml-border-subtle);
+    border-radius: var(--bml-disclosure-radius);
     background: rgba(255,255,255,0.72);
 }
 
 [data-testid="stMain"] [data-testid="stExpander"] summary {
-    color: var(--bml-ink);
+    color: var(--bml-text-primary);
     font-weight: 600;
 }
 
 /* Information cards keep their flat read-out shape (surfaces.py: 4px, left
    rule, no hover); only the palette follows the mentor's. */
 [data-testid="stMain"] .bml-info-card {
-    border-color: var(--bml-line);
+    border-color: var(--bml-border-subtle);
     border-left-color: rgba(40,123,245,0.32);
-    background: rgba(255,255,255,0.78);
-    color: var(--bml-ink);
+    background: var(--bml-surface);
+    color: var(--bml-text-primary);
 }
+
+/* STATUS (a run's COMPLETED / FAILED / CANCELLED / RUNNING): a word with a
+   dot, read, never pressed. A pill rather than the 12px box of a control,
+   no fill to press, no hover, the default cursor. The word carries the
+   state, so it reads without colour. */
+[data-testid="stMain"] .bml-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.1rem 0.6rem;
+    border: 1px solid currentColor;
+    border-radius: 999px;
+    font-size: var(--bml-fs-caption);
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--bml-text-secondary);
+    cursor: default;
+    user-select: text;
+}
+
+[data-testid="stMain"] .bml-status::before {
+    content: "";
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background: currentColor;
+}
+
+[data-testid="stMain"] .bml-status--completed { color: var(--bml-state-completed); }
+[data-testid="stMain"] .bml-status--failed { color: var(--bml-state-failed); }
+[data-testid="stMain"] .bml-status--cancelled { color: var(--bml-warning); }
+[data-testid="stMain"] .bml-status--running { color: var(--bml-state-loading); }
 </style>
 """
 
