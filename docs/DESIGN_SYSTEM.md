@@ -1,7 +1,7 @@
 # Design system
 
 One visual language for every page of the web app: the mentor's Home
-(`codex/ui-optimization`). Spec IDs `UI-10`, `UI-11`, `UI-12`, `UI-13`.
+(`codex/ui-optimization`). Spec IDs `UI-10`, `UI-11`, `UI-12`, `UI-13`, `UI-14`.
 
 Where it lives:
 
@@ -43,9 +43,9 @@ Home's hero title and its component headings keep the mentor's sizes.
 
 | Role | How to ask for it | Looks like |
 | --- | --- | --- |
-| Primary (Run, Preprocess, Analyze) | `type=PRIMARY_ROLE` | filled cobalt gradient |
-| Secondary (Download, Refresh, Summarize, Explain) | default / `type=SECONDARY_ROLE` | white, cobalt hairline |
-| Navigation (pages, Prev/Next) | `type=NAV_ROLE` | cobalt wash, no outline |
+| Primary (Run, Preprocess, Analyze, Connect) | `type=PRIMARY_ROLE` | filled cobalt gradient |
+| Secondary (Download, Refresh, Save, Summarize, Explain) | default / `type=SECONDARY_ROLE` | white, cobalt hairline |
+| Navigation (pages, Prev/Next, Configure LLM, Close) | `type=NAV_ROLE` | cobalt wash, no outline |
 | Interrupting (Stop run) | key `agent_cancel_<run_id>` | red hairline on white |
 | Disabled (any) | `disabled=True`, reason beneath | dashed, neutral, `not-allowed` |
 | Information | `surfaces.render_info_card` | flat 4px panel, no hover |
@@ -63,6 +63,18 @@ selector's labels are shortened: the selector's value, the session state and
 every section use the full run id, which the run's details show in a
 copyable code block next to the start time as recorded
 (`batteryml_web/ui/run_history.py`).
+
+## LLM settings from Results
+
+One store (`llm_state.py`), one form (`settings_panel.render_llm_settings_form`),
+shown in the sidebar Settings block and — when a page asks — in a small
+dismissible **LLM settings** dialog with the same fields and buttons. Review
+Results shows the live status line, never an old error in its place.
+**Configure LLM** opens the dialog; **Summarize results** and **Explain
+metrics** call the provider only when the status is *Connected* and
+otherwise open the dialog without sending anything. After a completed run,
+"Open Review Results" / "Review Results →" opens the dialog once per
+session when nothing is configured. Details: `docs/SPEC.md` `UI-14`.
 
 ## Checking it in a browser
 

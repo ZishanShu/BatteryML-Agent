@@ -417,6 +417,10 @@ class FakeStreamlit:
     def spinner(self, label, **kwargs):
         return _Ctx()
 
+    def container(self, **kwargs):
+        """st.container: a plain block. Settings drawn in place (no st.dialog) use it."""
+        return _Ctx()
+
     def status(self, label, **kwargs):
         """st.status: the indeterminate counterpart of st.progress.
 

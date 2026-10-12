@@ -59,6 +59,7 @@ from batteryml_web.ui.feedback import (
     toast,
 )
 from batteryml_web.ui.llm_state import (
+    connection_serial,
     describe_llm_status,
     ensure_llm_state_defaults,
     get_llm_status,
@@ -94,7 +95,16 @@ from batteryml_web.ui.run_history import (
     status_badge,
     render_run_location,
 )
-from batteryml_web.ui.settings_panel import render_configure_in_settings_notice
+from batteryml_web.ui.settings_panel import (
+    REVEAL_ACTION,
+    REVEAL_CONFIGURE,
+    consume_results_intent,
+    llm_action_allowed,
+    mark_results_intent,
+    render_configure_in_settings_notice,
+    render_requested_llm_settings,
+    request_llm_settings,
+)
 from batteryml_web.ui.home_style import render_home_style, render_site_style
 from batteryml_web.ui.progress_utils import (
     get_safe_runtime_env,
@@ -1503,6 +1513,10 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
     else:
         st.caption("After a run finishes, its metrics, predictions, and logs will appear here.")
     if st.button("Open Review Results", type=NAV_ROLE, use_container_width=True, key="home_quick_open_review"):
+        if last_status == "success":
+            # Viewing the results of the run that just completed: the one
+            # arrival that may offer LLM Settings, once (UI-14).
+            mark_results_intent()
         set_current_step("review_results")
 
 
@@ -2336,6 +2350,16 @@ def render_run_model_llm_output_panel(output_key: str, title: str, subtitle: str
 #: Suffixed onto the output's own key so two panels cannot share one label.
 SETTINGS_PROVENANCE_SUFFIX = "_llm_settings"
 
+#: Whether a stored output is an answer ("ok") or a failed request's message
+#: ("error"), and the connection serial it was produced under. Together they
+#: keep a past failure from being read as the live connection state: an error
+#: that a later successful connection superseded is not shown at all.
+LLM_OUTCOME_SUFFIX = "_outcome"
+LLM_SERIAL_SUFFIX = "_serial"
+
+#: Set when a Run Model run completes; drives the "Review Results →" button.
+RUN_MODEL_COMPLETED_KEY = "run_model_completed_run"
+
 
 def render_llm_output_panel(output_key: str, title: str) -> None:
     """Show a stored assistant output. Collapsed; sends nothing.
@@ -2348,6 +2372,19 @@ def render_llm_output_panel(output_key: str, title: str) -> None:
     """
     output = st.session_state.get(output_key)
     if not output:
+        return
+    if st.session_state.get(f"{output_key}{LLM_OUTCOME_SUFFIX}") == "error":
+        recorded = int(st.session_state.get(f"{output_key}{LLM_SERIAL_SUFFIX}") or 0)
+        if connection_serial() > recorded:
+            # A connection has worked since this request failed; the old
+            # error would now misstate the live state, which the status
+            # line above already gives.
+            return
+        st.warning(f"The last request for this result failed. {output}")
+        st.caption(
+            "That is the outcome of an earlier request, not a live connection check. "
+            f"LLM assistant status now: {describe_llm_status()}."
+        )
         return
     st.markdown("---")
     with st.expander(f"🤖 LLM Assistant Output · {title}", expanded=False):
@@ -2675,8 +2712,18 @@ def render_run_model_page():
                         event_key=EVENT_RUN_COMPLETED,
                         signature=["run_model", str(workspace_dir), result["return_code"]],
                     )
-                    if st.button("Review Results →", type=NAV_ROLE, use_container_width=True, key="run_go_results_after_run"):
-                        set_current_step("review_results")
+                    st.session_state[RUN_MODEL_COMPLETED_KEY] = workspace_dir.name
+                else:
+                    st.session_state.pop(RUN_MODEL_COMPLETED_KEY, None)
+        # Outside the Run branch. Drawn inside it, this button vanished on the
+        # rerun its own click caused, so the click never navigated.
+        if (
+            st.session_state.get(RUN_MODEL_COMPLETED_KEY)
+            and st.session_state.get("last_run_status") == "success"
+        ):
+            if st.button("Review Results →", type=NAV_ROLE, use_container_width=True, key="run_go_results_after_run"):
+                mark_results_intent()
+                set_current_step("review_results")
         render_run_model_llm_output_panel("run_model_command_llm_output", "Command guidance", "Command guidance", "Command assistant")
         st.markdown("#### Output workspace")
         st.code(str(workspace_dir), language="text")
@@ -2805,8 +2852,27 @@ def _invalidate_stale_result_state(selected: SelectedResult) -> None:
         "review_llm_output",
         EXPLANATION_IDENTITY_KEY,
         f"review_llm_output{SETTINGS_PROVENANCE_SUFFIX}",
+        f"review_llm_output{LLM_OUTCOME_SUFFIX}",
+        f"review_llm_output{LLM_SERIAL_SUFFIX}",
     ):
         st.session_state.pop(key, None)
+
+
+def _record_review_output(response: str, *, ok: bool, selected: SelectedResult) -> None:
+    """Store a Summarize/Explain outcome with everything that identifies it.
+
+    The result it was produced for (a slow reply for run A that lands after
+    the user moved to run B fails the identity check and is dropped rather
+    than shown under B), the configuration that produced it (never the key),
+    whether it is an answer or a failure, and the connection serial at the
+    time — so a failure is never shown as the live state after a later
+    successful connection.
+    """
+    st.session_state["review_llm_output"] = response
+    st.session_state[EXPLANATION_IDENTITY_KEY] = selected.identity_key()
+    st.session_state[f"review_llm_output{SETTINGS_PROVENANCE_SUFFIX}"] = llm_settings_fingerprint()
+    st.session_state[f"review_llm_output{LLM_OUTCOME_SUFFIX}"] = "ok" if ok else "error"
+    st.session_state[f"review_llm_output{LLM_SERIAL_SUFFIX}"] = connection_serial()
 
 
 def _selected_metrics_frame(selected: SelectedResult):
@@ -2993,21 +3059,32 @@ def render_review_results_page():
     st.caption(
         "Use the LLM assistant to summarize results or explain metrics. BatteryML metrics are computed by BatteryML and will not be modified."
     )
+    # The live connection state, read from the one store. Kept apart from
+    # any stored output below, which describes an earlier request. Filled
+    # in after the buttons are handled, so a request made on this run is
+    # already reflected in it.
+    status_slot = st.empty()
+    # Arriving from a run that just completed, with nothing configured,
+    # offers Settings once per session (UI-14); never on an ordinary rerun.
+    consume_results_intent()
+
     btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
     with btn_col1:
-        summarize_clicked = st.button("Summarize results", key="review_summarize_results", use_container_width=True)
+        summarize_clicked = st.button("Summarize results", key="review_summarize_results", type=SECONDARY_ROLE, use_container_width=True)
     with btn_col2:
-        explain_clicked = st.button("Explain metrics", key="review_explain_metrics", use_container_width=True)
+        explain_clicked = st.button("Explain metrics", key="review_explain_metrics", type=SECONDARY_ROLE, use_container_width=True)
     with btn_col3:
-        configure_clicked = st.button("Configure LLM", key="review_configure_llm", use_container_width=True)
+        configure_clicked = st.button("Configure LLM", key="review_configure_llm", type=NAV_ROLE, use_container_width=True)
 
     if configure_clicked:
-        st.session_state["review_show_llm_settings"] = True
+        request_llm_settings(REVEAL_CONFIGURE)
 
+    # One click, at most one request: a button is True only on the run its
+    # click caused, and nothing below is re-sent on an ordinary rerun.
     if summarize_clicked:
-        if not is_llm_configured():
-            set_llm_not_configured_message("review_llm_output")
-            st.session_state["review_show_llm_settings"] = True
+        if not llm_action_allowed():
+            # Not connected: open Settings and send nothing.
+            request_llm_settings(REVEAL_ACTION)
         else:
             # Built from the selected result's own identity and manifest.
             # It used to be built from the project-wide metrics table and
@@ -3035,23 +3112,17 @@ Logs available: {'Yes' if run_files.get("log_files") else 'No'}
                     **llm_credentials(),
                     system_prompt="You are an assistant for a BatteryML web protocol platform. Provide suggestions only. Do not modify raw data, metrics, predictions, or config files.",
                 )
+                ok = True
                 set_llm_connection_result(True, "LLM request completed.")
             except Exception as exc:
                 response = describe_llm_exception(exc)
+                ok = False
                 set_llm_connection_result(False, response)
-            # Stored with the identity it was computed for. A slow reply for
-            # run A that lands after the user moved to run B fails the
-            # identity check and is dropped rather than shown under B.
-            st.session_state["review_llm_output"] = response
-            st.session_state[EXPLANATION_IDENTITY_KEY] = selected.identity_key()
-            st.session_state[
-                f"review_llm_output{SETTINGS_PROVENANCE_SUFFIX}"
-            ] = llm_settings_fingerprint()
+            _record_review_output(response, ok=ok, selected=selected)
 
     if explain_clicked:
-        if not is_llm_configured():
-            set_llm_not_configured_message("review_llm_output")
-            st.session_state["review_show_llm_settings"] = True
+        if not llm_action_allowed():
+            request_llm_settings(REVEAL_ACTION)
         else:
             # The analysis path: deterministic facts first, then the prompt
             # that asks for interpretation. It replaces an f-string that
@@ -3065,24 +3136,20 @@ Logs available: {'Yes' if run_files.get("log_files") else 'No'}
                     **llm_credentials(),
                 )
                 response = render_analysis_markdown(parsed)
+                ok = True
                 set_llm_connection_result(True, "LLM request completed.")
             except Exception as exc:
                 response = describe_llm_exception(exc)
+                ok = False
                 set_llm_connection_result(False, response)
-            # Stored with the identity it was computed for. A slow reply for
-            # run A that lands after the user moved to run B fails the
-            # identity check and is dropped rather than shown under B.
-            st.session_state["review_llm_output"] = response
-            st.session_state[EXPLANATION_IDENTITY_KEY] = selected.identity_key()
-            st.session_state[
-                f"review_llm_output{SETTINGS_PROVENANCE_SUFFIX}"
-            ] = llm_settings_fingerprint()
+            _record_review_output(response, ok=ok, selected=selected)
 
-    if st.session_state.get("review_show_llm_settings") or not is_llm_configured():
-        # A sentence, not a form. Pressing "Configure LLM" here used to open
-        # the full provider/URL/key/model block on this page, which is the
-        # "it asked me again" the user reported.
+    status_slot.caption(f"LLM assistant status: {describe_llm_status()}")
+    if not is_llm_configured():
+        # A sentence, not a form, on the page itself; the form opens only in
+        # the Settings dialog below, from the one shared settings body.
         render_llm_availability_notice()
+    render_requested_llm_settings()
 
     # Shown only when it was produced for the result now on screen. Anything
     # else — a previous selection's answer, or a slow reply for a run the

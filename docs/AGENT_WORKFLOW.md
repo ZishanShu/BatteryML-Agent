@@ -55,7 +55,7 @@ them holding:
 | `batteryml_web/agent/provenance.py` | the run's own account of itself, read from the plan's argv | invent a field the plan does not carry |
 | `batteryml_web/agent/progress_estimate.py` | an ETA, once the run has earned one | assume a rate, or guess before two intervals are timed |
 | `batteryml_web/ui/formatting.py` | metrics at reading scale | change the stored value |
-| `batteryml_web/ui/settings_panel.py` | the LLM settings form, in the sidebar and wherever it is needed | display, log or persist the API key |
+| `batteryml_web/ui/settings_panel.py` | the LLM settings form, in the sidebar and in the Settings dialog a page opens (Configure LLM, Summarize/Explain without a connection, once after viewing a completed run's results with nothing configured — `UI-14`) | display, log or persist the API key |
 | `batteryml_web/ui/agent_workflow.py` | rendering all of the above | any of the above |
 
 ## Two entry points
