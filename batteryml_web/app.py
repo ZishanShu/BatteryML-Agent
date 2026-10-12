@@ -87,8 +87,11 @@ from batteryml_web.core.selected_result import (
 from batteryml_web.ui.run_history import (
     render_file_browser,
     render_predictions_panel,
+    experiment_summary,
     render_run_detail,
     render_run_history,
+    short_run_id,
+    status_badge,
     render_run_location,
 )
 from batteryml_web.ui.settings_panel import render_configure_in_settings_notice
@@ -2869,11 +2872,12 @@ def render_benchmark_panel(analysis: dict[str, Any]) -> None:
     """
     block = analysis.get("benchmark") or {}
     record = block.get("record")
+    st.markdown("#### Benchmark reference")
     if record is None:
         st.caption(f"Published BatteryML reference: none. {block.get('explanation', '')}")
         return
 
-    st.markdown("**Published BatteryML reference**")
+    st.caption("Published BatteryML reference")
     left, right = st.columns(2)
     with left:
         st.write(f"Model: {record['model_key']}")
@@ -2925,7 +2929,10 @@ def _render_project_run_history() -> None:
     if manifest is None:
         st.caption(f"Run {selected} is no longer on disk.")
         return
-    with st.expander(f"Run {selected}", expanded=True):
+    # A readable label; the full run id is the first thing inside.
+    with st.expander(
+        f"Run details · {short_run_id(selected)} · {experiment_summary(manifest)}", expanded=True
+    ):
         # Opening a historical run shows it. It never re-runs it.
         render_run_detail(manifest)
 
@@ -2949,11 +2956,6 @@ def render_review_results_page():
     # run manifests, so it survives a refresh and an app restart.
     _render_project_run_history()
 
-    st.markdown("#### Optional LLM interpretation")
-    st.caption(
-        "Use the LLM assistant to summarize results or explain metrics. BatteryML metrics are computed by BatteryML and will not be modified."
-    )
-
     project_dir = _project_root() or Path("runs/native_matr_xgb_test")
 
     # Everything below describes exactly this result, or says it cannot.
@@ -2974,7 +2976,9 @@ def render_review_results_page():
     )
 
     # Keep the main result navigation close to the page heading. Optional
-    # interpretation is secondary and should not push these tabs below it.
+    # interpretation is secondary and should not push these tabs below it:
+    # its section comes after the tabs and the benchmark reference.
+    st.subheader("Selected result", anchor=False)
     tabs = st.tabs(["Summary", "Metrics", "Predictions", "Logs", "Files"])
 
     # Deterministic, and drawn whether or not anyone asks for an
@@ -2985,6 +2989,10 @@ def render_review_results_page():
     selected_analysis = _selected_analysis_context(selected)
     render_benchmark_panel(selected_analysis)
 
+    st.subheader("Optional LLM interpretation", anchor=False)
+    st.caption(
+        "Use the LLM assistant to summarize results or explain metrics. BatteryML metrics are computed by BatteryML and will not be modified."
+    )
     btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
     with btn_col1:
         summarize_clicked = st.button("Summarize results", key="review_summarize_results", use_container_width=True)
@@ -3088,7 +3096,11 @@ Logs available: {'Yes' if run_files.get("log_files") else 'No'}
         _render_selected_result_header(selected)
         if not selected.available:
             st.info(selected.reason)
-        st.write(f"**Status:** {(selected.manifest or {}).get('status', 'Not available')}")
+        # Status as status: a passive pill, never a control.
+        st.markdown(
+            f"**Status:** {status_badge((selected.manifest or {}).get('status', 'Not available'))}",
+            unsafe_allow_html=True,
+        )
         st.write(f"**Metrics found:** {'Yes' if metrics_df is not None and not metrics_df.empty else 'No'}")
         st.write(f"**Predictions artifact:** {'Yes' if selected.available else 'No'}")
         st.write(f"**Logs found:** {'Yes' if run_files.get('log_files') else 'No'}")

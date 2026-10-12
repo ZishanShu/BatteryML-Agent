@@ -1,7 +1,7 @@
 # Design system
 
 One visual language for every page of the web app: the mentor's Home
-(`codex/ui-optimization`). Spec IDs `UI-10`, `UI-11`, `UI-12`.
+(`codex/ui-optimization`). Spec IDs `UI-10`, `UI-11`, `UI-12`, `UI-13`.
 
 Where it lives:
 
@@ -51,6 +51,18 @@ Home's hero title and its component headings keep the mentor's sizes.
 | Information | `surfaces.render_info_card` | flat 4px panel, no hover |
 | Status | `<span class="bml-status bml-status--completed">` | pill with a dot and the word |
 | Disclosure | `st.expander` | 10px hairline panel |
+
+## Review Results and Run History
+
+Page title, then three sections: **Run history**, **Selected result** (the
+result tabs, then the *Benchmark reference* subsection) and **Optional LLM
+interpretation**. The history table is compact — short run id, start time
+with its recorded zone (`2026-10-12 17:29 UTC`), `model · dataset · task`,
+seed, device, status, duration, metrics — and only the table and the
+selector's labels are shortened: the selector's value, the session state and
+every section use the full run id, which the run's details show in a
+copyable code block next to the start time as recorded
+(`batteryml_web/ui/run_history.py`).
 
 ## Checking it in a browser
 
