@@ -39,6 +39,7 @@ written in, so that is left as a separate decision [ASSUMED: upstream chose
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 from urllib.parse import urlparse
@@ -58,8 +59,32 @@ class DownloadError(RuntimeError):
     """A download failed; the message names the file, the URL and the fix."""
 
 
+#: Query parameters whose values are credentials and are never echoed.
+_SECRET_PARAMS = re.compile(
+    r"(?i)([?&;](?:access_token|token|auth|key|apikey|api_key|signature|sig|"
+    r"password|secret|x-amz-[a-z-]*)=)[^&#\s'\"]*"
+)
+_USERINFO = re.compile(r"(?i)(https?://)[^/@\s'\"]+@")
+
+
+def redact(text: Any) -> str:
+    """``text`` with URL credentials and secret query values replaced."""
+    cleaned = _USERINFO.sub(r"\1***@", str(text))
+    return _SECRET_PARAMS.sub(r"\1***", cleaned)
+
+
 def _host(url: str) -> str:
-    return urlparse(url).netloc or url
+    """``host[:port]`` — never the ``user:password@`` part of the URL."""
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        return redact(url)
+    return f"{parsed.hostname}:{parsed.port}" if parsed.port else parsed.hostname
+
+
+def request_host(exc: BaseException) -> Optional[str]:
+    """The host a failed ``requests`` call was made to, or None if unknown."""
+    url = getattr(getattr(exc, "request", None), "url", None)
+    return _host(str(url)) if url else None
 
 
 def _unreachable_advice(url: str) -> str:
@@ -105,14 +130,14 @@ def _open(url: str, filename: Path, get: Callable[..., Any]) -> Any:
         )
     except requests.RequestException as exc:
         raise DownloadError(
-            f"Could not download {filename} from {url}: {type(exc).__name__}: {exc}. "
+            f"Could not download {filename} from {redact(url)}: {type(exc).__name__}: {redact(exc)}. "
             f"Nothing was written to {filename}. {_unreachable_advice(url)}"
         ) from exc
     if response.status_code != 200:
         response.close()
         raise DownloadError(
             f"Could not download {filename}: the server answered HTTP "
-            f"{response.status_code} for {url}. Nothing was written to {filename}. "
+            f"{response.status_code} for {redact(url)}. Nothing was written to {filename}. "
             "If this repeats, the dataset may have moved; see dataprepare.md for "
             "manual download instructions."
         )
@@ -234,13 +259,13 @@ def download_file(
             written = _stream_to_part(response, part, expected, chunk_size, target.name)
         except requests.RequestException as exc:
             raise DownloadError(
-                f"The download of {target} from {url} stopped part-way: "
-                f"{type(exc).__name__}: {exc}. The incomplete data was deleted. "
+                f"The download of {target} from {redact(url)} stopped part-way: "
+                f"{type(exc).__name__}: {redact(exc)}. The incomplete data was deleted. "
                 f"{_unreachable_advice(url)}"
             ) from exc
         if written == 0:
             raise DownloadError(
-                f"The server sent an empty file for {target} ({url}). Nothing was "
+                f"The server sent an empty file for {target} ({redact(url)}). Nothing was "
                 "kept. Run the download again; if it repeats, see dataprepare.md "
                 "for manual download instructions."
             )

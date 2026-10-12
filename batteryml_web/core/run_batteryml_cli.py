@@ -53,11 +53,14 @@ def main():
         # through runpy would only bury it.
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1)
-    except requests.exceptions.RequestException:
-        # The branch's message, kept verbatim. Download failures are reported
-        # above as DownloadError (with the real URL) and never reach here.
+    except requests.exceptions.RequestException as exc:
+        # A network failure outside the safe downloader (download failures are
+        # reported above as DownloadError). Name the host this request used —
+        # never an assumed one — without credentials or query parameters.
+        from batteryml_web.core.safe_download import request_host
+
         print(
-            "error: Unable to connect to data.matr.io:443. "
+            f"error: Unable to connect to {request_host(exc) or 'the remote server'}. "
             "Check Windows firewall/network policy or configure HTTPS_PROXY, then retry.",
             file=sys.stderr,
         )
