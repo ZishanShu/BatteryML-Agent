@@ -241,6 +241,10 @@ class TestA10MentorHomeKept(unittest.TestCase):
     MENTOR_HOME = {
         ".bml-home-hero": {"border-radius": "24px", "padding": "2.2rem 2.4rem"},
         ".bml-home-title": {"font-size": "clamp(2.1rem, 4vw, 4rem)", "font-weight": "800"},
+        # Measured before the shared scale; pinned so the shared h2 rule
+        # (700, page-title spacing) cannot restyle this component heading.
+        ".bml-process-heading h2": {"font-size": "1.25rem", "font-weight": "600",
+                                    "letter-spacing": "-0.035em", "line-height": "1.2"},
     }
 
     def test_home_components_keep_their_values(self) -> None:

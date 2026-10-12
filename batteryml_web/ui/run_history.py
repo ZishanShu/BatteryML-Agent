@@ -136,10 +136,18 @@ def format_timestamp(value: Any) -> str:
     return f"{moment:%Y-%m-%d %H:%M} UTC{sign}{hours:02d}:{mins:02d}"
 
 
+def short_model_name(manifest: Dict[str, Any]) -> str:
+    """The model's name without its long form: ``"XGBoost"`` for
+    ``"XGBoost — Extreme Gradient Boosting"``. The full display name stays in
+    the run's details."""
+    display = str(manifest.get("model_display") or "").split(" — ", 1)[0].strip()
+    return display or str(manifest.get("model_key") or "")
+
+
 def experiment_summary(manifest: Dict[str, Any]) -> str:
     """``model · dataset · task`` from the manifest's own values."""
     parts = [
-        str(manifest.get("model_display") or manifest.get("model_key") or ""),
+        short_model_name(manifest),
         str(manifest.get("dataset") or ""),
         str(manifest.get("task") or ""),
     ]
@@ -188,17 +196,14 @@ def _history_column_config() -> Optional[Dict[str, Any]]:
     config = getattr(st, "column_config", None)
     if config is None or not hasattr(config, "TextColumn"):
         return None
+    # Widths are left to the content except the short id: fixed widths cut
+    # "COMPLETED" and the metrics off at 1440px (measured in a browser).
     return {
         "Run": config.TextColumn("Run", width="small",
                                  help="End of the run id. The full id is in the run's details below."),
-        "Started": config.TextColumn("Started", width="medium",
+        "Started": config.TextColumn("Started",
                                      help="Recorded start time, in the time zone the run recorded."),
-        "Experiment": config.TextColumn("Experiment", width="large", help="Model · dataset · task"),
-        "Seed": config.TextColumn("Seed", width="small"),
-        "Device": config.TextColumn("Device", width="small"),
-        "Status": config.TextColumn("Status", width="small"),
-        "Duration": config.TextColumn("Duration", width="small"),
-        "Metrics": config.TextColumn("Metrics", width="medium"),
+        "Experiment": config.TextColumn("Experiment", help="Model · dataset · task. The full model name is in the run's details."),
     }
 
 

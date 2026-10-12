@@ -44,8 +44,8 @@ Home's hero title and its component headings keep the mentor's sizes.
 | Role | How to ask for it | Looks like |
 | --- | --- | --- |
 | Primary (Run, Preprocess, Analyze, Connect) | `type=PRIMARY_ROLE` | filled cobalt gradient |
-| Secondary (Download, Refresh, Save, Summarize, Explain) | default / `type=SECONDARY_ROLE` | white, cobalt hairline |
-| Navigation (pages, Prev/Next, Configure LLM, Close) | `type=NAV_ROLE` | cobalt wash, no outline |
+| Secondary (Download, Refresh, Save, Close, Summarize, Explain) | default / `type=SECONDARY_ROLE` | white, cobalt hairline |
+| Navigation (pages, Prev/Next, Configure LLM) | `type=NAV_ROLE` | cobalt wash, no outline |
 | Interrupting (Stop run) | key `agent_cancel_<run_id>` | red hairline on white |
 | Disabled (any) | `disabled=True`, reason beneath | dashed, neutral, `not-allowed` |
 | Information | `surfaces.render_info_card` | flat 4px panel, no hover |
@@ -86,7 +86,7 @@ Playwright, which is optional tooling and not a platform dependency:
 ```bash
 pip install playwright==1.63.0
 python -m playwright install chromium
-streamlit run batteryml_web/app.py --server.port 8501 --server.headless true &
+python -m streamlit run batteryml_web/app.py --server.port 8501 --server.headless true &
 python scripts/ui_audit/viewport_audit.py --url http://localhost:8501
 ```
 

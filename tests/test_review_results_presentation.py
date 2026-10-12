@@ -80,6 +80,14 @@ class TestReadableValues(unittest.TestCase):
         self.assertEqual(rh.format_timestamp("yesterday"), "yesterday")   # shown, not guessed
         self.assertEqual(rh.format_timestamp(None), rh.NOT_AVAILABLE)
 
+    def test_the_model_reads_by_its_short_name_in_the_table_only(self) -> None:
+        long_form = {"model_display": "XGBoost — Extreme Gradient Boosting", "model_key": "xgb",
+                     "dataset": "MATR", "task": "SOH estimation"}
+        self.assertEqual(rh.short_model_name(long_form), "XGBoost")
+        self.assertEqual(rh.experiment_summary(long_form), "XGBoost · MATR · SOH estimation")
+        self.assertEqual(rh.short_model_name({"model_key": "xgb"}), "xgb")
+        self.assertEqual(long_form["model_display"], "XGBoost — Extreme Gradient Boosting")
+
     def test_the_table_is_compact(self) -> None:
         row = rh.history_row(_manifest(*RUNS[0], Path("/tmp/x")))
         self.assertEqual(tuple(row), rh.COLUMNS)

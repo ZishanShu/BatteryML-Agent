@@ -729,6 +729,12 @@ HOME_STYLE_CSS = """
     margin: 0;
     color: var(--bml-ink);
     font-size: 1.25rem;
+    /* Pinned to what this heading measured before the shared type scale
+       existed (600, -0.035em, 1.2): it is a component heading, not a page
+       title, and the shared h2 rule would otherwise make it 700. */
+    font-weight: 600;
+    letter-spacing: -0.035em;
+    line-height: 1.2;
 }
 
 .bml-process-heading span {

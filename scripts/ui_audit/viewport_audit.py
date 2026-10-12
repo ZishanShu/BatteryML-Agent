@@ -20,7 +20,7 @@ Optional tooling — not a dependency of the platform. It needs Playwright::
 
 Usage (from the repository root, with the app already running)::
 
-    streamlit run batteryml_web/app.py --server.port 8501 --server.headless true &
+    python -m streamlit run batteryml_web/app.py --server.port 8501 --server.headless true &
     python scripts/ui_audit/viewport_audit.py --url http://localhost:8501
 
 Screenshots and ``viewport_audit.json`` go to ``--out-dir`` (default

@@ -44,7 +44,7 @@ import streamlit as st
 from ..agent.failure_taxonomy import classify_llm_failure
 from ..agent.llm_client import test_llm_connection
 from .feedback import notify_success
-from .surfaces import NAV_ROLE, PRIMARY_ROLE, SECONDARY_ROLE
+from .surfaces import PRIMARY_ROLE, SECONDARY_ROLE
 from .llm_state import (
     CUSTOM_PROVIDER,
     LLM_STATUS_FAILED,
@@ -518,7 +518,7 @@ def _settings_dialog_body(reason: str) -> None:
     # A successful Connect closes the dialog and changes nothing else: the
     # selected result stays selected and no request is sent on its behalf.
     _render_settings_body(DIALOG_FORM_PREFIX, on_connected=_finish_reveal)
-    if st.button(CLOSE_LABEL, key=f"{DIALOG_FORM_PREFIX}_close", type=NAV_ROLE):
+    if st.button(CLOSE_LABEL, key=f"{DIALOG_FORM_PREFIX}_close", type=SECONDARY_ROLE):
         _finish_reveal()
 
 
