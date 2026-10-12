@@ -2375,9 +2375,13 @@ def render_run_model_page():
             model = st.selectbox("Model", options=available_models or [""], index=0, key="run_model_select", disabled=not available_models)
             st.session_state["selected_model"] = model if available_models else ""
             device = st.selectbox("Device", ["cpu", "cuda"], index=0 if st.session_state.get("selected_device", "cpu") == "cpu" else 1, key="run_device_select")
-            if device == "cuda" and not torch.cuda.is_available():
-                st.warning("CUDA is not available in the current environment. Falling back to CPU.")
-                device = "cpu"
+            # The device the user chose is the device that is recorded and
+            # run; one this machine cannot provide blocks Run (Command & Run
+            # tab) instead of being replaced by cpu behind the user's back.
+            cuda_ok, cuda_detail = quick_experience.cuda_available()
+            device_issue = quick_experience.device_problem(device, cuda_ok=cuda_ok, cuda_detail=cuda_detail)
+            if device_issue:
+                st.warning(device_issue)
             st.session_state["selected_device"] = device
             seed = st.number_input("Seed", min_value=0, value=int(st.session_state.get("run_seed", 0)), step=1, key="run_seed_input")
             st.session_state["run_seed"] = int(seed)
@@ -2490,17 +2494,24 @@ def render_run_model_page():
                         response,
                         (_project_root() or Path("runs/web_projects/default")) / "agent_outputs" / "command_explanation.md",
                     )
-        can_run = config_path is not None and Path(str(config_path)).exists() and readiness.get(ds, {}).get("ready", False)
+        cuda_ok, cuda_detail = quick_experience.cuda_available()
+        run_device_issue = quick_experience.device_problem(
+            st.session_state.get("selected_device", "cpu"), cuda_ok=cuda_ok, cuda_detail=cuda_detail)
+        can_run = config_path is not None and Path(str(config_path)).exists() and readiness.get(ds, {}).get("ready", False) and run_device_issue is None
         if not readiness.get(ds, {}).get("ready", False):
             st.warning("Processed dataset missing. Go to Prepare Data and run preprocessing first.")
         if config_path is None or not Path(str(config_path)).exists():
             st.warning("Config missing for the selected dataset/model combination.")
+        if run_device_issue:
+            st.warning(run_device_issue)
         # Reserved outside the columns, so the run's progress spans the whole
         # content area instead of inheriting c2's two-thirds. The buttons stay
         # side by side; only what the run draws moves out from under them.
         run_progress_host = st.container()
         with c2:
-            if st.button("Run BatteryML", type=PRIMARY_ROLE, disabled=not can_run, use_container_width=True, key="run_batteryml_btn"):
+            # `and can_run`: a click sent from a page drawn before the
+            # selection changed is not a licence to run the new selection.
+            if st.button("Run BatteryML", type=PRIMARY_ROLE, disabled=not can_run, use_container_width=True, key="run_batteryml_btn") and can_run:
                 log_path = (_project_root() or Path("runs/web_projects/default")) / "logs" / "run_model.log"
                 # Recorded before it starts, in its own folder, so Review
                 # Results lists it — and a crash or closed tab leaves a run

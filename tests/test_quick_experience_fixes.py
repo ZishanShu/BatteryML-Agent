@@ -400,9 +400,8 @@ SOH_PAIRS = [(f"synthetic_s{c}", cycle) for c in range(2) for cycle in (10, 15, 
 SOH_OBS = [0.99, 0.98, 0.97, 0.995, 0.985, 0.975]
 
 
-@unittest.skipIf(AppTest is None, "streamlit.testing is not available")
-class TestQuickExperiencePage(unittest.TestCase):
-    """The mentor's Quick experience panel, driven like a user would."""
+class _PageHarness:
+    """A real AppTest of app.py with a fake run, faked MATR readiness, temp project."""
 
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="synthetic_quick_page_"))
@@ -467,6 +466,11 @@ class TestQuickExperiencePage(unittest.TestCase):
 
     def value(self, at, key: str) -> Any:
         return at.selectbox(key=key).value
+
+
+@unittest.skipIf(AppTest is None, "streamlit.testing is not available")
+class TestQuickExperiencePage(_PageHarness, unittest.TestCase):
+    """The mentor's Quick experience panel, driven like a user would."""
 
     def test_task_switch_clears_stale_config_and_runs_soh(self) -> None:
         at = self.app()
@@ -605,6 +609,154 @@ class TestQuickExperiencePage(unittest.TestCase):
         at.button(key="home_choice_button_quick").click().run()
         self.assertTrue(any(h.value == "Quick experience" for h in at.subheader))
         self.assertEqual(self.calls, [])
+
+
+class TestResultViewsTaskAgreement(unittest.TestCase):
+    """result_views' artifact-side annotator table agrees with config_task.
+
+    The artifact records the config's ``label.name`` and declared ``task:``
+    verbatim (``batteryml/pipeline.py`` ``_task_metadata``), so the result
+    views see what the config said.
+    """
+
+    @staticmethod
+    def recorded(config: Dict[str, Any]) -> Dict[str, Any]:
+        label = config.get("label") if isinstance(config.get("label"), dict) else {}
+        metadata = {"label_annotator": label.get("name")}
+        if config.get("task"):
+            metadata["task"] = str(config["task"])
+        return {"task_metadata": metadata}
+
+    def test_known_and_unknown_annotators(self) -> None:
+        from batteryml_web.agent import result_views as rv
+
+        known = {
+            "SOHLabelAnnotator": ("SOH", rv.SOH_SCHEMA, rv.TARGET_SOH),
+            "CycleSOHLabelAnnotator": ("SOH", rv.SOH_SCHEMA, rv.TARGET_SOH),
+            "RULLabelAnnotator": ("RUL", rv.RUL_SCHEMA, rv.TARGET_LIFETIME),   # scalar per cell
+        }
+        for annotator, (family, schema, kind) in known.items():
+            with self.subTest(annotator=annotator):
+                config = {"label": {"name": annotator}}
+                self.assertEqual(ct.resolve_config_task(config).short, family)
+                self.assertEqual(rv.task_family(self.recorded(config)), family)
+                self.assertEqual(rv.target_spec(self.recorded(config), schema)["kind"], kind)
+        lifetime = rv.target_spec(self.recorded({"label": {"name": "RULLabelAnnotator"}}), rv.RUL_SCHEMA)
+        self.assertEqual((lifetime["quantity"], lifetime["unit"]), ("Battery lifetime", "cycles"))
+        for annotator in ("FooLabelAnnotator", "SOHishLabelAnnotator", "RULLabelAnnotatorV2", "", None):
+            with self.subTest(annotator=annotator):
+                config = {"label": {"name": annotator}}
+                self.assertIsNone(ct.resolve_config_task(config).task)
+                self.assertIsNone(rv.task_family(self.recorded(config)))
+                self.assertEqual(rv.target_spec(self.recorded(config), rv.RUL_SCHEMA)["kind"], rv.TARGET_UNKNOWN)
+
+    def test_every_repository_config(self) -> None:
+        from batteryml_web.agent import result_views as rv
+
+        families = set()
+        for path in sorted((REPO_ROOT / "configs").rglob("*.yaml")):
+            config = yaml.safe_load(path.read_text(encoding="utf-8"))
+            if not isinstance(config, dict) or "label" not in config:
+                continue
+            with self.subTest(config=path.relative_to(REPO_ROOT).as_posix()):
+                expected = ct.resolve_config_task(config).short
+                self.assertEqual(rv.task_family(self.recorded(config)), expected)
+                families.add(expected)
+        self.assertLessEqual({"RUL", "SOH"}, families)
+
+
+class _ReadyMATRStatus(_ReadyMATR):
+    """As :class:`_ReadyMATR`, and READY to Run Model, which reads ``status``."""
+
+    @property
+    def status(self) -> Any:
+        from batteryml_web.core.readiness import DatasetStatus
+
+        if str(getattr(self._report, "dataset", "")).upper() == "MATR":
+            return DatasetStatus.READY
+        return self._report.status
+
+
+@unittest.skipIf(AppTest is None, "streamlit.testing is not available")
+class TestRunModelDevicePage(_PageHarness, unittest.TestCase):
+    """Run Model → Device on a machine with and without CUDA.
+
+    Run is never pressed here: Run Model records every run under the
+    repository's own ``runs/web_projects/`` (``project_context``), and a test
+    must not leave a run there. What is checked is what Run would execute —
+    the button's state and the command it is bound to — and the device the
+    session records.
+    """
+
+    MANIFEST = REPO_ROOT / "data" / "metadata" / "dataset_manifest.json"
+
+    def setUp(self) -> None:
+        super().setUp()
+        from batteryml_web.core import readiness
+
+        harness_assess = readiness.assess_dataset
+        self.stack.enter_context(mock.patch.object(
+            readiness, "assess_dataset",
+            lambda *a, **k: _ReadyMATRStatus(harness_assess(*a, **k)._report, self.tmp)))
+        # Run Model lists the datasets the (gitignored) manifest marks present;
+        # only that one file's content is replaced, never written.
+        manifest, read_text, exists = self.MANIFEST, Path.read_text, Path.exists
+        listing = json.dumps([{"name": "MATR", "status": "present", "path": "data/raw/MATR"}])
+        self.stack.enter_context(mock.patch.object(
+            Path, "read_text", lambda p, *a, **k: listing if p == manifest else read_text(p, *a, **k)))
+        self.stack.enter_context(mock.patch.object(
+            Path, "exists", lambda p, *a, **k: True if p == manifest else exists(p, *a, **k)))
+
+    def open_run_model(self, cuda_ok: bool) -> "AppTest":
+        detail = "" if cuda_ok else "No CUDA here."
+        self.stack.enter_context(mock.patch.object(qx, "cuda_available", lambda probe=None: (cuda_ok, detail)))
+        at = self.app()
+        at.session_state["current_step"] = "run_model"
+        at.run()
+        self.assertHealthy(at)
+        return at
+
+    def command(self, at) -> str:
+        commands = [c.value for c in at.code if "run_batteryml_cli.py run" in c.value]
+        self.assertEqual(len(commands), 1, commands)
+        return commands[0]
+
+    def device_warnings(self, at) -> List[str]:
+        return [w.value for w in at.warning if "cuda" in w.value.lower()]
+
+    def test_cuda_without_cuda_blocks_run_and_is_never_replaced(self) -> None:
+        at = self.open_run_model(cuda_ok=False)
+        self.assertEqual(self.value(at, "run_device_select"), "cpu")
+        self.assertFalse(at.button(key="run_batteryml_btn").disabled)
+        self.assertEqual(self.device_warnings(at), [])
+
+        self.select(at, "run_device_select", "cuda")
+        self.assertEqual(self.value(at, "run_device_select"), "cuda")   # widget untouched
+        self.assertEqual(at.session_state["selected_device"], "cuda")   # what the user chose
+        self.assertIn("--device cuda", self.command(at))               # never rewritten to cpu
+        self.assertTrue(at.button(key="run_batteryml_btn").disabled)
+        warnings = self.device_warnings(at)
+        self.assertEqual(len(warnings), 2, warnings)                    # Configuration + Command & Run
+        for text in warnings:
+            self.assertIn("not available on this machine", text)
+            self.assertIn("Choose cpu explicitly", text)
+        page_text = " ".join(str(e.value) for e in (*at.warning, *at.info, *at.caption, *at.markdown))
+        self.assertNotIn("Falling back to CPU", page_text)
+
+        self.select(at, "run_device_select", "cpu")                    # the explicit choice
+        self.assertEqual(at.session_state["selected_device"], "cpu")
+        self.assertIn("--device cpu", self.command(at))
+        self.assertFalse(at.button(key="run_batteryml_btn").disabled)
+        self.assertEqual(self.device_warnings(at), [])
+        self.assertEqual(self.calls, [])
+
+    def test_cuda_with_cuda_is_runnable_on_cuda(self) -> None:
+        at = self.open_run_model(cuda_ok=True)
+        self.select(at, "run_device_select", "cuda")
+        self.assertEqual(at.session_state["selected_device"], "cuda")
+        self.assertIn("--device cuda", self.command(at))
+        self.assertFalse(at.button(key="run_batteryml_btn").disabled)
+        self.assertEqual(self.device_warnings(at), [])
 
 
 class TestMentorDesignKept(unittest.TestCase):
