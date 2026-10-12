@@ -219,8 +219,9 @@ class TestBothButtonsRecordTheirRuns(unittest.TestCase):
         )
 
     def test_home_demo(self) -> None:
+        # The home page's Quick experience delegates its run to this helper.
         self.assertEqual(
-            self._calls_in_order("render_home_page"),
+            self._calls_in_order("_run_home_experiment"),
             ["_begin_page_run", "run_command_with_progress", "_finish_page_run"],
         )
 

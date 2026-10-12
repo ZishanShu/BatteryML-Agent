@@ -269,6 +269,13 @@ def resolve_catalog_model(value: Any, catalog: Dict[str, Any]) -> Optional[str]:
             return str(entry.get("model_key"))
         if any(_normalized(alias) == wanted for alias in entry.get("aliases", [])):
             return str(entry.get("model_key"))
+    # The same names written without separators ("ElasticNet" for "elastic
+    # net"): still an exact comparison, only spacing is ignored.
+    compact = wanted.replace(" ", "")
+    for entry in catalog.get("models", []):
+        names = [entry.get("model_key"), entry.get("model_display")] + list(entry.get("aliases", []))
+        if any(_normalized(name).replace(" ", "") == compact for name in names if name):
+            return str(entry.get("model_key"))
     folded = canonical_model_key(str(value))
     for entry in catalog.get("models", []):
         if str(entry.get("model_key")) == folded:

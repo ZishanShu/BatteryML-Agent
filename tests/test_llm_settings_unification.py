@@ -300,13 +300,13 @@ class TestBothExplanationsUseTheSharedClient(unittest.TestCase):
 
     def test_agent_workflow_explanation_sends_the_stored_credentials(self) -> None:
         stub = _StubClient({"guidance": "narrated"})
-        real = ui.guide_workflow
-        ui.guide_workflow = stub
+        real = ui.explain_workflow_state
+        ui.explain_workflow_state = stub
         try:
             with _session(dict(CONFIGURED)):
                 ui._explain_workflow("predict MATR lifetime")
         finally:
-            ui.guide_workflow = real
+            ui.explain_workflow_state = real
 
         self.assertEqual(len(stub.calls), 1)
         sent = stub.calls[0]
@@ -342,13 +342,13 @@ class TestExplanationsAreOnDemand(unittest.TestCase):
         self.explain = _StubClient({"summary": "explained"})
         self.guide = _StubClient({"guidance": "narrated"})
         self._real_explain = ui.explain_run_result
-        self._real_guide = ui.guide_workflow
+        self._real_guide = ui.explain_workflow_state
         ui.explain_run_result = self.explain
-        ui.guide_workflow = self.guide
+        ui.explain_workflow_state = self.guide
 
     def tearDown(self) -> None:
         ui.explain_run_result = self._real_explain
-        ui.guide_workflow = self._real_guide
+        ui.explain_workflow_state = self._real_guide
 
     def _configured_session(self) -> dict:
         session = dict(CONFIGURED)
@@ -520,16 +520,17 @@ class TestTheDeterministicPathIsUnaffected(unittest.TestCase):
         def _boom(*args: Any, **kwargs: Any):
             raise RuntimeError("LLM API request failed with status 401: bad key")
 
-        real = ui.guide_workflow
-        ui.guide_workflow = _boom
+        real = ui.explain_workflow_state
+        ui.explain_workflow_state = _boom
         try:
             with _session(dict(CONFIGURED)) as fake:
                 ui._explain_workflow("predict MATR lifetime")
-                finding = fake.session_state.get("agent_explanation_failure")
+                finding = fake.session_state.get(ui.WORKFLOW_EXPLANATION_FAILURE_KEY)
                 self.assertIsInstance(finding, dict)
-                self.assertNotIn("agent_explanation", fake.session_state)
+                self.assertNotIn(ui.WORKFLOW_EXPLANATION_KEY, fake.session_state)
+                self.assertNotIn("401", str(fake.session_state.get(ui.WORKFLOW_EXPLANATION_KEY)))
         finally:
-            ui.guide_workflow = real
+            ui.explain_workflow_state = real
         self.assertEqual(finding["category"], "llm_authentication_failed")
 
 

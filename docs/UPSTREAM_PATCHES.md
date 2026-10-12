@@ -315,16 +315,67 @@ prediction could not be traced to the cell and cycle it was made for, and
 
 ---
 
+## UP-04 — `batteryml/preprocess`: partial-download handling and a completeness check
+
+| Field | Value |
+| --- | --- |
+| Files | `batteryml/preprocess/download.py`, `batteryml/preprocess/__init__.py`, `batteryml/preprocess/preprocess_MATR.py` |
+| Added | `is_download_complete(filename)`; `.part` download in `download_file`; a named error in `load_batch` |
+| Origin | commit `f058d51` on `codex/ui-optimization` (repository owner), kept when that branch was merged with `main` |
+| Basis | `[STATIC]` — read from the diff; not executed against a real download in the authoring environment |
+
+### Why it is upstream
+
+The Quick experience controls on the home page
+(`batteryml_web/app.py`, `_raw_download_progress`) ask whether each MATR batch
+file is *usable*, not merely present: a truncated HDF5 file can be gigabytes
+long. `is_download_complete` opens the HDF5 header (`'batch' in file`) to
+answer that, and it sits beside `DOWNLOAD_LINKS`, which names the files. The
+owner chose to keep it there; this entry records that decision as `CLAUDE.md`
+§4 requires.
+
+### The diff, in words
+
+* `is_download_complete(filename)`: missing or 0-byte → False; a
+  `MATR_batch_*.mat` file → True only if `h5py` can open it and it contains
+  `batch`; any other file with bytes → True.
+* `download_file`: an existing target is skipped only when
+  `is_download_complete` says so (otherwise it is deleted and fetched again);
+  the body is written to `<name>.part` and renamed onto the final name only
+  after the transfer finished; on a request/OS/value error the `.part` file
+  is removed and the error re-raised.
+* `__init__.py` exports `is_download_complete`.
+* `preprocess_MATR.load_batch`: an `OSError` from `h5py.File` is re-raised as
+  `OSError("MATR batch file is incomplete or corrupt: <name>. Delete it and
+  download the file again.")`.
+
+### What was deliberately not changed
+
+* `download_file`'s parameters, so the platform's run-time replacement below
+  still matches it (`CLI-01` checks this);
+* `verify=False` on the request;
+* the platform's own download path: the CLI wrapper still installs
+  `batteryml_web/core/safe_download.download_file` before handing over, so
+  `batteryml download` through the wrapper does not run this body. It applies
+  to code that imports upstream `download_file` directly
+  (e.g. `scripts/reproduce_batteryml/prepare_data.py`).
+
+**No scientific semantics changed.** Only download bookkeeping and an error
+message; preprocessing output for a complete file is unchanged.
+
+---
+
 ## Not a patch: `download_file` is replaced at run time
 
 Recorded here because it changes what an upstream function does when it is
 called through this platform, even though **no file under `batteryml/` or
 `bin/` was edited**.
 
-* **Upstream behaviour.** `batteryml/preprocess/download.py:50`
-  `download_file` opens the target file before sending the request. Any
-  failure leaves a 0-byte or truncated file under the final name, and the next
-  run prints `[INFO] … already exists. Skip it.` and keeps it.
+* **Upstream behaviour (before UP-04).** `batteryml/preprocess/download.py`
+  `download_file` opened the target file before sending the request. Any
+  failure left a 0-byte or truncated file under the final name, and the next
+  run printed `[INFO] … already exists. Skip it.` and kept it. UP-04 has since
+  changed the upstream body as well; the wrapper still installs its own.
 * **What the platform does.** `batteryml_web/core/run_batteryml_cli.py` calls
   `install_safe_download()` before `runpy.run_path("bin/batteryml.py")`. That
   sets `batteryml.preprocess.download_file` to
@@ -337,5 +388,6 @@ called through this platform, even though **no file under `batteryml/` or
   the hosts could be reached from the authoring environment to check.
 * **Guarded by.** `CLI-01` fails if the wrapper stops installing it before the
   hand-over, or if its parameters drift from upstream's;
-  `tests/test_safe_download.py` asserts the upstream file is unmodified.
+  `tests/test_safe_download.py` asserts this fix never edits the upstream
+  file and that any upstream edit to it is recorded here (UP-04).
 

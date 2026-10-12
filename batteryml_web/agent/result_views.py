@@ -87,7 +87,7 @@ _TASK_FAMILY_SOH = "SOH"
 
 #: Label annotator class name -> task family. The annotator *is* what the run
 #: trained against, so it cannot disagree with the task the way a filename or
-#: a model name can. Mirrors ``config_registry._TASK_BY_ANNOTATOR``.
+#: a model name can. Mirrors ``config_task.TASK_BY_LABEL_ANNOTATOR``.
 _ANNOTATOR_FAMILIES = {
     "rullabelannotator": _TASK_FAMILY_RUL,
     "sohlabelannotator": _TASK_FAMILY_SOH,

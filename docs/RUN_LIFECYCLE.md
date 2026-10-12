@@ -153,3 +153,12 @@ or `runs/web_projects/<project>/quickstart/<run_id>/` — which is also the
 combined stdout and stderr. Review Results finds these runs the same way it
 finds Agent Workflow runs: by the `run.json` files under the project.
 
+Home's **Quick experience** panel (the redesigned home page) launches through
+the same two calls from `_run_home_experiment`, into
+`<project>/quickstart/<run_id>/`. Before that it re-validates the selection
+with `quick_experience.build_quick_plan` (spec `QX-01`): the config must train
+the task on screen, the device must exist, and an uploaded config must satisfy
+`QX-02`. The metrics the panel shows are read back from the run's own
+`run.json` (`quick_experience.run_metrics`), never from a re-read of the
+artifact on the page.
+

@@ -15,6 +15,17 @@ its own credentials", whatever the implementation does underneath, and that
 is the complaint this module now answers. Every other surface shows
 :data:`CONFIGURE_IN_SETTINGS_MESSAGE` and sends the user here.
 
+**Opening Settings from a page** (UI-14). The sidebar may be collapsed —
+Streamlit collapses it on a narrow window — so expanding its Settings block
+from a page is not reliably visible. A page therefore *requests* Settings
+(:func:`request_llm_settings`) and the same settings body opens in a small,
+dismissible dialog (:func:`render_requested_llm_settings`): the one form,
+its one call site, its one store. It opens when the user asks (Configure
+LLM), when Summarize/Explain is pressed without a verified connection (no
+provider call is made), and once per session on arriving at Review Results
+from a completed run with nothing configured. A request is consumed when
+the dialog opens, so no rerun reopens it.
+
 Everything is read and written through :mod:`batteryml_web.ui.llm_state`,
 which owns the session keys. This module contributes the provider presets
 and the widgets; it stores nothing of its own.
@@ -33,15 +44,19 @@ import streamlit as st
 from ..agent.failure_taxonomy import classify_llm_failure
 from ..agent.llm_client import test_llm_connection
 from .feedback import notify_success
-from .surfaces import PRIMARY_ROLE
+from .surfaces import PRIMARY_ROLE, SECONDARY_ROLE
 from .llm_state import (
     CUSTOM_PROVIDER,
+    LLM_STATUS_FAILED,
     LLM_STATUS_NOT_CONFIGURED,
     PROVIDER_KEY,
     describe_llm_status,
     ensure_llm_state_defaults,
     get_llm_provider,
+    get_llm_state,
+    get_llm_status,
     is_llm_configured,
+    is_llm_connected,
     llm_credentials,
     llm_settings_fingerprint,
     llm_settings_summary,
@@ -274,9 +289,11 @@ def render_llm_settings_form(
 
     columns = st.columns(2)
     action: Optional[str] = None
-    # Save is this panel's primary action: it is the one that commits
-    # state. Connect stays secondary — it verifies what Save stored, and a
-    # panel with two filled buttons side by side ranks neither of them.
+    # Connect is this panel's primary action (the site's button hierarchy
+    # lists it with Run and Preprocess): it stores the fields *and* proves
+    # they work, which is what every LLM feature waits for. Save stays
+    # secondary — it stores without a network call — and a panel with two
+    # filled buttons side by side ranks neither of them.
     #
     # The role is passed as `type=` rather than through
     # `surfaces.primary_action`, because the helpers wrap `st.button` and
@@ -285,7 +302,7 @@ def render_llm_settings_form(
     if columns[0].button(
         SAVE_LABEL,
         key=f"{key_prefix}_save",
-        type=PRIMARY_ROLE,
+        type=SECONDARY_ROLE,
         use_container_width=True,
     ):
         # Stores only. Whether these credentials work is a separate question,
@@ -301,7 +318,10 @@ def render_llm_settings_form(
         if on_saved is not None:
             on_saved()
     if columns[1].button(
-        CONNECT_LABEL, key=f"{key_prefix}_connect", use_container_width=True
+        CONNECT_LABEL,
+        key=f"{key_prefix}_connect",
+        type=PRIMARY_ROLE,
+        use_container_width=True,
     ):
         ok, message = connect_llm(base_url, api_key, model, provider=provider)
         if not ok and message == INCOMPLETE_MESSAGE:
@@ -358,6 +378,51 @@ def render_configure_in_settings_notice() -> None:
     st.caption(CONFIGURE_IN_SETTINGS_MESSAGE)
 
 
+#: Widget namespaces of the two places the one settings body is shown. Two,
+#: because the sidebar renders on every run and a dialog may open in the
+#: same run, and Streamlit rejects duplicate keys; both are views of the one
+#: store (see :func:`_sync_widgets_from_store`).
+SIDEBAR_FORM_PREFIX = "sidebar_llm"
+DIALOG_FORM_PREFIX = "dialog_llm"
+
+DIALOG_TITLE = "LLM settings"
+CLOSE_LABEL = "Close"
+
+
+def _render_last_failure() -> None:
+    """Case D: the last connection test failed. Say so briefly, redacted.
+
+    The fields keep their values (the store is unchanged) and nothing is
+    retried; the user corrects a field and presses Connect.
+    """
+    if get_llm_status() != LLM_STATUS_FAILED:
+        return
+    message = get_llm_state().status_message
+    if not message:
+        return
+    finding = classify_llm_failure(message, configured=True)
+    st.caption(
+        f"Last connection test failed: {finding['short_title']} "
+        "Correct the settings above and press Connect; nothing is retried automatically."
+    )
+
+
+def _render_settings_body(
+    key_prefix: str, *, on_connected: Optional[Callable[[], None]] = None
+) -> Optional[str]:
+    """Everything Settings shows, wherever it is opened. The form's one call site."""
+    summary = llm_settings_summary()
+    st.caption(
+        "LLM assistant: configured"
+        if summary["configured"]
+        else "LLM assistant: not configured"
+    )
+    action = render_llm_settings_form(key_prefix=key_prefix, on_connected=on_connected)
+    if action is None:
+        _render_last_failure()
+    return action
+
+
 def render_sidebar_settings() -> None:
     """The Settings section of the sidebar.
 
@@ -366,10 +431,115 @@ def render_sidebar_settings() -> None:
     already hides them from end users.
     """
     with st.expander("Settings", expanded=False):
-        summary = llm_settings_summary()
-        st.caption(
-            "LLM assistant: configured"
-            if summary["configured"]
-            else "LLM assistant: not configured"
-        )
-        render_llm_settings_form(key_prefix="sidebar_llm")
+        _render_settings_body(SIDEBAR_FORM_PREFIX)
+
+
+# --- opening Settings from a page (UI-14) ------------------------------------
+
+#: One-shot request to show Settings on this script run, holding the reason.
+#: Consumed when the dialog opens, so a later rerun does not reopen it.
+REVEAL_REQUEST_KEY = "llm_settings_reveal_request"
+
+#: Set by an intentional "view the results of the run that just completed";
+#: consumed by Review Results on arrival.
+RESULTS_INTENT_KEY = "llm_results_view_intent"
+
+#: The once-per-session automatic reveal has happened (whether the user then
+#: connected, closed or dismissed it). Never reset within the session.
+RESULTS_REVEAL_DONE_KEY = "llm_results_reveal_done"
+
+REVEAL_CONFIGURE = "configure"
+REVEAL_ACTION = "action"
+REVEAL_ARRIVAL = "arrival"
+
+#: What the dialog says first, per reason. No reason claims a result is
+#: missing: every BatteryML number is already on the page without an LLM.
+REVEAL_NOTES: Dict[str, str] = {
+    REVEAL_ACTION: (
+        "Summaries and explanations need a connected LLM. Nothing was sent. "
+        "Connect below, then press the button again."
+    ),
+    REVEAL_ARRIVAL: (
+        "Your run has finished. Optionally connect an LLM to summarize or "
+        "explain it — every BatteryML result is already on the page without one."
+    ),
+}
+
+
+def request_llm_settings(reason: str) -> None:
+    """Ask for Settings to open on this run (see :func:`render_requested_llm_settings`)."""
+    st.session_state[REVEAL_REQUEST_KEY] = str(reason)
+
+
+def mark_results_intent() -> None:
+    """Record an intentional "view results" of a run that just completed."""
+    st.session_state[RESULTS_INTENT_KEY] = True
+
+
+def arrival_reveal_due(*, intent: bool, status: str, already_revealed: bool) -> bool:
+    """Whether arriving at Review Results opens Settings by itself. Pure.
+
+    Only on an intentional "view results" of a completed run, only when
+    nothing is configured (a saved or failed configuration is the user's to
+    act on — they have seen Settings already), and only once a session.
+    """
+    return bool(intent) and status == LLM_STATUS_NOT_CONFIGURED and not already_revealed
+
+
+def consume_results_intent() -> bool:
+    """On Review Results: decide, once, whether this arrival reveals Settings."""
+    intent = bool(st.session_state.pop(RESULTS_INTENT_KEY, False))
+    due = arrival_reveal_due(
+        intent=intent,
+        status=get_llm_status(),
+        already_revealed=bool(st.session_state.get(RESULTS_REVEAL_DONE_KEY)),
+    )
+    if due:
+        st.session_state[RESULTS_REVEAL_DONE_KEY] = True
+        request_llm_settings(REVEAL_ARRIVAL)
+    return due
+
+
+def llm_action_allowed() -> bool:
+    """Whether Summarize/Explain may call the provider: a verified connection only."""
+    return is_llm_connected()
+
+
+def _finish_reveal() -> None:
+    """Close Settings opened from a page: forget the request, redraw the page."""
+    st.session_state.pop(REVEAL_REQUEST_KEY, None)
+    st.rerun()
+
+
+def _settings_dialog_body(reason: str) -> None:
+    note = REVEAL_NOTES.get(reason)
+    if note:
+        st.caption(note)
+    # A successful Connect closes the dialog and changes nothing else: the
+    # selected result stays selected and no request is sent on its behalf.
+    _render_settings_body(DIALOG_FORM_PREFIX, on_connected=_finish_reveal)
+    if st.button(CLOSE_LABEL, key=f"{DIALOG_FORM_PREFIX}_close", type=SECONDARY_ROLE):
+        _finish_reveal()
+
+
+def render_requested_llm_settings() -> Optional[str]:
+    """Open Settings if a page asked for it on this run. Returns the reason.
+
+    A dialog where this Streamlit has one: dismissible (Close, the corner
+    cross, Escape) and consumed on opening, so nothing reopens it on a
+    rerun. Without ``st.dialog`` the same body is drawn in place, and stays
+    until Close or a successful Connect, because there typing reruns the
+    whole page.
+    """
+    reason = st.session_state.get(REVEAL_REQUEST_KEY)
+    if not reason:
+        return None
+    dialog = getattr(st, "dialog", None)
+    if dialog is None:
+        with st.container(border=True):
+            st.markdown(f"**{DIALOG_TITLE}**")
+            _settings_dialog_body(str(reason))
+        return str(reason)
+    st.session_state.pop(REVEAL_REQUEST_KEY, None)
+    dialog(DIALOG_TITLE)(_settings_dialog_body)(str(reason))
+    return str(reason)

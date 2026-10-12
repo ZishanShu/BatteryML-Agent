@@ -334,7 +334,11 @@ def find_catalog_model_mention(text: str, catalog: Dict[str, Any]) -> Optional[s
             alias_lower = str(alias).strip().lower()
             if not alias_lower:
                 continue
-            if re.search(r"\b" + re.escape(alias_lower) + r"\b", lowered):
+            # A multi-word alias also matches written without its separator
+            # ("ElasticNet", "elastic-net" for "elastic net"), still on word
+            # boundaries, so "Use ElasticNet on HUST" names elastic_net.
+            pattern = r"[\s_\-]*".join(re.escape(part) for part in re.split(r"[\s_\-]+", alias_lower))
+            if re.search(r"\b" + pattern + r"\b", lowered):
                 candidates.append((len(alias_lower), key))
             elif len(alias_lower) >= _SUBSTRING_ALIAS_MIN_LEN and alias_lower in lowered:
                 candidates.append((len(alias_lower), key))

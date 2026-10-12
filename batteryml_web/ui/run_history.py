@@ -13,12 +13,15 @@ value in a row comes from the manifest it was built from.
 
 from __future__ import annotations
 
+import html
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import streamlit as st
 
 from ..core import run_manifest as rm
+from ..core.run_identity import SUFFIX_CHARS, is_run_id
 from ..core.run_manager import get_run_manager
 from ..ui.formatting import compact_metric
 
@@ -27,15 +30,15 @@ HISTORY_TITLE = "Run history"
 #: Shown only for a run that can actually be continued.
 RESUME_LABEL = "Resume training"
 
-#: Column order for the history table.
+#: Column order for the history table: compact and readable (UI-13). The
+#: canonical run id and the recorded timestamp are not shortened anywhere
+#: they are used — the selector's value, the details, the manifest — only
+#: in this table's cells, and both appear in full in the run's details.
 COLUMNS: tuple[str, ...] = (
-    "Run ID",
+    "Run",
     "Started",
-    "Dataset",
-    "Task",
-    "Model",
+    "Experiment",
     "Seed",
-    "Epochs",
     "Device",
     "Status",
     "Duration",
@@ -43,6 +46,18 @@ COLUMNS: tuple[str, ...] = (
 )
 
 NOT_AVAILABLE = "—"
+
+#: A status word → the passive status pill's modifier (home_style.py,
+#: ``.bml-status--*``). An unknown status gets the neutral pill, never a
+#: guessed colour.
+STATUS_KINDS: Dict[str, str] = {
+    rm.STATUS_COMPLETED: "completed",
+    rm.STATUS_FAILED: "failed",
+    rm.STATUS_INTERRUPTED: "failed",
+    rm.STATUS_CANCELLED: "cancelled",
+    rm.STATUS_RUNNING: "running",
+    rm.STATUS_PLANNED: "running",
+}
 
 
 def format_duration(seconds: Any) -> str:
@@ -74,19 +89,86 @@ def format_metrics(metrics: Any) -> str:
     ) or NOT_AVAILABLE
 
 
+def short_run_id(run_id: Any) -> str:
+    """A run id shortened for reading in a table cell. Never used to find a run.
+
+    An id this platform minted ends in a random hexadecimal suffix, which is
+    what tells two runs started in the same second apart; that suffix is
+    shown. Any other id is shown whole when short, otherwise as its head and
+    tail around an ellipsis.
+    """
+    text = str(run_id or "")
+    if not text:
+        return NOT_AVAILABLE
+    if is_run_id(text):
+        return "…" + text[-SUFFIX_CHARS:]
+    return text if len(text) <= 18 else f"{text[:8]}…{text[-SUFFIX_CHARS:]}"
+
+
+def recorded_start(manifest: Dict[str, Any]) -> str:
+    """The run's start as the manifest recorded it (``started_at``, else ``created_at``)."""
+    return str(manifest.get("started_at") or manifest.get("created_at") or "")
+
+
+def format_timestamp(value: Any) -> str:
+    """``2026-10-12 17:29 UTC`` from a recorded ISO-8601 time, zone explicit.
+
+    The zone shown is the one the stamp carries — no conversion to the
+    server's or the browser's local time, so the cell says exactly what was
+    recorded, minus the seconds. A stamp without a zone says so; a value
+    that is not ISO-8601 is shown as recorded rather than guessed at.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return NOT_AVAILABLE
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    offset = moment.utcoffset()
+    if offset is None:
+        return f"{moment:%Y-%m-%d %H:%M} (time zone not recorded)"
+    if offset == timedelta(0):
+        return f"{moment:%Y-%m-%d %H:%M} UTC"
+    minutes = int(offset.total_seconds() // 60)
+    sign = "+" if minutes >= 0 else "-"
+    hours, mins = divmod(abs(minutes), 60)
+    return f"{moment:%Y-%m-%d %H:%M} UTC{sign}{hours:02d}:{mins:02d}"
+
+
+def short_model_name(manifest: Dict[str, Any]) -> str:
+    """The model's name without its long form: ``"XGBoost"`` for
+    ``"XGBoost — Extreme Gradient Boosting"``. The full display name stays in
+    the run's details."""
+    display = str(manifest.get("model_display") or "").split(" — ", 1)[0].strip()
+    return display or str(manifest.get("model_key") or "")
+
+
+def experiment_summary(manifest: Dict[str, Any]) -> str:
+    """``model · dataset · task`` from the manifest's own values."""
+    parts = [
+        short_model_name(manifest),
+        str(manifest.get("dataset") or ""),
+        str(manifest.get("task") or ""),
+    ]
+    return " · ".join(part for part in parts if part) or NOT_AVAILABLE
+
+
+def status_badge(status: Any) -> str:
+    """The run status as a passive pill (HTML). A word to read, not a control."""
+    word = str(status or "").strip() or "UNKNOWN"
+    kind = STATUS_KINDS.get(word.upper())
+    modifier = f" bml-status--{kind}" if kind else ""
+    return f'<span class="bml-status{modifier}">{html.escape(word)}</span>'
+
+
 def history_row(manifest: Dict[str, Any]) -> Dict[str, str]:
-    """One table row. Every value comes from ``manifest``."""
-    started = str(manifest.get("started_at") or manifest.get("created_at") or "")
+    """One table row. Every value comes from ``manifest``; none is invented."""
     return {
-        "Run ID": str(manifest.get("run_id") or NOT_AVAILABLE),
-        "Started": started or NOT_AVAILABLE,
-        "Dataset": str(manifest.get("dataset") or NOT_AVAILABLE),
-        "Task": str(manifest.get("task") or NOT_AVAILABLE),
-        "Model": str(
-            manifest.get("model_display") or manifest.get("model_key") or NOT_AVAILABLE
-        ),
-        "Seed": str(manifest.get("seed") or NOT_AVAILABLE),
-        "Epochs": str(manifest.get("epochs") or "Config default"),
+        "Run": short_run_id(manifest.get("run_id")),
+        "Started": format_timestamp(recorded_start(manifest)),
+        "Experiment": experiment_summary(manifest),
+        "Seed": str(manifest.get("seed") if manifest.get("seed") not in (None, "") else NOT_AVAILABLE),
         "Device": str(manifest.get("device") or NOT_AVAILABLE),
         "Status": str(manifest.get("status") or NOT_AVAILABLE),
         "Duration": format_duration(manifest.get("elapsed_seconds")),
@@ -99,6 +181,32 @@ def history_rows(manifests: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     return [history_row(manifest) for manifest in manifests]
 
 
+def run_option_label(manifest: Dict[str, Any]) -> str:
+    """What the "Open a run" selector shows for one run; its value stays the full id."""
+    return " · ".join((
+        short_run_id(manifest.get("run_id")),
+        format_timestamp(recorded_start(manifest)),
+        experiment_summary(manifest),
+        str(manifest.get("status") or NOT_AVAILABLE),
+    ))
+
+
+def _history_column_config() -> Optional[Dict[str, Any]]:
+    """Column widths and the full-id hint, where this Streamlit has column_config."""
+    config = getattr(st, "column_config", None)
+    if config is None or not hasattr(config, "TextColumn"):
+        return None
+    # Widths are left to the content except the short id: fixed widths cut
+    # "COMPLETED" and the metrics off at 1440px (measured in a browser).
+    return {
+        "Run": config.TextColumn("Run", width="small",
+                                 help="End of the run id. The full id is in the run's details below."),
+        "Started": config.TextColumn("Started",
+                                     help="Recorded start time, in the time zone the run recorded."),
+        "Experiment": config.TextColumn("Experiment", help="Model · dataset · task. The full model name is in the run's details."),
+    }
+
+
 def load_history(project_root: str) -> List[Dict[str, Any]]:
     """The current project's runs, newest first, reconciled against reality.
 
@@ -107,6 +215,25 @@ def load_history(project_root: str) -> List[Dict[str, Any]]:
     pretending the job is still going.
     """
     return rm.list_runs(project_root, live_run_ids=get_run_manager().live_run_ids())
+
+
+def projects_with_runs(projects_root: Path, *, exclude: str = "") -> List[tuple]:
+    """``[(project name, run count)]`` for every other project that has runs.
+
+    Read-only and name-sorted; used only to tell a reader of an empty history
+    where runs actually are. ``rm.list_runs`` is the same reader the history
+    uses, so a folder that is not a project yields nothing.
+    """
+    root = Path(projects_root)
+    if not root.is_dir():
+        return []
+    found = []
+    for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+        if child.is_dir() and child.name != exclude:
+            count = len(rm.list_runs(child))
+            if count:
+                found.append((child.name, count))
+    return found
 
 
 def render_run_history(project_root: str, *, project_name: str = "") -> Optional[str]:
@@ -118,6 +245,15 @@ def render_run_history(project_root: str, *, project_name: str = "") -> Optional
             f"No runs recorded yet for this project ({project_root}). A run "
             "appears here as soon as it is started."
         )
+        others = projects_with_runs(Path(project_root).parent, exclude=Path(project_root).name)
+        if others:
+            # Runs are never pulled in from another project; the reader is
+            # told where they are and how to open them.
+            listed = ", ".join(f"{name} ({count})" for name, count in others)
+            st.caption(
+                f"Runs are recorded in other projects: {listed}. Load one from "
+                "Home → Existing project to review its runs here."
+            )
         return None
 
     st.caption(
@@ -125,14 +261,22 @@ def render_run_history(project_root: str, *, project_name: str = "") -> Optional
         f"{project_name or project_root}, newest first. Read from the run "
         "manifests on disk, so this survives a refresh or a restart."
     )
-    st.dataframe(history_rows(runs), hide_index=True, use_container_width=True)
+    table: Dict[str, Any] = {"hide_index": True, "use_container_width": True}
+    column_config = _history_column_config()
+    if column_config is not None:
+        table["column_config"] = column_config
+    st.dataframe(history_rows(runs), **table)
 
+    # The value is the canonical run id — that is what the rest of the page
+    # looks the run up by; only the label is shortened.
     ids = [str(entry.get("run_id")) for entry in runs]
+    labels = {str(entry.get("run_id")): run_option_label(entry) for entry in runs}
     chosen = st.selectbox(
         "Open a run",
         ids,
         index=0,
         key="run_history_selection",
+        format_func=lambda run_id: labels.get(str(run_id), str(run_id)),
     )
     return str(chosen) if chosen else None
 
@@ -140,11 +284,19 @@ def render_run_history(project_root: str, *, project_name: str = "") -> Optional
 def render_run_detail(manifest: Dict[str, Any]) -> None:
     """Provenance and outcome for one historical run. Never re-runs it."""
     status = str(manifest.get("status") or "")
-    st.markdown(f"**{manifest.get('run_id')}** — {status}")
+    # Status is shown as status — a pill to read — beside what was run; the
+    # full run id sits in a code block so it can be copied whole.
+    st.markdown(
+        f"{status_badge(status)}&nbsp;&nbsp;{html.escape(experiment_summary(manifest))}",
+        unsafe_allow_html=True,
+    )
+    st.code(str(manifest.get("run_id") or NOT_AVAILABLE), language="text")
     if manifest.get("reconcile_reason"):
         st.warning(str(manifest["reconcile_reason"]))
 
     rows = [
+        {"Field": "Run ID", "Value": str(manifest.get("run_id") or NOT_AVAILABLE)},
+        {"Field": "Started (as recorded)", "Value": recorded_start(manifest) or NOT_AVAILABLE},
         {"Field": "Project", "Value": str(manifest.get("project") or NOT_AVAILABLE)},
         {"Field": "Run directory", "Value": str(manifest.get("run_dir") or manifest.get("workspace") or NOT_AVAILABLE)},
         {"Field": "Dataset", "Value": str(manifest.get("dataset") or NOT_AVAILABLE)},
@@ -164,7 +316,7 @@ def render_run_detail(manifest: Dict[str, Any]) -> None:
     if status == rm.STATUS_COMPLETED:
         metrics = manifest.get("metrics") or {}
         if metrics:
-            st.markdown("**Metrics**")
+            st.markdown("#### Metrics")
             st.dataframe(
                 [
                     {"Metric": name, "Value": compact_metric(value)}
@@ -204,6 +356,7 @@ def render_run_detail(manifest: Dict[str, Any]) -> None:
     run_dir = str(manifest.get("run_dir") or manifest.get("workspace") or "")
     if run_dir:
         if status == rm.STATUS_COMPLETED:
+            st.markdown("#### Scientific plots")
             _render_scientific_views(manifest)
             render_bundle_download(run_dir, manifest)
         render_artifacts(run_dir)
@@ -526,8 +679,31 @@ def _zoom_choice(scope: str) -> bool:
     return choice == ZOOM_OPTIONS[1]
 
 
+def _pyplot_full_width(figure: Any) -> None:
+    """Draw a figure at the available tab width instead of clipping it.
+
+    Newer Streamlit takes ``width="stretch"`` (``use_container_width`` is
+    deprecated there); older releases only know ``use_container_width``.
+    """
+    import inspect
+
+    try:
+        accepts_width = "width" in inspect.signature(st.pyplot).parameters
+    except (TypeError, ValueError):
+        accepts_width = False
+    if accepts_width:
+        st.pyplot(figure, clear_figure=True, width="stretch")
+    else:
+        st.pyplot(figure, clear_figure=True, use_container_width=True)
+
+
 def _show(panel: Dict[str, Any]) -> None:
-    st.pyplot(panel["figure"], clear_figure=True)
+    _pyplot_full_width(panel["figure"])
+
+
+def _show_figure(draw) -> None:
+    """Render a chart drawn by ``draw`` at the available tab width."""
+    _pyplot_full_width(_figure(draw))
 
 
 def _render_export_action(view: Dict[str, Any], scope: str, *, cell_id: Optional[str]) -> None:
@@ -667,7 +843,7 @@ def render_rul_cycle_figure(view: Dict[str, Any], *, max_cells: int = 6) -> None
         axes.set_ylabel("Remaining useful life (cycles)")
         axes.legend(loc="best", fontsize="small")
 
-    st.pyplot(_figure(_curves), clear_figure=True)
+    _show_figure(_curves)
 
 
 def render_soh_figures(view: Dict[str, Any], *, placement: str = "result") -> None:
@@ -824,7 +1000,7 @@ def render_trajectory_figure(view: Dict[str, Any], *, limit: int = 8) -> None:
             axes.legend(loc="best", fontsize="small")
 
     st.caption(f"{view['count']} trajectory(ies), {view['length']} point(s) each")
-    st.pyplot(_figure(_draw), clear_figure=True)
+    _show_figure(_draw)
 
 
 def render_prediction_table(view: Dict[str, Any], *, limit: int = 200) -> None:
@@ -848,7 +1024,7 @@ def render_artifacts(run_dir: str) -> None:
     if not entries:
         st.caption("No artifact files were found in this run's directory.")
         return
-    st.markdown("**Artifacts**")
+    st.markdown("#### Artifacts")
     st.dataframe(
         [
             {

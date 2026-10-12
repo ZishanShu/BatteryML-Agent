@@ -55,6 +55,13 @@ CUSTOM_PROVIDER = "Custom OpenAI-compatible"
 #: this module owns them.
 CREDENTIAL_KEYS = ("llm_base_url", "llm_api_key", "llm_model")
 
+#: How many times, in this session, a connection was shown to work (a passing
+#: Connect test or a completed request). Not a credential and not a second
+#: store: a counter that lets a page tell a failure that happened *before*
+#: the connection that works now from a current one, so an old 401 is never
+#: presented as the live state.
+CONNECTION_SERIAL_KEY = "llm_connection_serial"
+
 
 @dataclass
 class LLMState:
@@ -193,6 +200,27 @@ def set_llm_connection_result(ok: bool, message: str) -> None:
         LLM_STATUS_CONNECTED if ok else LLM_STATUS_FAILED
     )
     st.session_state["llm_status_message"] = str(message)
+    if ok:
+        st.session_state[CONNECTION_SERIAL_KEY] = connection_serial() + 1
+
+
+def connection_serial() -> int:
+    """The number of successful connections so far in this session (see above)."""
+    try:
+        return int(st.session_state.get(CONNECTION_SERIAL_KEY) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def is_llm_connected() -> bool:
+    """True only when a connection was verified for the settings now stored.
+
+    Stricter than :func:`is_llm_configured` on purpose: three filled fields
+    are not evidence that the endpoint answers, and a change to any of them
+    resets the status (:func:`set_llm_settings`), so this is never true for
+    settings that were not the ones tested.
+    """
+    return get_llm_status() == LLM_STATUS_CONNECTED
 
 
 def get_llm_state() -> LLMState:

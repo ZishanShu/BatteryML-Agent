@@ -18,6 +18,11 @@ without a network and without an API key:
   overrule it), and never places a blocked model where the page could select
   it.
 
+* the **alternatives** offered for a request that cannot run
+  (``agent/alternatives.py``) name only (dataset, task) pairs the live
+  registry configures, and offer an action only where readiness reports a
+  runnable model — never for a pair with no configuration (UI-15).
+
 The catalog is also checked for config paths: a path that reaches the prompt
 is a path the model can echo back, and a config path must come from
 readiness, never from a language model.
@@ -296,9 +301,55 @@ def _isolation_problems(intent: Any) -> list[str]:
     return problems
 
 
+def _alternatives_problems(alternatives_module: Any) -> list[str]:
+    """UI-15 against the live registry, with readiness answered synthetically.
+
+    Every unconfigured (dataset, task) pair is diagnosed as such; the
+    alternatives it lists are registry pairs only; and an action appears only
+    when the (synthetic) readiness reports a runnable model for that pair.
+    """
+    problems: list[str] = []
+    configured = alternatives_module.configured_triples()
+    pairs = {(d, t) for d, t, _ in configured}
+    datasets = sorted({d for d, _ in pairs})
+    tasks = sorted({t for _, t in pairs})
+
+    def nothing_runs(dataset: str, task: str) -> dict[str, Any]:
+        return {"dataset": dataset, "task": task, "dataset_status": "READY", "runnable_models": []}
+
+    def registry_runs(dataset: str, task: str) -> dict[str, Any]:
+        models = sorted({m for d, t, m in configured if d == dataset and t == task})
+        return {"dataset": dataset, "task": task, "dataset_status": "READY",
+                "runnable_models": [{"model": m, "model_display": m} for m in models]}
+
+    for dataset in datasets:
+        for task in tasks:
+            if (dataset, task) in pairs:
+                continue
+            for readiness in (nothing_runs, registry_runs):
+                result = alternatives_module.build_workflow_alternatives(
+                    {**nothing_runs(dataset, task), "blocked_models": []},
+                    configured=configured, context_for=readiness,
+                )
+                where = f"{dataset}/{task} ({readiness.__name__})"
+                if result["diagnosis"]["code"] != alternatives_module.NO_CONFIGURATION:
+                    problems.append(f"alternatives: {where} not diagnosed as unconfigured")
+                listed = {(e["dataset"], e["task"]) for e in
+                          result["same_task_other_datasets"] + result["same_dataset_other_tasks"]}
+                if not listed <= pairs:
+                    problems.append(f"alternatives: {where} lists unconfigured pairs {sorted(listed - pairs)}")
+                offered = {(a["dataset"], a["task"]) for a in result["actions"]}
+                if (dataset, task) in offered or not offered <= pairs:
+                    problems.append(f"alternatives: {where} offers an unconfigured action {sorted(offered)}")
+                if readiness is nothing_runs and offered:
+                    problems.append(f"alternatives: {where} offers actions although nothing is runnable")
+    return problems
+
+
 def check(output_dir: Path | None = None) -> CheckResult:
     """Establish that the LLM's menu is derived from the backend and binding."""
     try:
+        from batteryml_web.agent import alternatives as alternatives_module
         from batteryml_web.agent import catalog as catalog_module
         from batteryml_web.agent import llm_intent as intent_module
         from batteryml_web.agent import recommendation as presentation_module
@@ -325,6 +376,7 @@ def check(output_dir: Path | None = None) -> CheckResult:
     problems.extend(_rejection_problems(catalog, intent_module))
     problems.extend(_isolation_problems(intent_module))
     problems.extend(_presentation_problems(presentation_module))
+    problems.extend(_alternatives_problems(alternatives_module))
 
     evidence: dict[str, Any] = {
         "dataset_count": len(catalog.get("datasets", [])),
@@ -359,7 +411,9 @@ def check(output_dir: Path | None = None) -> CheckResult:
         "config path, and every alias folds back onto its own key. An invented dataset, "
         "task, model or config path is rejected and recorded, the intent layer neither "
         "plans nor executes, and the request-aware model view names no model of its own, "
-        "caps the primary list and never makes a blocked model selectable.",
+        "caps the primary list and never makes a blocked model selectable. Alternatives for an "
+        "unrunnable request name only registry-configured pairs and offer an action only "
+        "where a model is runnable.",
         evidence,
         artifacts,
     )

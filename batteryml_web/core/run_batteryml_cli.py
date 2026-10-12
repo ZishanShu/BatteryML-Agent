@@ -2,6 +2,8 @@ import runpy
 import sys
 from pathlib import Path
 
+import requests
+
 
 def main():
     repo_root = Path(__file__).resolve().parents[2]
@@ -51,6 +53,18 @@ def main():
         # through runpy would only bury it.
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1)
+    except requests.exceptions.RequestException as exc:
+        # A network failure outside the safe downloader (download failures are
+        # reported above as DownloadError). Name the host this request used —
+        # never an assumed one — without credentials or query parameters.
+        from batteryml_web.core.safe_download import request_host
+
+        print(
+            f"error: Unable to connect to {request_host(exc) or 'the remote server'}. "
+            "Check Windows firewall/network policy or configure HTTPS_PROXY, then retry.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2) from None
 
 
 if __name__ == "__main__":

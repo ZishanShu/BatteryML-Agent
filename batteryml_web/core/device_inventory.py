@@ -327,6 +327,104 @@ def _display_mib(value: Any) -> str:
 #: Device strings BatteryML can actually be given. ``bin/batteryml.py run
 #: --device`` is forwarded unchanged to ``DataBundle.to(device)`` and
 #: ``model.to(device)``, both of which take exactly one torch device.
+#: Each GPU's compute capability, read the same way as the inventory (argv,
+#: ``shell=False``, no torch, no CUDA context). ``compute_cap`` needs a recent
+#: driver; an older one rejects the field, and the answer is then "unknown".
+COMPUTE_CAP_ARGV: tuple[str, ...] = (
+    "nvidia-smi",
+    "--query-gpu=index,name,compute_cap",
+    "--format=csv,noheader,nounits",
+)
+
+#: The first CUDA toolkit able to build kernels for each GPU generation (major
+#: compute capability), from NVIDIA's CUDA release notes: Ampere 8.x → 11.0,
+#: Hopper 9.0 → 11.8, Blackwell 10.x/12.x → 12.8. Consulted only when PyTorch
+#: cannot list the architectures it was built for (PyTorch < 1.7 has no
+#: ``get_arch_list``); when it can, its own list decides.
+MIN_CUDA_FOR_ARCH_MAJOR: Dict[int, tuple[int, int]] = {8: (11, 0), 9: (11, 8), 10: (12, 8), 12: (12, 8)}
+
+
+def parse_compute_capabilities(text: str) -> List[Dict[str, Any]]:
+    """``[{"index", "name", "capability": (major, minor)}]`` from :data:`COMPUTE_CAP_ARGV`.
+
+    Raises:
+        ValueError: a row is malformed; the message quotes it.
+    """
+    rows: List[Dict[str, Any]] = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = [part.strip() for part in line.rsplit(",", 1)]
+        head = [part.strip() for part in parts[0].split(",", 1)]
+        if len(parts) != 2 or len(head) != 2:
+            raise ValueError(f"nvidia-smi compute_cap line is malformed: {line!r}.")
+        match = re.fullmatch(r"(\d+)\.(\d+)", parts[1])
+        if not match or not head[0].isdigit():
+            raise ValueError(f"nvidia-smi compute_cap line is malformed: {line!r}.")
+        rows.append({"index": int(head[0]), "name": head[1],
+                     "capability": (int(match.group(1)), int(match.group(2)))})
+    return rows
+
+
+def query_compute_capabilities(
+    *,
+    timeout: float = QUERY_TIMEOUT_S,
+    runner: Optional[Callable[..., Any]] = None,
+) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    """``(devices, None)``, or ``(None, why)`` when the machine cannot say."""
+    run = runner if runner is not None else subprocess.run
+    argv = list(COMPUTE_CAP_ARGV)
+    try:
+        proc = run(argv, capture_output=True, text=True, timeout=timeout, shell=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"`{' '.join(argv)}` could not run ({type(exc).__name__})."
+    if getattr(proc, "returncode", None) != 0:
+        stderr = str(getattr(proc, "stderr", "") or getattr(proc, "stdout", "") or "").strip()
+        return None, f"`{' '.join(argv)}` exited {getattr(proc, 'returncode', None)}: {stderr[:200] or '(empty)'}"
+    try:
+        return parse_compute_capabilities(str(getattr(proc, "stdout", "") or "")), None
+    except ValueError as exc:
+        return None, str(exc)
+
+
+def gpu_build_incompatibilities(
+    devices: Sequence[Dict[str, Any]],
+    *,
+    arch_list: Optional[Sequence[str]],
+    torch_cuda: Optional[str],
+) -> Optional[List[str]]:
+    """The GPUs this PyTorch build cannot run on, or None when it cannot be decided.
+
+    Pure. ``arch_list`` is PyTorch's ``get_arch_list()`` (e.g. ``["sm_37",
+    "sm_75", "compute_75"]``) or None when that PyTorch cannot report it;
+    ``torch_cuda`` is ``torch.version.cuda``. With an architecture list the
+    rule is PyTorch's own (``torch.cuda._check_cubins``): a device works when
+    a compiled ``sm_XY`` shares its major version. Without one, a device
+    whose generation needs a newer CUDA than the build's is incompatible.
+    Returns descriptions such as ``"NVIDIA GeForce RTX 3090 (sm_86)"``.
+    """
+    supported = [int(arch.split("_", 1)[1]) for arch in (arch_list or [])
+                 if str(arch).startswith("sm_") and str(arch).split("_", 1)[1].isdigit()]
+    cuda_version: Optional[tuple[int, int]] = None
+    match = re.match(r"^(\d+)\.(\d+)", str(torch_cuda or ""))
+    if match:
+        cuda_version = (int(match.group(1)), int(match.group(2)))
+    if not supported and cuda_version is None:
+        return None
+    bad: List[str] = []
+    for device in devices:
+        major, minor = device["capability"]
+        if supported:
+            ok = any(sm // 10 == major for sm in supported)
+        else:
+            needed = MIN_CUDA_FOR_ARCH_MAJOR.get(major)
+            ok = needed is None or cuda_version >= needed
+        if not ok:
+            bad.append(f"{device['name']} (sm_{major}{minor})")
+    return bad
+
+
 _DEVICE_RE = re.compile(r"^(cpu|mps|cuda|cuda:\d+)$")
 
 

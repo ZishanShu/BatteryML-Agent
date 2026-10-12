@@ -35,7 +35,7 @@ import json
 import time
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import streamlit as st
 
@@ -75,7 +75,12 @@ from ..agent.streaming import (
     STAGE_FAILED,
     execute_plan_streaming,
 )
-from ..agent.workflow import guide_workflow
+from ..agent.alternatives import (
+    RUNNABLE as ALTERNATIVES_RUNNABLE,
+    alternative_request_text,
+    build_workflow_alternatives,
+)
+from ..agent.workflow import explain_workflow_state
 from ..agent.progress_estimate import (
     EpochTimer,
     progress_line,
@@ -85,6 +90,7 @@ from ..agent.provenance import (
     build_run_context,
     context_rows,
 )
+from ..core import quick_experience
 from ..core.device_inventory import (
     build_device_selection,
     describe_selection,
@@ -114,7 +120,14 @@ from ..core.project_context import (
     resolve_project,
 )
 from .formatting import metric_display
-from .settings_panel import render_configure_in_settings_notice
+from .settings_panel import (
+    REVEAL_ACTION,
+    REVEAL_CONFIGURE,
+    llm_action_allowed,
+    render_configure_in_settings_notice,
+    render_requested_llm_settings,
+    request_llm_settings,
+)
 from .errors import format_details, render_copy_control, render_error
 from .feedback import (
     EVENT_EXPLANATION_READY,
@@ -129,9 +142,15 @@ from ..agent.result_analysis import (
     build_analysis_context,
     render_analysis_markdown,
 )
-from .llm_state import is_llm_configured, llm_credentials, llm_settings_fingerprint
+from .llm_state import (
+    describe_llm_status,
+    is_llm_configured,
+    llm_credentials,
+    llm_settings_fingerprint,
+    set_llm_connection_result,
+)
 from .progress_utils import get_safe_runtime_env
-from .surfaces import PRIMARY_ROLE
+from .surfaces import NAV_ROLE, PRIMARY_ROLE, SECONDARY_ROLE
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -201,6 +220,26 @@ GUIDANCE_REQUEST_KEY = "agent_guidance_request"
 #: The button that asks the assistant to narrate the resolved workflow.
 EXPLAIN_WORKFLOW_LABEL = "Explain this workflow"
 
+#: The deterministic alternatives for the analysed request (agent/alternatives.py).
+ALTERNATIVES_KEY = "agent_alternatives"
+
+#: One-shot: an alternative the user chose, applied before the request box is
+#: drawn on the next run (a widget's key may only be written before it exists).
+ALTERNATIVE_ACTION_KEY = "agent_alternative_action"
+
+#: The workflow explanation and its failure, each stored with the identity of
+#: the workflow it describes. Kept apart from ``agent_explanation``, which is
+#: the explanation of a computed *result* lower on the page.
+WORKFLOW_EXPLANATION_KEY = "agent_workflow_explanation"
+WORKFLOW_EXPLANATION_FAILURE_KEY = "agent_workflow_explanation_failure"
+
+#: Shown under "Explain this workflow" when it is pressed with no connected LLM.
+EXPLAIN_NEEDS_LLM = (
+    "Explaining this workflow needs a connected LLM, and none is connected, so "
+    "nothing was sent. The backend guidance above is complete without one."
+)
+OPEN_LLM_SETTINGS_LABEL = "Open LLM settings"
+
 #: Set when the user pressed an Explain button with nothing configured, so
 #: the page can say where to configure one. It is a note to self, not a
 #: second settings screen.
@@ -268,6 +307,44 @@ def has_runnable_model(context: dict[str, Any]) -> bool:
 def run_is_enabled(plan: dict[str, Any] | None) -> bool:
     """The single gate behind the Run button: the backend planner must allow it."""
     return isinstance(plan, dict) and plan.get("can_execute") is True
+
+
+#: GPU mode with nothing to run on. Blocks Run; the CPU is not substituted.
+NO_GPU_ENUMERATED = (
+    "No CUDA device was enumerated on this machine, so GPU mode cannot run. "
+    "Choose CPU to run on the CPU."
+)
+
+
+def gpu_mode_block(
+    *,
+    mode: str,
+    gpu_options: Sequence[str],
+    chosen_gpu: Optional[str],
+    cuda_status: Tuple[bool, str],
+) -> Optional[str]:
+    """Why the chosen compute mode cannot run here, or None. Pure.
+
+    An enumerated GPU is not necessarily a usable one: ``cuda_status`` is
+    :func:`quick_experience.cuda_available`, which also refuses a GPU the
+    installed PyTorch build was not compiled for. The answer is a reason to
+    block Run — never a reason to switch the run to the CPU.
+    """
+    if mode != "GPU":
+        return None
+    if not gpu_options:
+        return NO_GPU_ENUMERATED
+    ok, detail = cuda_status
+    if chosen_gpu and not ok:
+        return quick_experience.device_problem("cuda", cuda_ok=False, cuda_detail=detail)
+    return None
+
+
+def block_plan(plan: Optional[Dict[str, Any]], reason: Optional[str]) -> Optional[Dict[str, Any]]:
+    """``plan`` marked not executable for ``reason``; unchanged when there is none."""
+    if not reason or not run_is_enabled(plan):
+        return plan
+    return {**plan, "can_execute": False, "reason": reason}
 
 
 def smoke_epochs_value(enabled: bool) -> int | None:
@@ -434,7 +511,9 @@ def _render_intent(resolution: dict[str, Any] | None) -> None:
     """
     if not isinstance(resolution, dict):
         return
-    if resolution.get("source") == "llm":
+    if resolution.get("source") == "alternative":
+        st.caption("Chosen from the backend's available alternatives; no LLM call was made.")
+    elif resolution.get("source") == "llm":
         st.caption("Request interpreted by the LLM, then checked against the platform catalog.")
     elif resolution.get("llm_available"):
         st.caption("Request resolved by the deterministic resolver; no LLM call was needed.")
@@ -526,7 +605,97 @@ def _render_model_presentation(presentation: dict[str, Any]) -> None:
                 )
 
 
-def _render_context(context: dict[str, Any]) -> None:
+def _model_names(entries: list[dict[str, Any]], limit: int = 6) -> str:
+    names = [str(e.get("model_display") or e.get("model")) for e in entries]
+    shown = ", ".join(names[:limit])
+    return shown + (f" and {len(names) - limit} more" if len(names) > limit else "")
+
+
+def _render_alternative_group(title: str, entries: list[dict[str, Any]], empty: str) -> None:
+    st.markdown(f"**{title}**")
+    if not entries:
+        st.caption(empty)
+        return
+    for entry in entries:
+        place = f"{entry['dataset']} · {entry['task']} (data {entry['dataset_status']})"
+        if entry.get("runnable"):
+            st.write(f"- {place}: {_model_names(entry['runnable'])}")
+        else:
+            # Registered but not runnable here: named so the reader knows it
+            # exists, never offered as something to run.
+            st.write(
+                f"- {place}: no runnable model here — registered for "
+                f"{', '.join(entry.get('configured_not_runnable') or []) or 'no model'}, "
+                "not runnable until the dataset is ready and its configuration validates."
+            )
+
+
+def _render_next_steps(context: dict[str, Any], alternatives: dict[str, Any] | None) -> None:
+    """Backend recommended next steps: deterministic, available without an LLM.
+
+    When the request can run as asked this stays the compact disclosure it
+    was. When it cannot, it opens on the diagnosis — dataset readiness and
+    combination availability told apart — and the three kinds of alternative
+    the registry and readiness confirm, with an action for each runnable one.
+    """
+    steps = [str(step) for step in context.get("recommended_next_steps", [])]
+    diagnosis = (alternatives or {}).get("diagnosis") or {}
+    if not isinstance(alternatives, dict) or diagnosis.get("code") in (None, ALTERNATIVES_RUNNABLE):
+        if isinstance(alternatives, dict) and alternatives.get("error"):
+            st.warning(f"Alternatives could not be computed: {alternatives['error']}")
+        if steps:
+            with st.expander("Backend recommended next steps", expanded=False):
+                for step in steps:
+                    st.write(f"- {step}")
+        return
+
+    st.markdown("#### Backend recommended next steps")
+    st.caption(
+        "From the configuration registry and readiness checks; no LLM is involved. "
+        "Only combinations listed with models can run."
+    )
+    st.warning(str(diagnosis.get("message") or ""))
+    requested = alternatives.get("requested") or {}
+    dataset, task = requested.get("dataset"), requested.get("task")
+    same = alternatives.get("same_dataset_task") or []
+    st.markdown(f"**{dataset} · {task}**")
+    if same:
+        st.write(f"- Other runnable models: {_model_names(same)}")
+    else:
+        st.caption(f"No model can run {task} on {dataset} right now.")
+    groups = (
+        (f"{task} on other datasets", alternatives.get("same_task_other_datasets") or [],
+         f"No other dataset has a registered {task} configuration."),
+        (f"Other tasks on {dataset}", alternatives.get("same_dataset_other_tasks") or [],
+         f"No other task has a registered configuration for {dataset}."),
+    )
+    for title, entries, empty in groups:
+        _render_alternative_group(title, entries, empty)
+
+    actions = alternatives.get("actions") or []
+    if actions:
+        columns = st.columns(min(len(actions), 3))
+        for index, action in enumerate(actions):
+            # An explicit choice by the user; it re-analyses, it never runs.
+            if columns[index % len(columns)].button(
+                str(action["label"]),
+                key=f"agent_alternative_{index}",
+                type=SECONDARY_ROLE,
+                use_container_width=True,
+            ):
+                st.session_state[ALTERNATIVE_ACTION_KEY] = dict(action)
+                st.rerun()
+        st.caption(
+            "An action replaces the request above with the one it names and analyzes "
+            "it again. Nothing runs until you press Run."
+        )
+    if steps:
+        with st.expander("Readiness details", expanded=False):
+            for step in steps:
+                st.write(f"- {step}")
+
+
+def _render_context(context: dict[str, Any], alternatives: dict[str, Any] | None = None) -> None:
     st.subheader("Workflow analysis", anchor=False)
     cols = st.columns(3)
     cols[0].metric("Dataset", str(context.get("dataset") or "Unknown"))
@@ -541,17 +710,14 @@ def _render_context(context: dict[str, Any]) -> None:
     blocked = blocked_model_entries(context)
     st.caption(
         f"{len(runnable)} model(s) runnable, {len(blocked)} blocked for this "
-        "dataset and task."
+        "dataset and task. Dataset readiness describes the data only; a model "
+        "also needs a registered, validated configuration for this dataset and task."
     )
     # Which models to *name* is decided by _render_model_presentation from
     # what the request asked for. Listing every runnable model plus every
     # blocked one here buried the answer under the catalogue.
 
-    steps = [str(step) for step in context.get("recommended_next_steps", [])]
-    if steps:
-        with st.expander("Backend recommended next steps", expanded=False):
-            for step in steps:
-                st.write(f"- {step}")
+    _render_next_steps(context, alternatives)
 
 
 def _gpu_inventory(refresh: bool = False) -> dict[str, Any]:
@@ -1044,15 +1210,83 @@ def _resolve_intent(trimmed: str, catalog: dict[str, Any]) -> dict[str, Any]:
     return resolve_workflow_intent_with_llm(trimmed, catalog=catalog)
 
 
-def _analyze_request(trimmed: str) -> None:
+def _selection_resolution(
+    request_text: str, selection: dict[str, Any], catalog: dict[str, Any]
+) -> dict[str, Any]:
+    """The resolution of an alternative the user chose: exactly that choice.
+
+    Shaped like the resolver's answer (it is the deterministic resolver's
+    answer for the request text, with the chosen dataset, task and model
+    written in), so everything downstream treats it the same way. No LLM.
+    """
+    resolution = dict(resolve_workflow_intent_with_llm(request_text, catalog=catalog))
+    model = selection.get("model")
+    resolution.update(
+        {
+            "source": "alternative",
+            "dataset": str(selection["dataset"]),
+            "task": str(selection["task"]),
+            "requested_model": str(model) if model else None,
+            "requested_model_name": None,
+            "needs_clarification": False,
+            "clarification_question": None,
+            "suggested_model_keys": [],
+            "rejected": [],
+            "warnings": [],
+            "user_facing_rationale": (
+                f"Selected alternative: {selection['dataset']} · {selection['task']}"
+                + (f" with {selection.get('model_display') or model}" if model else "")
+                + "."
+            ),
+        }
+    )
+    return resolution
+
+
+def _compute_alternatives(
+    context: dict[str, Any], model_request: dict[str, Any]
+) -> dict[str, Any]:
+    """Deterministic alternatives, through this page's own context builder."""
+    try:
+        return build_workflow_alternatives(
+            context,
+            model_request=model_request,
+            context_for=lambda dataset, task: build_agent_workflow_context(dataset, task),
+        )
+    except Exception as exc:  # noqa: BLE001 - said on the page, analysis stands
+        return {"error": f"{type(exc).__name__}: {redact(str(exc))}"}
+
+
+def _apply_alternative(action: dict[str, Any]) -> None:
+    """Make a chosen alternative the request, visibly, and analyse it again.
+
+    Runs before the request box is drawn, so the box shows the new request.
+    Never builds a run: the page plans only once a runnable model is chosen,
+    and runs only on the explicit Run button.
+    """
+    text = alternative_request_text(action, action.get("model_display"))
+    st.session_state[REQUEST_WIDGET_KEY] = text
+    _analyze_request(text, selection=action)
+
+
+def _analyze_request(trimmed: str, *, selection: dict[str, Any] | None = None) -> None:
     """Resolve one request through the backend and store the result.
 
-    Analysis only: it resolves intent, reads readiness and builds the compact
-    workflow context, and optionally asks the LLM to explain it. Nothing is
-    executed here — execution needs the explicit Run button below.
+    Analysis only: it resolves intent, reads readiness, builds the compact
+    workflow context and the deterministic alternatives. Nothing is executed
+    here — execution needs the explicit Run button below. ``selection`` is an
+    alternative the user chose (dataset, task, optional model), resolved as
+    exactly that rather than re-read from text.
     """
     st.session_state[REQUEST_STATE_KEY] = trimmed
+    # A new subject: no configuration chosen for the previous one survives.
+    for key in [k for k in st.session_state if str(k).startswith("agent_config_choice_")]:
+        st.session_state.pop(key, None)
     for key in (
+        "agent_selected_config",
+        ALTERNATIVES_KEY,
+        WORKFLOW_EXPLANATION_KEY,
+        WORKFLOW_EXPLANATION_FAILURE_KEY,
         "agent_selected_model",
         "agent_execution_plan",
         "agent_execution_result",
@@ -1087,7 +1321,11 @@ def _analyze_request(trimmed: str) -> None:
     # Built once: it scans the config registry and the dataset directories,
     # and both the resolver and the model-request check need the same menu.
     catalog = build_intent_catalog()
-    resolution = _resolve_intent(trimmed, catalog)
+    resolution = (
+        _selection_resolution(trimmed, selection, catalog)
+        if isinstance(selection, dict)
+        else _resolve_intent(trimmed, catalog)
+    )
     _store_json_state("agent_intent", resolution)
 
     if not resolution.get("dataset") or not resolution.get("task"):
@@ -1112,6 +1350,7 @@ def _analyze_request(trimmed: str) -> None:
     _store_json_state("agent_model_request", model_request)
     if model_request.get("status") == "runnable" and model_request.get("model_key"):
         st.session_state["agent_selected_model"] = str(model_request["model_key"])
+    _store_json_state(ALTERNATIVES_KEY, _compute_alternatives(context, model_request))
 
     _store_json_state(
         "agent_suggestions",
@@ -1132,27 +1371,121 @@ def _analyze_request(trimmed: str) -> None:
     st.session_state[GUIDANCE_REQUEST_KEY] = trimmed
 
 
-def _explain_workflow(request_text: str) -> None:
-    """Ask the assistant to narrate the resolved workflow. Button-only.
+def workflow_identity(session_state: Any) -> str:
+    """The workflow on screen: request, dataset, task, requested model, status.
 
-    Uses the same shared client and the same store as every other LLM call
-    on the site; nothing here reads a form or builds a client of its own.
+    An explanation is stored with this and shown only while it still matches,
+    so an explanation of one request never appears under another.
     """
+    context = session_state.get("agent_workflow_context") or {}
+    model_request = session_state.get("agent_model_request") or {}
+    return json.dumps(
+        [
+            str(session_state.get(GUIDANCE_REQUEST_KEY) or ""),
+            context.get("dataset"),
+            context.get("task"),
+            context.get("dataset_status"),
+            model_request.get("requested"),
+            model_request.get("model_key"),
+        ],
+        sort_keys=True,
+    )
+
+
+def _explain_workflow(request_text: str) -> None:
+    """Ask the shared LLM to explain the workflow on screen. Button-only.
+
+    The prompt is built from what the page shows — its resolved context, the
+    requested model's status and the deterministic alternatives — so a
+    workflow that cannot run is explained too, as an explanation and never as
+    a plan. Same shared client and store as every other LLM call on the site.
+    """
+    identity = workflow_identity(st.session_state)
     try:
-        guidance = guide_workflow(request_text, **llm_credentials())
-        st.session_state.pop("agent_explanation_failure", None)
-        st.session_state["agent_explanation"] = str(guidance.get("guidance") or "")
-        st.session_state["agent_explanation_settings"] = llm_settings_fingerprint()
-        st.session_state["agent_explanation_serial"] = (
-            int(st.session_state.get("agent_explanation_serial", 0)) + 1
+        answer = explain_workflow_state(
+            request_text,
+            st.session_state.get("agent_workflow_context") or {},
+            model_request=st.session_state.get("agent_model_request"),
+            alternatives=st.session_state.get(ALTERNATIVES_KEY),
+            **llm_credentials(),
         )
+        st.session_state.pop(WORKFLOW_EXPLANATION_FAILURE_KEY, None)
+        st.session_state[WORKFLOW_EXPLANATION_KEY] = {
+            "text": str(answer.get("guidance") or ""),
+            "identity": identity,
+            "settings": llm_settings_fingerprint(),
+        }
+        set_llm_connection_result(True, "LLM request completed.")
     except Exception as exc:  # noqa: BLE001 - reported, never escalated
-        # The deterministic resolution above stands: it came from the
-        # backend catalog and the readiness check, not from the assistant.
-        st.session_state["agent_explanation_failure"] = classify_llm_failure(
-            exc, configured=is_llm_configured()
+        # The deterministic analysis above stands: it came from the backend
+        # catalog and the readiness check, not from the assistant.
+        finding = classify_llm_failure(exc, configured=is_llm_configured())
+        st.session_state[WORKFLOW_EXPLANATION_FAILURE_KEY] = {**finding, "identity": identity}
+        st.session_state.pop(WORKFLOW_EXPLANATION_KEY, None)
+        set_llm_connection_result(False, str(finding.get("short_title") or "LLM request failed."))
+
+
+def _render_workflow_explanation() -> None:
+    """The Explain button, and its outcome directly beneath it.
+
+    Measured before this: a click stored the text, and it was drawn at the
+    bottom of the page in a closed expander — 34 elements below the button,
+    after the model list and the "cannot be executed" notice — with no
+    progress shown while the LLM worked. With no LLM, the only response was
+    a grey caption. Now: a spinner while it works, the text or a redacted
+    error right below the button, and without a connected LLM a plain
+    statement and the shared settings.
+    """
+    guidance_request = st.session_state.get(GUIDANCE_REQUEST_KEY)
+    if not guidance_request:
+        return
+    identity = workflow_identity(st.session_state)
+    st.caption(
+        "Optional: an LLM explanation of these choices, their limits and the next "
+        "steps. It cannot select, configure or run anything."
+    )
+    if st.button(
+        EXPLAIN_WORKFLOW_LABEL,
+        key="agent_explain_workflow",
+        type=SECONDARY_ROLE,
+        use_container_width=True,
+    ):
+        if llm_action_allowed():
+            st.session_state.pop(NEEDS_CONFIGURATION_KEY, None)
+            with st.spinner("Asking the connected LLM to explain this workflow…"):
+                _explain_workflow(str(guidance_request))
+        else:
+            st.session_state[NEEDS_CONFIGURATION_KEY] = True
+            request_llm_settings(REVEAL_ACTION)
+
+    if st.session_state.get(NEEDS_CONFIGURATION_KEY) and not llm_action_allowed():
+        st.info(f"{EXPLAIN_NEEDS_LLM} LLM assistant status: {describe_llm_status()}.")
+        if st.button(OPEN_LLM_SETTINGS_LABEL, key="agent_open_llm_settings", type=NAV_ROLE):
+            request_llm_settings(REVEAL_CONFIGURE)
+
+    failure = st.session_state.get(WORKFLOW_EXPLANATION_FAILURE_KEY)
+    if isinstance(failure, dict) and failure.get("identity") == identity:
+        st.warning(
+            "The explanation could not be generated. "
+            f"{failure.get('short_title')} {failure.get('user_message')}"
         )
-        st.session_state.pop("agent_explanation", None)
+        if failure.get("recommended_action"):
+            st.caption(str(failure["recommended_action"]))
+        st.caption("The backend analysis above is unaffected. Nothing is retried automatically.")
+
+    stored = st.session_state.get(WORKFLOW_EXPLANATION_KEY)
+    if isinstance(stored, dict):
+        if stored.get("identity") != identity:
+            # Written for a workflow no longer on screen.
+            st.session_state.pop(WORKFLOW_EXPLANATION_KEY, None)
+        else:
+            with st.container(border=True):
+                note = "LLM explanation — explanatory only; the backend analysis above is authoritative."
+                if stored.get("settings") and stored.get("settings") != llm_settings_fingerprint():
+                    note += " Generated with an earlier LLM configuration."
+                st.caption(note)
+                st.markdown(str(stored.get("text") or ""))
+    render_requested_llm_settings()
 
 
 def request_template() -> str:
@@ -1712,6 +2045,11 @@ def render_agent_workflow() -> None:
     pending = st.session_state.pop("agent_pending_request", None)
     if isinstance(pending, str) and pending.strip():
         _analyze_request(pending.strip())
+    # An alternative chosen on the previous run, applied before the request
+    # box exists so the box can show the new request.
+    chosen = st.session_state.pop(ALTERNATIVE_ACTION_KEY, None)
+    if isinstance(chosen, dict) and chosen.get("dataset") and chosen.get("task"):
+        _apply_alternative(chosen)
 
     # One request control. The suggestion is grey placeholder text while the
     # field is empty: it is a hint, not the user's request, and nothing is
@@ -1779,27 +2117,13 @@ def render_agent_workflow() -> None:
         return
 
     _render_intent(st.session_state.get("agent_intent"))
-    _render_context(context)
+    _render_context(context, st.session_state.get(ALTERNATIVES_KEY))
 
     # The workflow narration Analyze used to produce on its own. It is a
     # button now, for the reason the whole step exists: a page that renders
     # must not spend an API call, and an explanation nobody asked for is a
     # call nobody asked for.
-    guidance_request = st.session_state.get(GUIDANCE_REQUEST_KEY)
-    if guidance_request:
-        if st.button(
-            EXPLAIN_WORKFLOW_LABEL,
-            key="agent_explain_workflow",
-            use_container_width=True,
-        ):
-            if is_llm_configured():
-                _explain_workflow(str(guidance_request))
-                st.rerun()
-            else:
-                st.session_state[NEEDS_CONFIGURATION_KEY] = True
-                st.rerun()
-        if st.session_state.get(NEEDS_CONFIGURATION_KEY) and not is_llm_configured():
-            render_configure_in_settings_notice()
+    _render_workflow_explanation()
 
     presentation = build_model_presentation(
         resolution=st.session_state.get("agent_intent"),
@@ -1876,12 +2200,6 @@ def render_agent_workflow() -> None:
             label_visibility="collapsed",
             key=f"agent_compute_mode_{selected_key}_{int(bool(smoke))}",
         )
-        if mode == "GPU" and not gpu_options:
-            st.warning(
-                "No CUDA device was enumerated on this machine, so GPU mode is "
-                "unavailable. Runs will use the CPU."
-            )
-            mode = "CPU"
 
         chosen_gpu: str | None = None
         if mode == "GPU":
@@ -1904,6 +2222,17 @@ def render_agent_workflow() -> None:
         # The readable form for the provenance block ("CPU", "GPU 3"), which
         # is separate from the executable --device string below.
         device_label_text = describe_selection(selection)
+
+        # Why GPU mode cannot run here, if it cannot. It blocks Run; the CPU
+        # is never substituted for an explicit GPU choice (EXEC-09).
+        gpu_block = gpu_mode_block(
+            mode=mode,
+            gpu_options=gpu_options,
+            chosen_gpu=chosen_gpu,
+            cuda_status=quick_experience.cuda_available() if chosen_gpu else (True, ""),
+        )
+        if gpu_block:
+            st.warning(gpu_block)
 
         if chosen_gpu:
             # One compact line. A warning box only when the figure deserves
@@ -1999,6 +2328,7 @@ def render_agent_workflow() -> None:
                 # refuses anything outside them.
                 config_path=explicit_config,
             )
+            plan = block_plan(plan, gpu_block)
             _store_json_state("agent_execution_plan", plan)
             run_context = build_run_context(
                 project=project,

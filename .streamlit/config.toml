@@ -21,3 +21,12 @@ showErrorDetails = true
 
 [browser]
 gatherUsageStats = false
+
+# The mentor's palette for Streamlit's own widgets. Without it, the active
+# tab underline, the selected radio dot, toggles and focus rings were drawn
+# in Streamlit's default red beside the cobalt actions of
+# batteryml_web/ui/home_style.py. primaryColor is that sheet's --bml-blue;
+# base = "light" because the design (canvas, ink headings) is a light one.
+[theme]
+base = "light"
+primaryColor = "#287bf5"

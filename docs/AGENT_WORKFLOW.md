@@ -55,7 +55,7 @@ them holding:
 | `batteryml_web/agent/provenance.py` | the run's own account of itself, read from the plan's argv | invent a field the plan does not carry |
 | `batteryml_web/agent/progress_estimate.py` | an ETA, once the run has earned one | assume a rate, or guess before two intervals are timed |
 | `batteryml_web/ui/formatting.py` | metrics at reading scale | change the stored value |
-| `batteryml_web/ui/settings_panel.py` | the LLM settings form, in the sidebar and wherever it is needed | display, log or persist the API key |
+| `batteryml_web/ui/settings_panel.py` | the LLM settings form, in the sidebar and in the Settings dialog a page opens (Configure LLM, Summarize/Explain without a connection, once after viewing a completed run's results with nothing configured — `UI-14`) | display, log or persist the API key |
 | `batteryml_web/ui/agent_workflow.py` | rendering all of the above | any of the above |
 
 ## Two entry points
@@ -417,3 +417,29 @@ message is for. Confirm that the page says CUDA out of memory on the device
 you picked, offers CPU and any GPU with more free memory, states that
 nothing was retried, and still shows the full traceback in the debug
 expander.
+
+## When a request cannot run (UI-15, UI-16)
+
+"Dataset READY" describes the data only. Whether *dataset + task + model*
+can run also needs a registered run configuration that passes readiness and
+validation. When the analysed combination cannot run, **Backend recommended
+next steps** (deterministic, no LLM) says why and lists, from the
+configuration registry and readiness only:
+
+1. other runnable models for the same dataset and task;
+2. the same task on other datasets (registered pairs only; a dataset that is
+   not READY is named but never offered);
+3. other tasks on the same dataset.
+
+Each runnable alternative has an action that rewrites the request and
+re-analyses it; nothing runs until **Run**. Example, with the registry in
+this repository: `Use ElasticNet on HUST to predict soh.` → HUST has no
+registered SOH estimation configuration; SOH estimation is registered for
+MATR only (Elastic Net, Lasso, Random Forest, Ridge, XGBoost), offered when
+MATR is READY; RUL prediction is registered for HUST.
+
+**Explain this workflow** is the optional LLM explanation of the same
+facts. It needs a connected LLM (shared settings), sends one request per
+click, shows the answer directly beneath the button and may explain a
+workflow that cannot run — never as a plan to execute.
+

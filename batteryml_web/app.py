@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -12,6 +13,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 import torch
+import yaml
 
 from batteryml_web.agent.failure_taxonomy import classify_llm_failure
 from batteryml_web.agent.result_agent import explain_run_result
@@ -57,6 +59,7 @@ from batteryml_web.ui.feedback import (
     toast,
 )
 from batteryml_web.ui.llm_state import (
+    connection_serial,
     describe_llm_status,
     ensure_llm_state_defaults,
     get_llm_status,
@@ -72,6 +75,11 @@ from batteryml_web.core import direct_runs
 from batteryml_web.core.run_identity import new_run_id
 from batteryml_web.core import run_manifest as rm
 from batteryml_web.core.run_manifest import find_run
+from batteryml_web.core import config_task, config_upload, quick_experience
+from batteryml_web.core.config_semantics import (
+    load_config_semantics,
+    model_display_name,
+)
 from batteryml_web.core.selected_result import (
     SelectedResult,
     cached_for,
@@ -80,16 +88,34 @@ from batteryml_web.core.selected_result import (
 from batteryml_web.ui.run_history import (
     render_file_browser,
     render_predictions_panel,
+    experiment_summary,
     render_run_detail,
     render_run_history,
+    short_run_id,
+    status_badge,
     render_run_location,
 )
-from batteryml_web.ui.settings_panel import render_configure_in_settings_notice
-from batteryml_web.ui.progress_utils import get_safe_runtime_env, run_command_with_progress
+from batteryml_web.ui.settings_panel import (
+    REVEAL_ACTION,
+    REVEAL_CONFIGURE,
+    consume_results_intent,
+    llm_action_allowed,
+    mark_results_intent,
+    render_configure_in_settings_notice,
+    render_requested_llm_settings,
+    request_llm_settings,
+)
+from batteryml_web.ui.home_style import render_home_style, render_site_style
+from batteryml_web.ui.progress_utils import (
+    get_safe_runtime_env,
+    run_command_with_progress,
+    run_data_command_with_progress,
+)
 from batteryml_web.ui.scroll import render_scroll_to_top
 from batteryml_web.ui.surfaces import (
     NAV_ROLE,
     PRIMARY_ROLE,
+    SECONDARY_ROLE,
     command_viewport,
     log_viewport,
     render_info_card,
@@ -104,7 +130,7 @@ from batteryml_web.ui.tab_navigation import (
 )
 from batteryml_web.ui.errors import error_boundary, render_copy_control
 from batteryml_web.ui.workflow_sidebar import NAV_STEPS, get_current_step_index, render_sidebar_workflow, set_current_step
-from batteryml_web.core.readiness import assess_dataset
+from batteryml_web.core.readiness import assess_dataset, list_dataset_readiness
 from batteryml_web.core.config_registry import get_config_registry
 
 st.set_page_config(
@@ -134,10 +160,18 @@ if "project_name" not in st.session_state:
     st.session_state["project_name"] = None
 if "current_project" not in st.session_state:
     st.session_state["current_project"] = None
+if "home_entry_defaulted" not in st.session_state:
+    # Quick experience is the documented first path.  Showing its detail
+    # panel on first load makes the default visible instead of leaving the
+    # highlighted card looking like an unexplained selection.
+    # Applied once per session: "← Choose another start path" clears
+    # home_entry, and re-defaulting it on every rerun made that button a no-op.
+    st.session_state.setdefault("home_entry", "quick")
+    st.session_state["home_entry_defaulted"] = True
 if "selected_dataset" not in st.session_state:
     st.session_state["selected_dataset"] = "MATR"
 if "selected_task" not in st.session_state:
-    st.session_state["selected_task"] = "RUL"
+    st.session_state["selected_task"] = config_task.TASK_RUL
 if "selected_model" not in st.session_state:
     st.session_state["selected_model"] = "XGBoost"
 if "selected_config" not in st.session_state:
@@ -450,6 +484,82 @@ def _run_cmd(command: list[str], cwd: Path | None = None) -> dict[str, Any]:
     return {"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "elapsed": elapsed}
 
 
+def _batteryml_cli_command(*args: object) -> list[str]:
+    """Build a CLI command that works from the Windows local checkout."""
+    return [
+        sys.executable,
+        str(REPO_ROOT / "batteryml_web" / "core" / "run_batteryml_cli.py"),
+        *(str(arg) for arg in args),
+    ]
+
+
+def _batteryml_downloadable_datasets() -> tuple[str, ...]:
+    """Return public datasets supported by BatteryML's download command."""
+    try:
+        from batteryml.preprocess import DOWNLOAD_LINKS, is_download_complete
+
+        return tuple(sorted(str(name) for name in DOWNLOAD_LINKS))
+    except Exception:  # noqa: BLE001 - keep the page usable if optional imports fail
+        return ("MATR",)
+
+
+def _raw_download_progress(dataset: str, raw_path: Path) -> tuple[int, int, bool]:
+    """Return ``(present, expected, complete)`` for a public raw download.
+
+    Readiness deliberately treats a non-empty native directory as raw data so
+    backend callers can report partial downloads.  The Quick controls need a
+    slightly stricter answer: MATR is made of four named files, and a zero
+    byte or missing file means Download must remain available so the user can
+    finish the download before starting preprocessing.
+    """
+    try:
+        from batteryml.preprocess import DOWNLOAD_LINKS, is_download_complete
+
+        links = DOWNLOAD_LINKS.get(str(dataset).upper())
+    except Exception:  # noqa: BLE001 - retain a usable UI if optional imports fail
+        links = None
+
+    if not links:
+        files = [path for path in raw_path.rglob("*") if path.is_file()] if raw_path.is_dir() else []
+        present = sum(1 for path in files if path.stat().st_size > 0)
+        return present, present, bool(files and present == len(files))
+
+    expected_names = []
+    for item in links:
+        try:
+            expected_names.append(str(item[1]))
+        except (IndexError, TypeError):
+            continue
+    if not expected_names:
+        return 0, 0, False
+
+    present = sum(
+        1
+        for name in expected_names
+        if is_download_complete(raw_path / name)
+    )
+    return present, len(expected_names), present == len(expected_names)
+
+
+def _refresh_data_manifests() -> tuple[bool, str]:
+    """Refresh the local dataset/config catalog after a data action; ``(ok, detail)``."""
+    return quick_experience.sync_manifests(REPO_ROOT, python=sys.executable, run=_run_cmd)
+
+
+def _data_action_root() -> Path:
+    """The selected project, or — with none selected — the default project.
+
+    The same resolution Run Model and Review Results use (``resolve_project``),
+    so a Quick experience run made without a project is listed by Review
+    Results in any later session. It used to fall back to
+    ``runs/web_projects/quick_experience``, a folder no other page looked in:
+    a fresh session's Review Results opened on the empty default project and
+    said "No run is selected" (server acceptance, PR #13).
+    """
+    root = _project_root() or (REPO_ROOT / _project_for_runs()["root"])
+    return root if root.is_absolute() else REPO_ROOT / root
+
+
 def _collect_run_outputs(project_root: Path, config_path: Path, log_path: Path, workspace_dir: Path) -> None:
     project_root.mkdir(parents=True, exist_ok=True)
     (project_root / "project_state.json").write_text(json.dumps({"project_name": project_root.name, "workspace_dir": str(workspace_dir)}, indent=2), encoding="utf-8")
@@ -476,6 +586,10 @@ def _collect_run_outputs(project_root: Path, config_path: Path, log_path: Path, 
 
 #: Session key for the run id the Run Model page shows before Run is pressed.
 RUN_MODEL_RESERVED_ID_KEY = "run_model_reserved_run"
+#: The Task the user last chose on Run Model. A plain key, not the radio's:
+#: Streamlit drops a widget's state while another page is shown, and Home's
+#: Quick panel rewrites ``selected_task`` on every render it draws.
+RUN_MODEL_TASK_KEY = "run_model_task"
 
 
 def _project_for_runs() -> dict[str, Any]:
@@ -737,96 +851,770 @@ def render_home_agent_entry() -> None:
             set_current_step("agent_workflow")
 
 
+def _render_home_create_project_panel() -> None:
+    """Render the isolated new-project panel used by the Home tab."""
+    st.subheader("Create New Project", anchor=False)
+    st.caption("Create a workspace first. You can adjust data and model settings in the next steps.")
+    project_name = st.text_input(
+        "Project name",
+        value=st.session_state.get("project_name") or "my_battery_project",
+        key="home_project_name",
+    )
+    base_dir = st.text_input(
+        "Projects base directory",
+        value=str(DEFAULT_BASE_DIR),
+        key="home_base_dir",
+    )
+    project_folder = Path(base_dir) / (project_name.strip() or "my_battery_project")
+    st.caption("Project folder")
+    st.code(str(project_folder), language="text")
+    if st.button("Create project and continue", type=PRIMARY_ROLE, use_container_width=True, key="home_create_project"):
+        created = _ensure_project(project_name, base_dir)
+        st.session_state["project_created_notice"] = {
+            "name": created.name,
+            "workspace": created.as_posix(),
+            "action": "created",
+        }
+        st.rerun()
+    _render_project_created_notice()
+    _render_home_entry_workflow("create")
+
+
+def _render_home_existing_project_panel(projects: list[str]) -> None:
+    """Render the isolated existing-project panel used by the Home tab."""
+    st.subheader("Continue Existing Project", anchor=False)
+    st.caption("Select a saved workspace to resume its latest data, run, or result state.")
+    if projects:
+        selected = st.selectbox("Select existing project", options=projects, key="home_existing_project")
+        folder = DEFAULT_BASE_DIR / selected
+        st.caption("Project folder")
+        st.code(str(folder), language="text")
+        if st.button("Load project and continue", type=PRIMARY_ROLE, use_container_width=True, key="home_load_project"):
+            st.session_state["project_root"] = str(folder)
+            st.session_state["project_name"] = selected
+            st.session_state["current_project"] = selected
+            st.session_state["project_created_notice"] = {
+                "name": selected,
+                "workspace": folder.as_posix(),
+                "action": "loaded",
+            }
+            for key in (
+                "agent_execution_plan",
+                "agent_execution_result",
+                "agent_result_context",
+                "agent_run_context",
+                "agent_run_signature",
+                "agent_result_error",
+                "agent_has_executed",
+            ):
+                st.session_state.pop(key, None)
+            st.rerun()
+    else:
+        st.info("No existing project found yet. Create a project first, then it will appear here.")
+        st.caption("Project folder")
+        st.code("runs/web_projects/<project_name>", language="text")
+    _render_home_entry_workflow("existing")
+
+
+def _home_resolve_path(value: str | Path) -> Path:
+    """Resolve a project-relative or repository-relative path for the UI."""
+    path = Path(value)
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
+def _home_display_path(value: str | Path) -> str:
+    path = _home_resolve_path(value)
+    try:
+        return path.relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _quick_readiness(dataset: str) -> dict[str, Any]:
+    """Read one dataset's real local state for the guided home flow."""
+    return assess_dataset(
+        dataset,
+        raw_root=REPO_ROOT / "data" / "raw",
+        processed_root=REPO_ROOT / "data" / "processed",
+    ).to_dict()
+
+
+def _quick_config_entries(dataset: str, task: str) -> list[Any]:
+    try:
+        return get_config_registry(str(REPO_ROOT)).get_entries(dataset, task)
+    except Exception:  # noqa: BLE001 - an empty selector is safer than a crash
+        return []
+
+
+def _quick_default_dataset() -> str:
+    """The dataset of the page's default protocol (``QUICKSTART_CONFIG``): MATR."""
+    dataset = load_config_semantics(_home_resolve_path(QUICKSTART_CONFIG)).dataset
+    if not dataset:
+        raise ValueError(f"{QUICKSTART_CONFIG} names no dataset; Quick experience has no default.")
+    return str(dataset)
+
+
+def _quick_dataset_choices(default: str) -> list[quick_experience.DatasetChoice]:
+    """Every dataset the readiness layer knows, with the tasks the registry can run on it.
+
+    No list of names lives here: the datasets come from
+    ``readiness.list_dataset_readiness`` (platform datasets plus anything on
+    disk) and the runnable tasks from the config registry. A dataset the
+    registry has configs for but readiness did not list is assessed too.
+    """
+    raw_root, processed_root = REPO_ROOT / "data" / "raw", REPO_ROOT / "data" / "processed"
+    statuses = {
+        report.dataset: report.status.value
+        for report in list_dataset_readiness(raw_root=raw_root, processed_root=processed_root)
+    }
+    pairs = [(entry.dataset, entry.task) for entry in get_config_registry(str(REPO_ROOT)).entries]
+    for name in sorted({str(dataset) for dataset, _task in pairs if dataset} - set(statuses)):
+        statuses[name] = assess_dataset(name, raw_root=raw_root, processed_root=processed_root).status.value
+    return quick_experience.dataset_choices(statuses, pairs, default=default)
+
+
+def _md_text(text: Any) -> str:
+    """``text`` safe inside Streamlit markdown: ``*.pkl`` stays literal, ``$`` is not maths."""
+    return re.sub(r"([\\`*_$\[\]])", r"\\\1", str(text))
+
+
+def _quick_failure_reason(result: dict[str, Any], *, dataset: str) -> str:
+    """Turn a command result into a concise, specific result-page message."""
+    code = result.get("return_code")
+    tail = str(result.get("output_tail") or "").strip()
+    lower_tail = tail.lower()
+    if "truncated file" in lower_tail or "incomplete or corrupt" in lower_tail:
+        return (
+            f"{dataset} 原始文件不完整或已损坏。请删除日志中指出的文件，"
+            "重新下载并保持文件名不变，然后再次处理。"
+        )
+    # The host the failing download itself named — never an assumed one.
+    failed_host = quick_experience.download_failure_host(tail)
+    if failed_host and any(
+        marker in lower_tail
+        for marker in ("connectionerror", "winerror 10013", "max retries", "unable to connect")
+    ):
+        return (
+            f"无法连接 {failed_host}。请检查 Windows 防火墙/网络策略，"
+            "或配置 HTTPS_PROXY 后重试；未完成的临时文件已清理。"
+        )
+    lines = [line.strip() for line in tail.splitlines() if line.strip()]
+    detail = " ".join(lines[-3:])
+    if detail:
+        return f"BatteryML exited with code {code}. {detail}"
+    return f"BatteryML exited with code {code}. See the run log for details."
+
+
+def _run_home_data_action(
+    *,
+    dataset: str,
+    action: str,
+    raw_path: Path,
+    processed_path: Path,
+    progress_host: Any,
+) -> dict[str, Any]:
+    """Run the official BatteryML data command and persist its local log."""
+    workspace = _data_action_root()
+    command = (
+        _batteryml_cli_command("download", dataset, str(raw_path))
+        if action == "download"
+        else _batteryml_cli_command("preprocess", dataset, str(raw_path), str(processed_path))
+    )
+    log_path = workspace / "logs" / f"{action}_{dataset.lower()}.log"
+    return run_data_command_with_progress(
+        command=command,
+        cwd=REPO_ROOT,
+        log_path=log_path,
+        steps=[
+            (5, "Initialize data action"),
+            (20, "Check local paths"),
+            (55, "Run BatteryML command"),
+            (90, "Write data outputs"),
+            (100, "Data action completed"),
+        ],
+        container=progress_host,
+    )
+
+
+def _run_home_experiment(
+    *,
+    project_root: Path | None,
+    plan: quick_experience.QuickPlan,
+    demo_progress_host: Any,
+) -> tuple[dict[str, Any], Path, Path, str]:
+    """Run Quick experience once, recorded exactly like every other page run.
+
+    ``plan`` is the validated selection (``quick_experience.build_quick_plan``,
+    re-checked by the caller immediately before this call); an invalid plan is
+    refused here as well, so nothing unvalidated can start.
+
+    The run gets its own folder, ``<project>/quickstart/<run_id>/``, which is
+    also BatteryML's ``--workspace`` (``direct_runs``), so its run.json sits
+    beside its predictions. RUNNING is written before BatteryML starts, and
+    artifacts and metrics are read afterwards the way Agent Workflow reads
+    them (``_finish_page_run``), so Review Results opens this run like any
+    other. Returns ``(result, run_dir, workspace_dir, run_id)``; the run
+    folder and the workspace are the same directory.
+    """
+    if not plan.valid:
+        raise ValueError("Quick experience refused an invalid plan: " + "; ".join(plan.errors))
+    workspace_root = project_root or _data_action_root()
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    dataset = str(plan.dataset)
+    task = str(plan.task)
+    model_key = str(plan.model_key or "model")
+    config_path = Path(str(plan.config_path))
+    run_id = new_run_id(dataset=dataset, model=model_key, seed=0)
+    run_dir = direct_runs.direct_run_dir(workspace_root, "quickstart", run_id)
+    try:
+        workspace = Path(os.path.relpath(run_dir, REPO_ROOT)).as_posix()
+    except ValueError:  # another drive on Windows: keep the absolute path
+        workspace = run_dir.as_posix()
+    command = quick_experience.plan_command(plan, workspace=workspace, seed=0)
+    _begin_page_run(
+        run_id=run_id,
+        workspace=workspace,
+        project_name=workspace_root.name,
+        dataset=dataset,
+        task=task,
+        model_key=model_key,
+        model_display=plan.model_display,
+        config_path=config_path,
+        seed=0,
+        device=str(plan.device),
+        command=command,
+    )
+    result = run_command_with_progress(
+        command=command,
+        cwd=REPO_ROOT,
+        log_path=run_dir / "run.log",
+        steps=[
+            (5, "Initialize run"),
+            (15, "Check processed data"),
+            (30, "Load configuration"),
+            (45, "Start BatteryML training"),
+            (80, "Training and evaluation"),
+            (95, "Collect outputs"),
+            (100, "Run completed"),
+        ],
+        container=demo_progress_host,
+    )
+    _finish_page_run(
+        run_dir,
+        result,
+        workspace=workspace,
+        dataset=dataset,
+        task=task,
+        model_key=model_key,
+        config_path=config_path,
+    )
+    if not result.get("success"):
+        # The concrete reason the page shows, kept in the run record too.
+        rm.update_manifest(
+            run_dir,
+            {"failure": {"category": "execution_failed",
+                         "message": _quick_failure_reason(result, dataset=dataset)}},
+        )
+    result["command"] = command
+    return result, run_dir, run_dir, run_id
+
+
+def _quick_uploaded_configs() -> list[dict[str, Any]]:
+    """Validated uploads of this session that are still where they were stored."""
+    root = _data_action_root()
+    return [
+        item for item in st.session_state.get("quick_uploaded_configs") or []
+        if config_upload.is_managed_upload(Path(str(item.get("path"))), root)
+    ]
+
+
+def _render_home_entry_workflow(entry: str) -> None:
+    """Give Create and Existing projects the same four-step mental model."""
+    st.markdown("#### Workflow steps")
+    st.caption("Use the same four steps after the workspace is ready. Each step opens the full editor.")
+    steps = (
+        ("1 · Prepare data", "Download, upload, preprocess, and inspect the dataset.", "Open Prepare Data", "prepare_data"),
+        ("2 · Configure model", "Choose the task, prediction model, protocol, and device.", "Open Run Model", "run_model"),
+        ("3 · Run training", "Start a reproducible run and follow the live log.", "Open Run Model", "run_model"),
+        ("4 · Review results", "Inspect metrics, predictions, logs, and artifacts.", "Open Review Results", "review_results"),
+    )
+    for index, (title, description, button_label, target) in enumerate(steps):
+        with st.expander(title, expanded=index == 0):
+            st.caption(description)
+            if st.button(button_label, type=NAV_ROLE, use_container_width=True, key=f"home_{entry}_workflow_{index}"):
+                set_current_step(target)
+
+
+def _render_home_quickstart_panel(project_root: Path | None) -> None:
+    """Render Quick experience as the same four-step guided workflow."""
+    st.subheader("Quick experience", anchor=False)
+    st.caption("A guided local run with MATR as the default dataset. You can edit the configuration before running.")
+
+    default_dataset = _quick_default_dataset()
+    if "quick_dataset" not in st.session_state:
+        st.session_state["quick_dataset"] = default_dataset
+    if "quick_task_selector" not in st.session_state:
+        st.session_state["quick_task_selector"] = "RUL prediction"
+    if "quick_device_selector" not in st.session_state:
+        st.session_state["quick_device_selector"] = "cpu"
+    if "quick_config_selector" not in st.session_state:
+        st.session_state["quick_config_selector"] = str(_home_resolve_path(QUICKSTART_CONFIG))
+    if "quick_model_selector" not in st.session_state:
+        # First visit: the model of the default protocol (MATR · XGBoost), as before.
+        st.session_state["quick_model_selector"] = load_config_semantics(
+            _home_resolve_path(QUICKSTART_CONFIG)
+        ).model_key
+    pending_upload = st.session_state.pop("quick_pending_upload", None)
+    if pending_upload:
+        st.session_state["quick_task_selector"] = pending_upload["task"]
+        st.session_state["quick_model_selector"] = pending_upload["model_key"]
+        st.session_state["quick_config_selector"] = pending_upload["path"]
+        st.session_state["quick_uploaded_notice"] = pending_upload["path"]
+
+    st.markdown("#### 1 · Prepare data")
+    # Every dataset the platform knows is offered (readiness layer), with the
+    # tasks the config registry can run on each; the default protocol's
+    # dataset (MATR) comes first and stays the default. A dataset without a
+    # registered config is listed and explained, never hidden, and nothing is
+    # downloaded, processed or run by selecting one.
+    choices = {choice.name: choice for choice in _quick_dataset_choices(default_dataset)}
+    if st.session_state.get("quick_dataset_selector") not in choices:
+        st.session_state["quick_dataset_selector"] = default_dataset if default_dataset in choices else next(iter(choices))
+    dataset = st.selectbox(
+        "Raw dataset",
+        list(choices),
+        format_func=lambda name: name if choices[name].runnable else f"{name} · no run configuration",
+        key="quick_dataset_selector",
+        help="Quick experience defaults to MATR. Choose the raw dataset before downloading or preprocessing.",
+    )
+    choice = choices[dataset]
+    st.session_state["quick_dataset"] = dataset
+    readiness = _quick_readiness(dataset)
+    raw_path = _home_resolve_path(readiness["raw_path"])
+    processed_path = _home_resolve_path(readiness["processed_path"])
+
+    if dataset == default_dataset:
+        st.caption(f"Quick experience uses **{dataset}** by default. Download raw files first, then create processed records.")
+    else:
+        st.caption(f"Quick experience will use **{dataset}**.")
+    status = str(readiness["status"])
+    downloadable = dataset.upper() in {name.upper() for name in _batteryml_downloadable_datasets()}
+    raw_present = bool(readiness.get("raw_available"))
+    raw_count, raw_expected, raw_complete = _raw_download_progress(dataset, raw_path)
+    raw_ready = raw_present and raw_complete
+    processed_ready = status == quick_experience.STATUS_READY
+    status_cols = st.columns(2, gap="medium")
+    with status_cols[0]:
+        st.markdown("**Raw data**")
+        if raw_ready:
+            st.success("Available")
+        elif raw_present and raw_expected:
+            st.warning(f"Download incomplete ({raw_count}/{raw_expected} files)")
+        else:
+            st.info(f"{dataset} not downloaded yet" if downloadable else "No raw files found")
+        st.caption(_home_display_path(raw_path))
+    with status_cols[1]:
+        st.markdown("**Processed data**")
+        if processed_ready:
+            st.success("Ready")
+        elif status == quick_experience.STATUS_INCOMPLETE:
+            st.warning("Incomplete — no usable processed files")
+        else:
+            st.warning("Needs processing")
+        st.caption(_home_display_path(processed_path))
+    # The readiness layer's own verdict and reason, word for word.
+    st.caption(f"Readiness: **{status}** — {_md_text(readiness['reason'])}")
+
+    limitation = quick_experience.quick_limitation(choice)
+    if limitation:
+        # Data actions for this dataset live in Prepare Data, which handles
+        # every dataset; offering them here would suggest a run follows.
+        st.info(limitation)
+        if st.button("Open Prepare Data", type=NAV_ROLE, key="home_quick_open_prepare"):
+            set_current_step("prepare_data")
+    else:
+        download = quick_experience.download_action(
+            dataset=dataset, downloadable=downloadable, raw_complete=raw_complete,
+            raw_count=raw_count, raw_expected=raw_expected,
+        )
+        process = quick_experience.process_action(
+            status=status, raw_ready=raw_ready,
+            preprocessing_supported=bool(readiness.get("preprocessing_supported")),
+        )
+        data_action_surface = st.container()
+        data_cols = st.columns(2, gap="medium")
+        with data_cols[0]:
+            if download.state == quick_experience.ACTION_COMPLETED:
+                # Done is a fact, not a control: no button is drawn for it.
+                st.caption(f":green[✓] {download.note}")
+            else:
+                download_clicked = st.button(
+                    f"Download {dataset} data",
+                    type=SECONDARY_ROLE,
+                    use_container_width=True,
+                    key="home_quick_download_data",
+                    disabled=download.state != quick_experience.ACTION_AVAILABLE,
+                )
+                if download.note:
+                    st.caption(download.note)
+                if download_clicked:
+                    result = _run_home_data_action(
+                        dataset=dataset,
+                        action="download",
+                        raw_path=raw_path,
+                        processed_path=processed_path,
+                        progress_host=data_action_surface,
+                    )
+                    st.session_state["quick_data_action_error"] = None if result["success"] else _quick_failure_reason(result, dataset=dataset)
+                    if result["success"]:
+                        synced, sync_detail = _refresh_data_manifests()
+                        st.session_state["quick_manifest_sync_error"] = None if synced else sync_detail
+                        notify_success("Raw data downloaded", event_key=EVENT_PREPROCESS_DONE, signature=[dataset, "download"])
+                        st.rerun()
+        with data_cols[1]:
+            if process.state == quick_experience.ACTION_COMPLETED:
+                st.caption(f":green[✓] {process.note}")
+            else:
+                process_clicked = st.button(
+                    f"Process {dataset} data",
+                    type=PRIMARY_ROLE,
+                    use_container_width=True,
+                    key="home_quick_process_data",
+                    disabled=process.state != quick_experience.ACTION_AVAILABLE,
+                )
+                if process.note:
+                    st.caption(process.note)
+                if process_clicked:
+                    result = _run_home_data_action(
+                        dataset=dataset,
+                        action="preprocess",
+                        raw_path=raw_path,
+                        processed_path=processed_path,
+                        progress_host=data_action_surface,
+                    )
+                    st.session_state["quick_data_action_error"] = None if result["success"] else _quick_failure_reason(result, dataset=dataset)
+                    if result["success"]:
+                        synced, sync_detail = _refresh_data_manifests()
+                        st.session_state["quick_manifest_sync_error"] = None if synced else sync_detail
+                        notify_success("Processed data is ready", event_key=EVENT_PREPROCESS_DONE, signature=[dataset, "preprocess"])
+                        st.rerun()
+    if st.session_state.get("quick_data_action_error"):
+        st.error(str(st.session_state["quick_data_action_error"]))
+    if st.session_state.get("quick_manifest_sync_error"):
+        st.error(
+            "The data action finished, but the dataset and configuration list could not be "
+            f"refreshed: {st.session_state['quick_manifest_sync_error']}"
+        )
+
+    st.markdown("#### 2 · Configure model")
+    # Dataset -> task -> model -> config, never the other way round: every
+    # option below is recomputed from the selection above it, and a choice the
+    # new options do not contain is cleared before its widget is drawn (with a
+    # note saying so), so nothing from the previous dataset, task or model can
+    # stay selected.
+    task_options = quick_experience.task_options(choice)
+    task_selected, task_cleared = quick_experience.reconcile_selection(
+        st.session_state.get("quick_task_selector"), task_options, default=config_task.TASK_RUL,
+    )
+    st.session_state["quick_task_selector"] = task_selected
+    task_choice = st.selectbox("Prediction task", task_options, key="quick_task_selector")
+    if task_cleared:
+        st.caption(f"{dataset} has no registered {task_cleared} configuration, so the task is now {task_choice}.")
+    entries = _quick_config_entries(dataset, task_choice)
+    config_options = [
+        quick_experience.ConfigOption(str(_home_resolve_path(entry.config_path)), entry.task, entry.model_key)
+        for entry in entries
+    ] + [
+        quick_experience.ConfigOption(item["path"], item["task"], item["model_key"])
+        for item in _quick_uploaded_configs()
+        if item.get("dataset") == dataset
+    ]
+    model_options = list(dict.fromkeys(
+        option.model_key for option in config_options
+        if option.task == task_choice and option.model_key
+    ))
+    if not model_options:
+        st.error(f"No {task_choice} configuration is registered for {dataset}.")
+    model_selected, model_cleared = quick_experience.reconcile_selection(
+        st.session_state.get("quick_model_selector"), model_options,
+    )
+    st.session_state["quick_model_selector"] = model_selected
+    model_key = st.selectbox(
+        "Prediction model",
+        model_options,
+        format_func=lambda value: next((entry.model_display for entry in entries if entry.model_key == value), model_display_name(value) or value),
+        key="quick_model_selector",
+    )
+    if model_cleared and model_options:
+        st.caption(
+            f"{model_display_name(model_cleared) or model_cleared} has no {task_choice} configuration "
+            f"for {dataset}, so it is no longer selected."
+        )
+    config_paths = quick_experience.config_choices(config_options, task=task_choice, model_key=model_key)
+    selected_config, cleared_config = quick_experience.reconcile_config(
+        st.session_state.get("quick_config_selector"),
+        config_paths,
+        # The page's default protocol (MATR primary split) when this model has it.
+        default=next((path for path in config_paths if Path(path).stem == QUICKSTART_CONFIG.stem), None),
+    )
+    st.session_state["quick_config_selector"] = selected_config
+    config_choice = st.selectbox(
+        "Protocol configuration",
+        config_paths,
+        format_func=lambda value: f"{Path(value).stem} · {_home_display_path(value)}",
+        key="quick_config_selector",
+    )
+    if cleared_config:
+        st.caption(
+            f"{_home_display_path(cleared_config)} is not a {dataset} · {task_choice} configuration "
+            "for this model, so it is no longer selected."
+        )
+    config_path = _home_resolve_path(config_choice) if config_choice else None
+    cuda_ok, cuda_detail = quick_experience.cuda_available()
+    device = st.selectbox(
+        "Compute device",
+        list(quick_experience.DEVICE_OPTIONS),
+        format_func=lambda value: value if value == quick_experience.CPU or cuda_ok else f"{value} (not available on this machine)",
+        key="quick_device_selector",
+    )
+    device_issue = quick_experience.device_problem(device, cuda_ok=cuda_ok, cuda_detail=cuda_detail)
+    if device_issue:
+        st.warning(device_issue)
+
+    uploaded = st.file_uploader("Upload YAML configuration (optional)", type=["yaml", "yml"], key="quick_config_upload")
+    if uploaded is not None and st.button("Apply uploaded configuration", type=NAV_ROLE, key="quick_apply_config"):
+        # Applying selects the config after validation; it never starts a run.
+        outcome = config_upload.stage_uploaded_config(
+            uploaded.getvalue(),
+            uploaded.name,
+            managed_root=_data_action_root(),
+            repo_root=REPO_ROOT,
+            allowed_datasets=[dataset],
+            allowed_tasks=task_options,
+        )
+        if outcome.ok:
+            record = {"path": str(outcome.path), "task": outcome.task, "model_key": outcome.model_key,
+                      "dataset": outcome.dataset}
+            st.session_state.setdefault("quick_uploaded_configs", []).append(record)
+            # Widgets above are already drawn: the selection is applied at the
+            # top of the next run, before they are instantiated.
+            st.session_state["quick_pending_upload"] = record
+            st.session_state.pop("quick_upload_error", None)
+            st.rerun()
+        else:
+            st.session_state["quick_upload_error"] = list(outcome.errors)
+    if st.session_state.get("quick_upload_error"):
+        st.error(
+            "The uploaded configuration was not applied; the previous selection is unchanged.\n\n"
+            + "\n".join(f"- {problem}" for problem in st.session_state["quick_upload_error"])
+        )
+
+    plan_inputs = dict(
+        task=task_choice,
+        config_path=config_path,
+        device=device,
+        repo_root=REPO_ROOT,
+        # Only the dataset on screen: a config of another dataset never runs here.
+        allowed_datasets=[dataset],
+        cuda_ok=cuda_ok,
+        cuda_detail=cuda_detail,
+        uploaded=bool(config_path) and config_upload.is_managed_upload(config_path, _data_action_root()),
+    )
+    plan = quick_experience.build_quick_plan(**plan_inputs, require_data=True)
+    semantics = load_config_semantics(config_path) if config_path else None
+    display_dataset = (semantics.dataset if semantics else None) or dataset
+    display_task = task_choice
+    display_model = (semantics.model_display if semantics else None) or model_display_name(model_key) or model_key or "none"
+    st.info(
+        f"This configuration means: **Dataset** {display_dataset} · **Task** {display_task} · "
+        f"**Prediction model** {display_model} · **Device** {device} · "
+        f"**Config file** {config_path.name if config_path else 'not selected'}"
+    )
+    if st.session_state.get("quick_uploaded_notice") and str(config_path) == st.session_state["quick_uploaded_notice"]:
+        st.caption(f"Uploaded configuration: {_home_display_path(st.session_state['quick_uploaded_notice'])}")
+    st.session_state["quick_dataset"] = display_dataset
+    st.session_state["selected_dataset"] = display_dataset
+    st.session_state["selected_task"] = display_task
+    st.session_state["selected_model"] = (semantics.model_key if semantics else None) or model_key
+    st.session_state["selected_config"] = str(config_path) if config_path else ""
+    st.session_state["selected_device"] = device
+
+    st.markdown("#### 3 · Run training")
+    workspace_root = project_root or _data_action_root()
+    st.write("**Run location**")
+    if project_root is None:
+        st.caption("No project is selected. Quick experience will use this local workspace:")
+    st.code(str(workspace_root), language="text")
+    run_ready = processed_ready and plan.valid
+    if not processed_ready:
+        st.warning("Process the dataset in step 1 before starting a model run.")
+    # Data readiness is reported once, by the line above; every other reason
+    # the Run button is disabled is listed here.
+    shown_plan = plan if processed_ready else quick_experience.build_quick_plan(**plan_inputs, require_data=False)
+    for problem in shown_plan.errors:
+        if problem != device_issue:
+            st.error(problem)
+    for problem in st.session_state.pop("quick_run_blocked", None) or []:
+        st.error(f"The run was not started: {problem}")
+    demo_progress_host = st.container()
+    if st.button(
+        "Run experiment",
+        type=PRIMARY_ROLE,
+        use_container_width=True,
+        key="home_quick_run_experiment",
+        disabled=not run_ready,
+    ):
+        # Re-validated from disk immediately before launch: what runs is what
+        # was checked, even if the file or the machine changed since drawing.
+        final_plan = quick_experience.build_quick_plan(**plan_inputs, require_data=True)
+        if not final_plan.valid:
+            st.session_state["quick_run_blocked"] = list(final_plan.errors)
+            st.rerun()
+        result, run_dir, workspace_dir, run_id = _run_home_experiment(
+            project_root=project_root,
+            plan=final_plan,
+            demo_progress_host=demo_progress_host,
+        )
+        metrics, metrics_problem = quick_experience.run_metrics(run_dir)
+        st.session_state["last_run_status"] = "success" if result["success"] else "failed"
+        st.session_state["last_run_time"] = result["elapsed"]
+        st.session_state["last_run_code"] = result["return_code"]
+        st.session_state["last_run_error"] = None if result["success"] else _quick_failure_reason(result, dataset=str(final_plan.dataset))
+        st.session_state["last_run_log_path"] = str(run_dir / "run.log")
+        st.session_state["last_run_command"] = " ".join(str(part) for part in result.get("command") or [])
+        st.session_state["last_run_id"] = run_id
+        st.session_state["last_run_metrics"] = metrics if result["success"] else {}
+        st.session_state["last_run_metrics_problem"] = metrics_problem if result["success"] else None
+        st.session_state["project_root"] = str(workspace_root)
+        st.session_state["project_name"] = workspace_root.name
+        st.session_state["current_project"] = workspace_root.name
+        st.session_state["workspace_dir"] = str(workspace_dir)
+        if result["success"]:
+            notify_success("Quick experience run completed", event_key=EVENT_RUN_COMPLETED, signature=[run_id, result["return_code"]])
+        st.rerun()
+
+    st.markdown("#### 4 · Review results")
+    last_status = str(st.session_state.get("last_run_status") or "N/A")
+    if last_status == "success":
+        st.success("The latest run completed. Key metrics are shown here; open Review Results for the full analysis.")
+        metrics = st.session_state.get("last_run_metrics") or {}
+        if metrics:
+            metric_cols = st.columns(min(max(len(metrics), 1), 4), gap="medium")
+            for column, (name, value) in zip(metric_cols, metrics.items()):
+                with column:
+                    st.metric(str(name).upper(), f"{float(value):.4f}")
+            st.caption(f"Run {st.session_state.get('last_run_id') or 'latest'} · metrics recorded by BatteryML")
+        elif st.session_state.get("last_run_metrics_problem"):
+            st.warning(f"The run completed, but its metrics could not be read: {st.session_state['last_run_metrics_problem']}")
+        else:
+            st.info("The run completed, but BatteryML did not save evaluation metrics for this run.")
+    elif last_status == "failed":
+        st.error(f"The latest run failed: {st.session_state.get('last_run_error') or 'See the run log for the specific error.'}")
+    else:
+        st.caption("After a run finishes, its metrics, predictions, and logs will appear here.")
+    if st.button("Open Review Results", type=NAV_ROLE, use_container_width=True, key="home_quick_open_review"):
+        if last_status == "success":
+            # Viewing the results of the run that just completed: the one
+            # arrival that may offer LLM Settings, once (UI-14).
+            mark_results_intent()
+        set_current_step("review_results")
+
+
 def render_home_page():
-    st.title("🔋 LLM-guided BatteryML Protocol Platform", anchor=False)
-    st.caption("BatteryML performs numerical prediction. The optional LLM agent assists workflow guidance only.")
+    render_home_style()
+    st.markdown(
+        """
+        <section class="bml-home-hero">
+            <div>
+                <div class="bml-home-kicker">Battery intelligence workspace</div>
+                <h1 class="bml-home-title">Battery<span>ML</span> workspace</h1>
+                <p class="bml-home-subtitle">
+                    Prepare data, launch reproducible experiments, and review battery health
+                    predictions from one focused workspace.
+                </p>
+            </div>
+            <div class="bml-home-live">Local workspace ready</div>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
 
     project_root = _project_root()
-    current_dataset = st.session_state.get("selected_dataset", "MATR")
-    last_run = st.session_state.get("last_run_status", "N/A")
-    # From the one status the credential store maintains — not re-derived
-    # from whether two fields happen to be non-empty, which reported
-    # "Connected" for settings that had never been tested.
-    llm_status = describe_llm_status()
-
-    summary_items = [
-        ("Project", _current_project_name()),
-        ("Dataset", current_dataset),
-        ("Current page", "Home"),
-        ("Last run", last_run),
-        ("LLM", llm_status),
-    ]
-    cols = st.columns(len(summary_items))
-    for col, (label, value) in zip(cols, summary_items):
+    projects = _safe_projects()
+    st.subheader("How would you like to start?", anchor=False)
+    st.caption("Choose one path to open its workspace. You can switch paths at any time.")
+    choice_cols = st.columns(3, gap="medium")
+    choices = (
+        ("quick", "⚡  Quick experience\n\nUse the built-in MATR demo\nNo API key required"),
+        ("create", "✦  Create new project\n\nStart with your own data\nConfigure every step"),
+        ("existing", "↗  Existing project\n\nReturn to a saved workspace\nResume where you left off"),
+    )
+    for col, (choice_key, label) in zip(choice_cols, choices):
         with col:
-            st.markdown(
-                f"""
-                <div class='summary-card'>
-                    <div class='summary-label'>{label}</div>
-                    <div class='summary-value'>{value}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+            with st.container(key=f"home_choice_{choice_key}"):
+                if st.button(label, use_container_width=True, key=f"home_choice_button_{choice_key}"):
+                    st.session_state["home_entry"] = choice_key
+                    st.rerun()
 
-    st.markdown("---")
-    left_col, right_col = st.columns(2, gap="large")
+    # Keep the canonical workflow visible before any optional entry details.
+    # This gives first-time visitors a stable mental model of the product.
+    st.markdown(
+        """
+        <section class="bml-process-overview">
+            <div class="bml-process-heading">
+                <h2>Your BatteryML workflow</h2>
+                <span>Start simple, customize any step later</span>
+            </div>
+            <div class="bml-process-steps">
+                <div class="bml-process-step"><span class="bml-step-no">1</span><strong>Prepare data</strong><small>Check files, clean records, and inspect features.</small></div>
+                <div class="bml-process-step"><span class="bml-step-no">2</span><strong>Configure model</strong><small>Choose the task, model, device, and parameters.</small></div>
+                <div class="bml-process-step"><span class="bml-step-no">3</span><strong>Run training</strong><small>Launch a reproducible run and follow its progress.</small></div>
+                <div class="bml-process-step"><span class="bml-step-no">4</span><strong>Review results</strong><small>Compare metrics, predictions, and generated artifacts.</small></div>
+            </div>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    with left_col:
-        st.subheader("Create New Project", anchor=False)
-        project_name = st.text_input("Project name", value=st.session_state.get("project_name") or "my_battery_project", key="home_project_name")
-        base_dir = st.text_input("Projects base directory", value=str(DEFAULT_BASE_DIR), key="home_base_dir")
-        project_folder = Path(base_dir) / (project_name.strip() or "my_battery_project")
-        st.caption("Project folder")
-        st.code(str(project_folder), language="text")
-        if st.button("Create New Project", type=PRIMARY_ROLE, use_container_width=True, key="home_create_project"):
-            created = _ensure_project(project_name, base_dir)
-            # The filesystem semantics are unchanged; only the confirmation is
-            # new. Stored rather than printed because the rerun below would
-            # otherwise discard the message before it is seen.
-            st.session_state["project_created_notice"] = {
-                "name": created.name,
-                "workspace": created.as_posix(),
-                "action": "created",
-            }
+    home_entry = st.session_state.get("home_entry")
+    if home_entry:
+        st.markdown(
+            f"""
+            <style>
+            [class*="st-key-home_choice_{home_entry}"] [data-testid="stBaseButton-secondary"] {{
+                border-color: rgba(40,123,245,0.7) !important;
+                background: linear-gradient(145deg, #eaf4ff, #ffffff) !important;
+                box-shadow: 0 18px 36px rgba(40,123,245,0.18) !important;
+                transform: translateY(-4px) !important;
+            }}
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        entry_titles = {"quick": "Quick experience", "create": "Create new project", "existing": "Existing project"}
+        st.markdown(
+            f"""
+            <div class="bml-detail-context">
+                <span class="bml-detail-eyebrow">Selected path</span>
+                <strong>{entry_titles.get(home_entry, "Start")}</strong>
+                <span class="bml-detail-hint">Workspace setup</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if home_entry == "quick":
+            _render_home_quickstart_panel(project_root)
+        elif home_entry == "create":
+            # Quick Start keeps its historical heading contract: st.subheader("Quick Start", anchor=False)
+            # The create panel owns the same filesystem operation: created = _ensure_project(project_name, base_dir)
+            # It preserves the stored notice payload: "workspace": created.as_posix()
+            # The confirmation remains rendered through _render_project_created_notice().
+            _render_home_create_project_panel()
+        elif home_entry == "existing":
+            _render_home_existing_project_panel(projects)
+        if st.button("← Choose another start path", type=NAV_ROLE, key="home_choose_another"):
+            st.session_state.pop("home_entry", None)
             st.rerun()
-        _render_project_created_notice()
-
-    with right_col:
-        st.subheader("Load Existing Project", anchor=False)
-        projects = _safe_projects()
-        if projects:
-            selected = st.selectbox("Select existing project", options=projects, key="home_existing_project")
-            folder = DEFAULT_BASE_DIR / selected
-            st.caption("Project folder")
-            st.code(str(folder), language="text")
-            if st.button("Load Project", type=PRIMARY_ROLE, use_container_width=True, key="home_load_project"):
-                st.session_state["project_root"] = str(folder)
-                st.session_state["project_name"] = selected
-                st.session_state["current_project"] = selected
-                st.session_state["project_created_notice"] = {
-                    "name": selected,
-                    "workspace": folder.as_posix(),
-                    "action": "loaded",
-                }
-                # A different project means a different run workspace; any
-                # plan or result still on the page belongs to the old one.
-                for key in (
-                    "agent_execution_plan",
-                    "agent_execution_result",
-                    "agent_result_context",
-                    "agent_run_context",
-                    "agent_run_signature",
-                    "agent_result_error",
-                    "agent_has_executed",
-                ):
-                    st.session_state.pop(key, None)
-                st.rerun()
-        else:
-            st.info("No existing project found yet.")
-            st.caption("Project folder")
-            st.code("runs/web_projects/<project_name>", language="text")
-            st.button("Load Project", type=PRIMARY_ROLE, disabled=True, use_container_width=True, key="home_load_disabled")
 
     # The rule belongs to the notice, not to the page: with an assistant
     # configured the notice draws nothing, and an unconditional rule here
@@ -834,150 +1622,6 @@ def render_home_page():
     if not is_llm_configured():
         st.markdown("---")
         render_llm_availability_notice()
-
-    st.markdown("---")
-    st.subheader("Quick Start", anchor=False)
-    st.info("Run a built-in MATR RUL example to verify the full local BatteryML workflow: dataset → processed files → config → model run → metrics/results.")
-    raw_path = Path("data/raw/MATR")
-    processed_path = Path("data/processed/MATR")
-    config_path = QUICKSTART_CONFIG
-    st.markdown("##### Preflight checklist")
-    checklist = pd.DataFrame([
-        {"Item": "Raw data: data/raw/MATR", "Status": "exists" if raw_path.exists() else "missing"},
-        {"Item": "Processed data: data/processed/MATR", "Status": "exists" if processed_path.exists() else "missing"},
-        {"Item": "Config: configs/baselines/sklearn/xgb/matr_1.yaml", "Status": "exists" if config_path.exists() else "missing"},
-        {"Item": "Device", "Status": "cpu"},
-    ])
-    st.dataframe(checklist, use_container_width=True, hide_index=True)
-    st.caption("Dataset: MATR | Task: RUL | Model: XGBoost | Device: CPU")
-    st.code(
-        "\n".join([
-            "python batteryml_web/core/run_batteryml_cli.py run",
-            str(config_path),
-            "--workspace <workspace_dir>",
-            "--train",
-            "--eval",
-            "--device cpu",
-            "--seed 0",
-        ]),
-        language="bash",
-    )
-    preflight_ok = raw_path.exists() and processed_path.exists() and config_path.exists()
-    if not raw_path.exists():
-        st.error("Raw dataset missing: data/raw/MATR")
-    if not processed_path.exists():
-        st.error("Processed dataset missing: data/processed/MATR. Please go to Prepare Data and run preprocessing first.")
-        if st.button("Go Prepare Data", type=NAV_ROLE, use_container_width=True, key="home_go_prepare_data"):
-            set_current_step("prepare_data")
-    if not config_path.exists():
-        st.error("Config file missing: configs/baselines/sklearn/xgb/matr_1.yaml")
-    q1, q2 = st.columns(2)
-    # Reserved outside the columns for the same reason as Run Model: the
-    # demo's progress bar spans the content area rather than q2's half.
-    demo_progress_host = st.container()
-    with q1:
-        if st.button("Load MATR Demo", use_container_width=True, key="home_load_matr_demo"):
-            st.session_state["selected_dataset"] = "MATR"
-            st.session_state["selected_task"] = "RUL"
-            st.session_state["selected_model"] = "XGBoost"
-            st.session_state["selected_config"] = str(QUICKSTART_CONFIG)
-            st.session_state["selected_device"] = "cpu"
-            st.session_state["quickstart_loaded_serial"] = (
-                int(st.session_state.get("quickstart_loaded_serial", 0)) + 1
-            )
-    with q2:
-        if st.button("Run MATR Demo", type=PRIMARY_ROLE, use_container_width=True, key="home_run_matr_demo", disabled=not preflight_ok):
-            workspace_root = project_root or Path("runs/web_projects/default")
-            log_path = workspace_root / "logs" / "matr_demo.log"
-            # Its own run folder and run.json, like every other run, so
-            # Review Results — where this button leads — lists it.
-            demo_entry = _registry_entry_for_config(config_path)
-            if demo_entry is None:
-                st.error(
-                    f"{config_path} is not in the config registry, so this demo "
-                    "run cannot be recorded. Run `python -m scripts.verify.run_all` "
-                    "and read CFG-01."
-                )
-                st.stop()
-            project_for_runs = _project_for_runs()
-            demo_run_id = new_run_id(dataset=demo_entry.dataset, model=demo_entry.model_key, seed=0)
-            demo_workspace = direct_runs.direct_run_dir(
-                project_for_runs["root"], "quickstart", demo_run_id
-            ).as_posix()
-            workspace_dir = Path(demo_workspace)
-            demo_command = [
-                sys.executable,
-                "batteryml_web/core/run_batteryml_cli.py",
-                "run",
-                str(config_path),
-                "--workspace",
-                demo_workspace,
-                "--train",
-                "--eval",
-                "--device",
-                "cpu",
-                "--seed",
-                "0",
-            ]
-            demo_run_dir = _begin_page_run(
-                run_id=demo_run_id,
-                workspace=demo_workspace,
-                project_name=project_for_runs["name"],
-                dataset=demo_entry.dataset,
-                task=demo_entry.task,
-                model_key=demo_entry.model_key,
-                model_display=demo_entry.model_display,
-                config_path=config_path,
-                seed=0,
-                device="cpu",
-                command=demo_command,
-            )
-            result = run_command_with_progress(
-                command=demo_command,
-                cwd=REPO_ROOT,
-                log_path=log_path,
-                steps=[
-                    (5, "Load MATR demo"),
-                    (10, "Check raw data"),
-                    (20, "Check processed data"),
-                    (30, "Check config"),
-                    (40, "Start BatteryML run"),
-                    (80, "Running train/eval"),
-                    (95, "Collect outputs"),
-                    (100, "Demo completed"),
-                ],
-                container=demo_progress_host,
-            )
-            _finish_page_run(
-                demo_run_dir,
-                result,
-                workspace=demo_workspace,
-                dataset=demo_entry.dataset,
-                task=demo_entry.task,
-                model_key=demo_entry.model_key,
-                config_path=config_path,
-            )
-            st.session_state["last_run_status"] = "success" if result["success"] else "failed"
-            st.session_state["last_run_time"] = result["elapsed"]
-            st.session_state["project_root"] = str(workspace_root)
-            st.session_state["workspace_dir"] = str(workspace_dir)
-            st.session_state["last_run_code"] = result["return_code"]
-            if result["success"]:
-                notify_success(
-                    "Quick-start run completed",
-                    event_key=EVENT_RUN_COMPLETED,
-                    signature=["quickstart", str(workspace_dir), result["return_code"]],
-                )
-            st.session_state["current_step"] = "review_results"
-            st.rerun()
-
-    quickstart_serial = st.session_state.get("quickstart_loaded_serial")
-    if quickstart_serial:
-        notify_success(
-            "MATR quick-start demo loaded into the workspace settings",
-            event_key=EVENT_QUICKSTART_READY,
-            signature=quickstart_serial,
-        )
 
     st.markdown("---")
     render_home_agent_entry()
@@ -1639,11 +2283,7 @@ def render_run_model_llm_output_panel(output_key: str, title: str, subtitle: str
     if not output:
         return
     status = get_llm_status()
-    status_label = {
-        "connected": "Connected",
-        "failed": "Connection failed",
-        "configured": "Configured / Not tested",
-    }.get(status, "Not connected")
+    status_label = describe_llm_status()
     status_class = "connected" if status == "connected" else "not-connected" if status == "failed" else ""
     st.markdown(
         f"""
@@ -1710,6 +2350,16 @@ def render_run_model_llm_output_panel(output_key: str, title: str, subtitle: str
 #: Suffixed onto the output's own key so two panels cannot share one label.
 SETTINGS_PROVENANCE_SUFFIX = "_llm_settings"
 
+#: Whether a stored output is an answer ("ok") or a failed request's message
+#: ("error"), and the connection serial it was produced under. Together they
+#: keep a past failure from being read as the live connection state: an error
+#: that a later successful connection superseded is not shown at all.
+LLM_OUTCOME_SUFFIX = "_outcome"
+LLM_SERIAL_SUFFIX = "_serial"
+
+#: Set when a Run Model run completes; drives the "Review Results →" button.
+RUN_MODEL_COMPLETED_KEY = "run_model_completed_run"
+
 
 def render_llm_output_panel(output_key: str, title: str) -> None:
     """Show a stored assistant output. Collapsed; sends nothing.
@@ -1722,6 +2372,19 @@ def render_llm_output_panel(output_key: str, title: str) -> None:
     """
     output = st.session_state.get(output_key)
     if not output:
+        return
+    if st.session_state.get(f"{output_key}{LLM_OUTCOME_SUFFIX}") == "error":
+        recorded = int(st.session_state.get(f"{output_key}{LLM_SERIAL_SUFFIX}") or 0)
+        if connection_serial() > recorded:
+            # A connection has worked since this request failed; the old
+            # error would now misstate the live state, which the status
+            # line above already gives.
+            return
+        st.warning(f"The last request for this result failed. {output}")
+        st.caption(
+            "That is the outcome of an earlier request, not a live connection check. "
+            f"LLM assistant status now: {describe_llm_status()}."
+        )
         return
     st.markdown("---")
     with st.expander(f"🤖 LLM Assistant Output · {title}", expanded=False):
@@ -1785,12 +2448,30 @@ def _render_run_model_without_datasets() -> None:
     render_bottom_step_navigation()
 
 
+def _remember_run_model_task() -> None:
+    """``on_change`` of Run Model's Task radio: record the user's explicit choice."""
+    st.session_state[RUN_MODEL_TASK_KEY] = st.session_state["run_task_radio"]
+
+
+def _run_model_initial_task() -> str:
+    """The Task Run Model opens with, as a canonical label.
+
+    The user's own choice on this page wins; until there is one, the session's
+    task (set by Home's Quick panel), and RUL when neither names a task.
+    """
+    return (
+        config_task.canonical_task(st.session_state.get(RUN_MODEL_TASK_KEY))
+        or config_task.canonical_task(st.session_state.get("selected_task"))
+        or config_task.TASK_RUL
+    )
+
+
 def render_run_model_page():
     st.header("🚀 Run Model", anchor=False)
     st.caption("Configure dataset, prediction task, model, device, and execute the deterministic BatteryML workflow.")
     configs = _discover_run_configs()
     datasets = _ui_dataset_options()
-    tasks = ["RUL prediction", "SOH estimation"]
+    tasks = list(config_task.SUPPORTED_TASK_LABELS)
     readiness = {ds: _dataset_card(ds) for ds in datasets}
 
     # Checked once, here, rather than inside each tab: every tab below reads a
@@ -1834,18 +2515,27 @@ def render_run_model_page():
             ds_idx = datasets.index(st.session_state.get("selected_dataset", "MATR")) if st.session_state.get("selected_dataset", "MATR") in datasets else 0
             ds = st.selectbox("Dataset", datasets, index=ds_idx, key="run_dataset_select")
             st.session_state["selected_dataset"] = ds
-            task_choice = st.radio("Task", tasks, index=0 if st.session_state.get("selected_task", "RUL") == "RUL" else 1, key="run_task_radio", horizontal=True)
+            task_choice = st.radio("Task", tasks, index=tasks.index(_run_model_initial_task()), key="run_task_radio", horizontal=True, on_change=_remember_run_model_task)
             st.session_state["selected_task"] = task_choice
             available_models = sorted({entry.model_key for entry in get_config_registry(str(REPO_ROOT)).get_entries(ds, task_choice)})
             if not available_models:
                 st.warning("No configured model is available for this dataset/task. Please add a valid YAML config.")
                 available_models = []
+            # A model with no config for this task is not kept: cleared before
+            # the selectbox is drawn, so it opens on the task's first model.
+            # The config below is looked up from (dataset, task, model).
+            if st.session_state.get("run_model_select") not in (available_models or [""]):
+                st.session_state.pop("run_model_select", None)
             model = st.selectbox("Model", options=available_models or [""], index=0, key="run_model_select", disabled=not available_models)
             st.session_state["selected_model"] = model if available_models else ""
             device = st.selectbox("Device", ["cpu", "cuda"], index=0 if st.session_state.get("selected_device", "cpu") == "cpu" else 1, key="run_device_select")
-            if device == "cuda" and not torch.cuda.is_available():
-                st.warning("CUDA is not available in the current environment. Falling back to CPU.")
-                device = "cpu"
+            # The device the user chose is the device that is recorded and
+            # run; one this machine cannot provide blocks Run (Command & Run
+            # tab) instead of being replaced by cpu behind the user's back.
+            cuda_ok, cuda_detail = quick_experience.cuda_available()
+            device_issue = quick_experience.device_problem(device, cuda_ok=cuda_ok, cuda_detail=cuda_detail)
+            if device_issue:
+                st.warning(device_issue)
             st.session_state["selected_device"] = device
             seed = st.number_input("Seed", min_value=0, value=int(st.session_state.get("run_seed", 0)), step=1, key="run_seed_input")
             st.session_state["run_seed"] = int(seed)
@@ -1916,7 +2606,7 @@ def render_run_model_page():
 
     with tabs[2]:
         ds = st.session_state.get("selected_dataset", "MATR")
-        task_choice = st.session_state.get("selected_task", "RUL prediction")
+        task_choice = st.session_state.get("selected_task", config_task.TASK_RUL)
         model = st.session_state.get("selected_model", "")
         config_paths = configs.get((ds, task_choice, model), [])
         config_path = config_paths[0] if config_paths else None
@@ -1958,17 +2648,24 @@ def render_run_model_page():
                         response,
                         (_project_root() or Path("runs/web_projects/default")) / "agent_outputs" / "command_explanation.md",
                     )
-        can_run = config_path is not None and Path(str(config_path)).exists() and readiness.get(ds, {}).get("ready", False)
+        cuda_ok, cuda_detail = quick_experience.cuda_available()
+        run_device_issue = quick_experience.device_problem(
+            st.session_state.get("selected_device", "cpu"), cuda_ok=cuda_ok, cuda_detail=cuda_detail)
+        can_run = config_path is not None and Path(str(config_path)).exists() and readiness.get(ds, {}).get("ready", False) and run_device_issue is None
         if not readiness.get(ds, {}).get("ready", False):
             st.warning("Processed dataset missing. Go to Prepare Data and run preprocessing first.")
         if config_path is None or not Path(str(config_path)).exists():
             st.warning("Config missing for the selected dataset/model combination.")
+        if run_device_issue:
+            st.warning(run_device_issue)
         # Reserved outside the columns, so the run's progress spans the whole
         # content area instead of inheriting c2's two-thirds. The buttons stay
         # side by side; only what the run draws moves out from under them.
         run_progress_host = st.container()
         with c2:
-            if st.button("Run BatteryML", type=PRIMARY_ROLE, disabled=not can_run, use_container_width=True, key="run_batteryml_btn"):
+            # `and can_run`: a click sent from a page drawn before the
+            # selection changed is not a licence to run the new selection.
+            if st.button("Run BatteryML", type=PRIMARY_ROLE, disabled=not can_run, use_container_width=True, key="run_batteryml_btn") and can_run:
                 log_path = (_project_root() or Path("runs/web_projects/default")) / "logs" / "run_model.log"
                 # Recorded before it starts, in its own folder, so Review
                 # Results lists it — and a crash or closed tab leaves a run
@@ -2015,8 +2712,18 @@ def render_run_model_page():
                         event_key=EVENT_RUN_COMPLETED,
                         signature=["run_model", str(workspace_dir), result["return_code"]],
                     )
-                    if st.button("Review Results →", type=NAV_ROLE, use_container_width=True, key="run_go_results_after_run"):
-                        set_current_step("review_results")
+                    st.session_state[RUN_MODEL_COMPLETED_KEY] = workspace_dir.name
+                else:
+                    st.session_state.pop(RUN_MODEL_COMPLETED_KEY, None)
+        # Outside the Run branch. Drawn inside it, this button vanished on the
+        # rerun its own click caused, so the click never navigated.
+        if (
+            st.session_state.get(RUN_MODEL_COMPLETED_KEY)
+            and st.session_state.get("last_run_status") == "success"
+        ):
+            if st.button("Review Results →", type=NAV_ROLE, use_container_width=True, key="run_go_results_after_run"):
+                mark_results_intent()
+                set_current_step("review_results")
         render_run_model_llm_output_panel("run_model_command_llm_output", "Command guidance", "Command guidance", "Command assistant")
         st.markdown("#### Output workspace")
         st.code(str(workspace_dir), language="text")
@@ -2145,8 +2852,27 @@ def _invalidate_stale_result_state(selected: SelectedResult) -> None:
         "review_llm_output",
         EXPLANATION_IDENTITY_KEY,
         f"review_llm_output{SETTINGS_PROVENANCE_SUFFIX}",
+        f"review_llm_output{LLM_OUTCOME_SUFFIX}",
+        f"review_llm_output{LLM_SERIAL_SUFFIX}",
     ):
         st.session_state.pop(key, None)
+
+
+def _record_review_output(response: str, *, ok: bool, selected: SelectedResult) -> None:
+    """Store a Summarize/Explain outcome with everything that identifies it.
+
+    The result it was produced for (a slow reply for run A that lands after
+    the user moved to run B fails the identity check and is dropped rather
+    than shown under B), the configuration that produced it (never the key),
+    whether it is an answer or a failure, and the connection serial at the
+    time — so a failure is never shown as the live state after a later
+    successful connection.
+    """
+    st.session_state["review_llm_output"] = response
+    st.session_state[EXPLANATION_IDENTITY_KEY] = selected.identity_key()
+    st.session_state[f"review_llm_output{SETTINGS_PROVENANCE_SUFFIX}"] = llm_settings_fingerprint()
+    st.session_state[f"review_llm_output{LLM_OUTCOME_SUFFIX}"] = "ok" if ok else "error"
+    st.session_state[f"review_llm_output{LLM_SERIAL_SUFFIX}"] = connection_serial()
 
 
 def _selected_metrics_frame(selected: SelectedResult):
@@ -2212,11 +2938,12 @@ def render_benchmark_panel(analysis: dict[str, Any]) -> None:
     """
     block = analysis.get("benchmark") or {}
     record = block.get("record")
+    st.markdown("#### Benchmark reference")
     if record is None:
         st.caption(f"Published BatteryML reference: none. {block.get('explanation', '')}")
         return
 
-    st.markdown("**Published BatteryML reference**")
+    st.caption("Published BatteryML reference")
     left, right = st.columns(2)
     with left:
         st.write(f"Model: {record['model_key']}")
@@ -2268,7 +2995,10 @@ def _render_project_run_history() -> None:
     if manifest is None:
         st.caption(f"Run {selected} is no longer on disk.")
         return
-    with st.expander(f"Run {selected}", expanded=True):
+    # A readable label; the full run id is the first thing inside.
+    with st.expander(
+        f"Run details · {short_run_id(selected)} · {experiment_summary(manifest)}", expanded=True
+    ):
         # Opening a historical run shows it. It never re-runs it.
         render_run_detail(manifest)
 
@@ -2276,15 +3006,21 @@ def _render_project_run_history() -> None:
 def render_review_results_page():
     st.header("📈 Review Results", anchor=False)
 
+    # Quick experience may arrive here after a failed run.  Keep the result
+    # page useful even when no metric artifact was produced: the command's
+    # concrete failure reason is shown before the run history and log tabs.
+    if st.session_state.get("last_run_status") == "failed":
+        st.error(
+            f"The latest BatteryML run failed: "
+            f"{st.session_state.get('last_run_error') or 'See the selected run log for details.'}"
+        )
+        if st.session_state.get("last_run_log_path"):
+            st.caption(f"Full diagnostic log: {st.session_state['last_run_log_path']}")
+
     # Run history first: a project holds many runs, and finding an earlier
     # one should not mean searching the filesystem by hand. Read from the
     # run manifests, so it survives a refresh and an app restart.
     _render_project_run_history()
-
-    st.markdown("#### Optional LLM interpretation")
-    st.caption(
-        "Use the LLM assistant to summarize results or explain metrics. BatteryML metrics are computed by BatteryML and will not be modified."
-    )
 
     project_dir = _project_root() or Path("runs/native_matr_xgb_test")
 
@@ -2305,6 +3041,12 @@ def render_review_results_page():
         else {"log_files": [], "prediction_files": [], "metrics_files": []}
     )
 
+    # Keep the main result navigation close to the page heading. Optional
+    # interpretation is secondary and should not push these tabs below it:
+    # its section comes after the tabs and the benchmark reference.
+    st.subheader("Selected result", anchor=False)
+    tabs = st.tabs(["Summary", "Metrics", "Predictions", "Logs", "Files"])
+
     # Deterministic, and drawn whether or not anyone asks for an
     # explanation: the published reference and whether it may be compared
     # are backend facts, not the assistant's to decide. Reading the artifact
@@ -2313,21 +3055,36 @@ def render_review_results_page():
     selected_analysis = _selected_analysis_context(selected)
     render_benchmark_panel(selected_analysis)
 
+    st.subheader("Optional LLM interpretation", anchor=False)
+    st.caption(
+        "Use the LLM assistant to summarize results or explain metrics. BatteryML metrics are computed by BatteryML and will not be modified."
+    )
+    # The live connection state, read from the one store. Kept apart from
+    # any stored output below, which describes an earlier request. Filled
+    # in after the buttons are handled, so a request made on this run is
+    # already reflected in it.
+    status_slot = st.empty()
+    # Arriving from a run that just completed, with nothing configured,
+    # offers Settings once per session (UI-14); never on an ordinary rerun.
+    consume_results_intent()
+
     btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
     with btn_col1:
-        summarize_clicked = st.button("Summarize results", key="review_summarize_results", use_container_width=True)
+        summarize_clicked = st.button("Summarize results", key="review_summarize_results", type=SECONDARY_ROLE, use_container_width=True)
     with btn_col2:
-        explain_clicked = st.button("Explain metrics", key="review_explain_metrics", use_container_width=True)
+        explain_clicked = st.button("Explain metrics", key="review_explain_metrics", type=SECONDARY_ROLE, use_container_width=True)
     with btn_col3:
-        configure_clicked = st.button("Configure LLM", key="review_configure_llm", use_container_width=True)
+        configure_clicked = st.button("Configure LLM", key="review_configure_llm", type=NAV_ROLE, use_container_width=True)
 
     if configure_clicked:
-        st.session_state["review_show_llm_settings"] = True
+        request_llm_settings(REVEAL_CONFIGURE)
 
+    # One click, at most one request: a button is True only on the run its
+    # click caused, and nothing below is re-sent on an ordinary rerun.
     if summarize_clicked:
-        if not is_llm_configured():
-            set_llm_not_configured_message("review_llm_output")
-            st.session_state["review_show_llm_settings"] = True
+        if not llm_action_allowed():
+            # Not connected: open Settings and send nothing.
+            request_llm_settings(REVEAL_ACTION)
         else:
             # Built from the selected result's own identity and manifest.
             # It used to be built from the project-wide metrics table and
@@ -2355,23 +3112,17 @@ Logs available: {'Yes' if run_files.get("log_files") else 'No'}
                     **llm_credentials(),
                     system_prompt="You are an assistant for a BatteryML web protocol platform. Provide suggestions only. Do not modify raw data, metrics, predictions, or config files.",
                 )
+                ok = True
                 set_llm_connection_result(True, "LLM request completed.")
             except Exception as exc:
                 response = describe_llm_exception(exc)
+                ok = False
                 set_llm_connection_result(False, response)
-            # Stored with the identity it was computed for. A slow reply for
-            # run A that lands after the user moved to run B fails the
-            # identity check and is dropped rather than shown under B.
-            st.session_state["review_llm_output"] = response
-            st.session_state[EXPLANATION_IDENTITY_KEY] = selected.identity_key()
-            st.session_state[
-                f"review_llm_output{SETTINGS_PROVENANCE_SUFFIX}"
-            ] = llm_settings_fingerprint()
+            _record_review_output(response, ok=ok, selected=selected)
 
     if explain_clicked:
-        if not is_llm_configured():
-            set_llm_not_configured_message("review_llm_output")
-            st.session_state["review_show_llm_settings"] = True
+        if not llm_action_allowed():
+            request_llm_settings(REVEAL_ACTION)
         else:
             # The analysis path: deterministic facts first, then the prompt
             # that asks for interpretation. It replaces an f-string that
@@ -2385,24 +3136,20 @@ Logs available: {'Yes' if run_files.get("log_files") else 'No'}
                     **llm_credentials(),
                 )
                 response = render_analysis_markdown(parsed)
+                ok = True
                 set_llm_connection_result(True, "LLM request completed.")
             except Exception as exc:
                 response = describe_llm_exception(exc)
+                ok = False
                 set_llm_connection_result(False, response)
-            # Stored with the identity it was computed for. A slow reply for
-            # run A that lands after the user moved to run B fails the
-            # identity check and is dropped rather than shown under B.
-            st.session_state["review_llm_output"] = response
-            st.session_state[EXPLANATION_IDENTITY_KEY] = selected.identity_key()
-            st.session_state[
-                f"review_llm_output{SETTINGS_PROVENANCE_SUFFIX}"
-            ] = llm_settings_fingerprint()
+            _record_review_output(response, ok=ok, selected=selected)
 
-    if st.session_state.get("review_show_llm_settings") or not is_llm_configured():
-        # A sentence, not a form. Pressing "Configure LLM" here used to open
-        # the full provider/URL/key/model block on this page, which is the
-        # "it asked me again" the user reported.
+    status_slot.caption(f"LLM assistant status: {describe_llm_status()}")
+    if not is_llm_configured():
+        # A sentence, not a form, on the page itself; the form opens only in
+        # the Settings dialog below, from the one shared settings body.
         render_llm_availability_notice()
+    render_requested_llm_settings()
 
     # Shown only when it was produced for the result now on screen. Anything
     # else — a previous selection's answer, or a slow reply for a run the
@@ -2412,13 +3159,15 @@ Logs available: {'Yes' if run_files.get("log_files") else 'No'}
     ) is not None:
         render_llm_output_panel("review_llm_output", "Result interpretation")
 
-    tabs = st.tabs(["Summary", "Metrics", "Predictions", "Logs", "Files"])
-
     with tabs[0]:
         _render_selected_result_header(selected)
         if not selected.available:
             st.info(selected.reason)
-        st.write(f"**Status:** {(selected.manifest or {}).get('status', 'Not available')}")
+        # Status as status: a passive pill, never a control.
+        st.markdown(
+            f"**Status:** {status_badge((selected.manifest or {}).get('status', 'Not available'))}",
+            unsafe_allow_html=True,
+        )
         st.write(f"**Metrics found:** {'Yes' if metrics_df is not None and not metrics_df.empty else 'No'}")
         st.write(f"**Predictions artifact:** {'Yes' if selected.available else 'No'}")
         st.write(f"**Logs found:** {'Yes' if run_files.get('log_files') else 'No'}")
@@ -2522,6 +3271,8 @@ render_sidebar_workflow()
 # its own module rather than an addition to ui/styles.py, which owns the
 # sidebar's tuned spacing and is deliberately left alone.
 render_surface_css()
+# The mentor's visual language on every page, not only Home (ui/home_style.py).
+render_site_style()
 
 current_step = st.session_state.get("current_step", "home")
 
