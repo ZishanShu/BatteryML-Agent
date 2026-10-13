@@ -24,6 +24,10 @@ from batteryml_web.agent.result_analysis import (
 )
 from batteryml_web.agent.llm_client import run_llm_prompt, save_llm_output
 from batteryml_web.agent.catalog import REQUEST_TEMPLATE_STRUCTURE
+from batteryml_web.agent.config_explanation import (
+    CONFIG_EXPLANATION_SYSTEM_PROMPT,
+    build_config_explanation_prompt,
+)
 from batteryml_web.agent.execution import build_run_command
 from batteryml_web.agent.executor import discover_artifacts
 from batteryml_web.agent.results import build_result_context
@@ -2557,10 +2561,26 @@ def render_run_model_page():
                     if require_llm_or_show_message("run_model_config_llm_output"):
                         try:
                             with st.spinner("Calling LLM assistant..."):
+                                # The file's own text and the page's resolved
+                                # dataset/task/model, not just its path: from the
+                                # path alone the assistant swapped dataset and
+                                # model and invented config sections.
+                                config_file = Path(str(config_path)) if config_path else None
+                                try:
+                                    config_text = config_file.read_text(encoding="utf-8") if config_file and config_file.is_file() else None
+                                except OSError:
+                                    config_text = None
                                 response = run_llm_prompt(
-                                    f"Explain this BatteryML config: {config_path}. Return suggestion only.",
+                                    build_config_explanation_prompt(
+                                        dataset=ds,
+                                        task=task_choice,
+                                        model_key=model,
+                                        model_display=model_display_name(model),
+                                        config_path=str(config_path),
+                                        config_text=config_text,
+                                    ),
                                     **llm_credentials(),
-                                    system_prompt="You are an assistant for a BatteryML web protocol platform. Provide suggestions only. Do not modify raw data, metrics, predictions, or config files.",
+                                    system_prompt=CONFIG_EXPLANATION_SYSTEM_PROMPT,
                                 )
                             set_llm_connection_result(True, "LLM request completed.")
                         except Exception as exc:
@@ -2579,7 +2599,7 @@ def render_run_model_page():
                                 response = run_llm_prompt(
                                     build_config_suggestion_prompt(
                                         dataset=ds,
-                                        task="RUL prediction",
+                                        task=task_choice,
                                         model=model,
                                         config_path=Path(str(config_path)) if config_path else Path("<missing-config>"),
                                         config_text=(Path(str(config_path)).read_text(encoding="utf-8", errors="ignore") if config_path and Path(str(config_path)).exists() else "Config file missing."),
