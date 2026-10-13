@@ -55,6 +55,20 @@ LAST_RENDERED_STEP_KEY = "_last_rendered_step"
 #: Session key for the injection counter described in the module docstring.
 SCROLL_SERIAL_KEY = "_scroll_to_top_serial"
 
+#: Emitted only on the run that opens a new page (see render_scroll_to_top).
+#: Streamlit marks an element of the previous run ``data-stale="true"`` until
+#: the new run re-draws its position. Layout blocks (tabs, column rows,
+#: expanders) carry no such attribute themselves, so one is hidden while
+#: everything in it is stale and nothing of the new page has arrived in it —
+#: otherwise the previous page's tab bar stayed on screen, greyed, under the
+#: new title.
+HIDE_STALE_PAGE_CSS = """<style>
+[data-testid="stMain"] [data-stale="true"],
+[data-testid="stMain"] :is([data-testid="stTabs"], [data-testid="stLayoutWrapper"], [data-testid="stExpander"]):has([data-stale="true"]):not(:has([data-stale="false"])) {
+    display: none !important;
+}
+</style>"""
+
 
 def page_changed(session_state: MutableMapping, step: str) -> bool:
     """Whether ``step`` differs from the step rendered on the previous run.
@@ -123,9 +137,28 @@ def render_scroll_to_top(step: str) -> bool:
     tell the two cases apart rather than guessing from the absence of a
     visible effect.
     """
+    # One slot on *every* run, filled only on a page change. Emitting the
+    # iframe on some runs and nothing on others shifted every element below
+    # it by one position on the first rerun after navigating; Streamlit then
+    # treated the page's st.tabs as a new widget (first tab selected) and
+    # left the old page greyed out underneath. Measured on Run Model: the
+    # first "Run BatteryML" click jumped to "Configuration", hid the run's
+    # progress in the unselected "Command & Run" tab, and kept a faded copy
+    # of the previous page below until the run ended.
+    slot = st.empty()
     if not page_changed(st.session_state, step):
         return False
     serial = int(st.session_state.get(SCROLL_SERIAL_KEY, 0)) + 1
     st.session_state[SCROLL_SERIAL_KEY] = serial
-    components.html(scroll_script(serial), height=0)
+    with slot.container():
+        components.html(scroll_script(serial), height=0)
+        # Only on this navigation run: the previous page's elements are
+        # "stale" until the new page re-draws their positions, and a page
+        # that reads a large data tree before drawing (Run Model's dataset
+        # cards, Review Results' run history) left the previous page's
+        # content greyed out under the new title for the whole time. Hiding
+        # stale elements in the main area removes it at once. The rule lives
+        # in this slot, so the next rerun within the page drops it and a
+        # button press keeps Streamlit's usual behaviour.
+        st.markdown(HIDE_STALE_PAGE_CSS, unsafe_allow_html=True)
     return True

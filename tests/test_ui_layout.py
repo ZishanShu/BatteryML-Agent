@@ -97,11 +97,31 @@ class _Component:
         self.calls.append({"html": str(html), "height": kwargs.get("height")})
 
 
+class _Slot:
+    def __enter__(self) -> "_Slot":
+        return self
+
+    def container(self, **kwargs) -> "_Slot":
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+
 class _St:
-    """The two attributes ``ui/scroll.py`` touches."""
+    """The attributes ``ui/scroll.py`` touches."""
 
     def __init__(self, session: dict) -> None:
         self.session_state = session
+        self.slots = 0
+        self.markdowns: list[str] = []
+
+    def markdown(self, body: str, **kwargs) -> None:
+        self.markdowns.append(str(body))
+
+    def empty(self) -> _Slot:
+        self.slots += 1
+        return _Slot()
 
 
 class TestPageTopResetDecision(unittest.TestCase):
@@ -174,6 +194,30 @@ class TestPageTopResetInjection(unittest.TestCase):
 
         self.assertFalse(self.scroll.render_scroll_to_top("run_model"))
         self.assertEqual(len(self.components.calls), 1)
+
+    def test_the_slot_is_reserved_on_every_run(self) -> None:
+        """Same element count before the page body whether or not it scrolls.
+
+        Otherwise the first rerun after navigating shifts every element below
+        by one, and Streamlit rebuilds the page's tabs (first tab selected).
+        """
+        fake = self.scroll.st
+        for step in ("home", "run_model", "run_model", "run_model"):
+            self.scroll.render_scroll_to_top(step)
+        self.assertEqual(fake.slots, 4)
+        self.assertEqual(len(self.components.calls), 1)
+
+    def test_stale_previous_page_is_hidden_only_on_navigation(self) -> None:
+        """The old page must not linger greyed out under the new page's title."""
+        fake = self.scroll.st
+        self.scroll.render_scroll_to_top("prepare_data")
+        self.assertEqual(fake.markdowns, [])
+        self.scroll.render_scroll_to_top("run_model")
+        self.assertEqual(fake.markdowns, [self.scroll.HIDE_STALE_PAGE_CSS])
+        self.assertIn('[data-stale="true"]', self.scroll.HIDE_STALE_PAGE_CSS)
+        self.assertIn('[data-testid="stMain"]', self.scroll.HIDE_STALE_PAGE_CSS)
+        self.scroll.render_scroll_to_top("run_model")       # a rerun within the page
+        self.assertEqual(len(fake.markdowns), 1)
 
     def test_the_injection_takes_no_vertical_space(self) -> None:
         self.scroll.render_scroll_to_top("home")

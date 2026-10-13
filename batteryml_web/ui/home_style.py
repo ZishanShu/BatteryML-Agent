@@ -797,6 +797,18 @@ HOME_STYLE_CSS = """
     line-height: 1.35;
 }
 
+/* "← Choose another start path": a navigation button sized to its label
+   had no horizontal padding (165px, text touching both edges). 240px wide
+   (user request) with side padding so the label never touches the edge;
+   capped by the column so it never overflows. */
+.st-key-home_choose_another [data-testid="stButton"] > button {
+    width: 240px;
+    max-width: 100%;
+    padding-left: 1rem;
+    padding-right: 1rem;
+    justify-content: center;
+}
+
 @media (max-width: 900px) {
     .bml-process-steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .bml-process-step::after { content: ""; }
