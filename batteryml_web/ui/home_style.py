@@ -798,13 +798,14 @@ HOME_STYLE_CSS = """
 }
 
 /* "← Choose another start path": a navigation button sized to its label
-   had no horizontal padding (165px, text touching both edges). Give it room
-   and a wider footprint; capped by the column so it never overflows. */
+   had no horizontal padding (165px, text touching both edges). 240px wide
+   (user request) with side padding so the label never touches the edge;
+   capped by the column so it never overflows. */
 .st-key-home_choose_another [data-testid="stButton"] > button {
-    min-width: 20rem;
+    width: 240px;
     max-width: 100%;
-    padding-left: 1.75rem;
-    padding-right: 1.75rem;
+    padding-left: 1rem;
+    padding-right: 1rem;
     justify-content: center;
 }
 
