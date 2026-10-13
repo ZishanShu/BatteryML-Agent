@@ -123,9 +123,19 @@ def render_scroll_to_top(step: str) -> bool:
     tell the two cases apart rather than guessing from the absence of a
     visible effect.
     """
+    # One slot on *every* run, filled only on a page change. Emitting the
+    # iframe on some runs and nothing on others shifted every element below
+    # it by one position on the first rerun after navigating; Streamlit then
+    # treated the page's st.tabs as a new widget (first tab selected) and
+    # left the old page greyed out underneath. Measured on Run Model: the
+    # first "Run BatteryML" click jumped to "Configuration", hid the run's
+    # progress in the unselected "Command & Run" tab, and kept a faded copy
+    # of the previous page below until the run ended.
+    slot = st.empty()
     if not page_changed(st.session_state, step):
         return False
     serial = int(st.session_state.get(SCROLL_SERIAL_KEY, 0)) + 1
     st.session_state[SCROLL_SERIAL_KEY] = serial
-    components.html(scroll_script(serial), height=0)
+    with slot:
+        components.html(scroll_script(serial), height=0)
     return True

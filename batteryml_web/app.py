@@ -2598,7 +2598,9 @@ def render_run_model_page():
                             response,
                             (_project_root() or Path("runs/web_projects/default")) / "agent_outputs" / "model_config_suggestion.md",
                         )
-            render_run_model_llm_output_panel("run_model_config_llm_output", "Config guidance", "Config guidance", "Config assistant")
+        # Full width, under both columns: drawn inside the right column the
+        # answer was squeezed into ~45% of the page (user request).
+        render_run_model_llm_output_panel("run_model_config_llm_output", "Config guidance", "Config guidance", "Config assistant")
 
     with tabs[2]:
         ds = st.session_state.get("selected_dataset", "MATR")

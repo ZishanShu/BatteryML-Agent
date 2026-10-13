@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import html
 import os
+import queue
 import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -126,11 +128,45 @@ def run_command_with_progress(
     )
 
     update(steps[1][0] if len(steps) > 1 else 10, steps[1][1] if len(steps) > 1 else "Running command...")
+    running_percent = steps[1][0] if len(steps) > 1 else 10
 
+    # Output is read on a helper thread so this (the script) thread can
+    # refresh the page every second even while BatteryML prints nothing —
+    # BatLiNet's feature extraction runs for minutes without a line, and the
+    # page then sat on "Check dataset" with "Elapsed time: 00:00:00", which
+    # reads as frozen. Only this thread touches Streamlit.
+    lines: "queue.Queue[Optional[str]]" = queue.Queue()
+
+    def _pump(stream) -> None:
+        try:
+            for raw in stream:
+                lines.put(raw)
+        finally:
+            lines.put(None)
+
+    reader = None
     if process.stdout is not None:
-        for line in process.stdout:
-            logs.append(_strip_terminal_controls(line))
-            _render_progress_log(log_box, logs)
+        reader = threading.Thread(target=_pump, args=(process.stdout,), daemon=True)
+        reader.start()
+        stream_open = True
+        last_tick = 0.0
+        while stream_open:
+            try:
+                raw = lines.get(timeout=1.0)
+            except queue.Empty:
+                raw = ""
+            if raw is None:
+                stream_open = False
+            elif raw:
+                logs.append(_strip_terminal_controls(raw))
+                _render_progress_log(log_box, logs)
+            now = time.perf_counter()
+            if stream_open and now - last_tick >= 1.0:
+                last_tick = now
+                # A truthful status: the run is in progress; the bar holds
+                # where it is because BatteryML reports no percentage.
+                update(running_percent, "BatteryML is running. Output appears below as it is printed.")
+        reader.join(timeout=5)
 
     return_code = process.wait()
     output_tail = "".join(logs[-200:])
