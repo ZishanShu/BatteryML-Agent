@@ -413,26 +413,27 @@ class TestExplanationsAreOnDemand(unittest.TestCase):
         _render(session, radio_values={ui.COMPUTE_LABEL: "CPU"})
         self.assertEqual(len(self.explain.calls), 1)
 
-    def test_the_agent_explanation_panel_is_collapsed(self) -> None:
-        """Requirement 10.
+    def test_the_agent_explanation_panel_is_shown_open(self) -> None:
+        """Requirement 10, amended on user request: drawn open, not collapsed.
 
-        It opened itself, which pushed the metrics it was commenting on off
-        the first screen — and it was the LLM's prose that the reader met
-        first, above BatteryML's own numbers.
+        The user pressed "Explain computed result" to get this text; a closed
+        expander hid it behind a second click. It is drawn once, in a
+        bordered block under its heading, and a rerun sends nothing.
         """
         session = self._configured_session()
-        fake = _render(
+        _render(
             session,
             clicked={ui.EXPLAIN_BUTTON_LABEL},
             radio_values={ui.COMPUTE_LABEL: "CPU"},
         )
         fake = _render(session, radio_values={ui.COMPUTE_LABEL: "CPU"})
-        states = dict(fake.rec["expander_states"])
-        self.assertIn("Agent explanation", states)
-        self.assertFalse(
-            states["Agent explanation"],
-            "the explanation panel must not open by itself",
+        self.assertNotIn(ui.AGENT_EXPLANATION_TITLE, dict(fake.rec["expander_states"]))
+        self.assertIn(f"#### 🤖 {ui.AGENT_EXPLANATION_TITLE}", fake.rec["markdown"])
+        self.assertTrue(
+            any(session["agent_explanation"] in w for w in fake.rec["writes"]),
+            "the explanation text is not drawn on the page",
         )
+        self.assertEqual(len(self.explain.calls), 1)
 
     def test_the_result_explanation_panel_is_shown_open(self) -> None:
         """Review Results draws the answer directly (user request superseding Requirement 11).

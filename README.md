@@ -832,7 +832,8 @@ Click **Run**.
   `stdout.log`, `stderr.log`, `config_<timestamp>.yaml` and
   `predictions_seed_0_<timestamp>.pkl`.
 - **Expected:** the saved metrics; **Run again** repeats; with an LLM,
-  **Explain computed result** describes the result in words.
+  **Explain computed result** describes the result in words, shown directly
+  below the result in a box titled **🤖 Agent explanation** (not collapsed).
 - **Errors:** a dataset that is not `READY` blocks the run; preprocess it (§8).
 
 ---

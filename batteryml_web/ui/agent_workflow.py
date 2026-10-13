@@ -255,6 +255,9 @@ REQUEST_WIDGET_KEY = "agent_request_input"
 USE_TEMPLATE_KEY = "agent_use_template"
 #: Exact wording milestone A requires wherever a smoke run is offered or shown.
 SMOKE_CHECKBOX_LABEL = SMOKE_NOTICE
+
+#: Heading of the open block that shows "Explain computed result"'s answer.
+AGENT_EXPLANATION_TITLE = "Agent explanation"
 #: Raw stdout/stderr are display tails only; metrics never come from them.
 OUTPUT_TAIL_CHARS = 4000
 #: stderr carries the traceback, so it keeps a much larger tail than stdout
@@ -2503,11 +2506,12 @@ def render_agent_workflow() -> None:
                 event_key=EVENT_EXPLANATION_READY,
                 signature=explanation_serial,
             )
-        # Collapsed. An explanation is commentary on a result that is already
-        # fully rendered above it, so it opens when the reader asks for it
-        # rather than pushing the metrics off the first screen. Opening it
-        # sends nothing: the text is already in session state.
-        with st.expander("Agent explanation", expanded=False):
+        # Drawn open, in a bordered block below the computed result it
+        # describes (user request: a collapsed expander hid the answer the
+        # user had just pressed a button for). Drawing it sends nothing: the
+        # text is already in session state.
+        with st.container(border=True, key="agent_explanation_panel"):
+            st.markdown(f"#### 🤖 {AGENT_EXPLANATION_TITLE}")
             st.caption("Explanation only — never a source of metrics or execution.")
             settings_label = st.session_state.get("agent_explanation_settings")
             if settings_label and settings_label != llm_settings_fingerprint():
