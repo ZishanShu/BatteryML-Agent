@@ -536,7 +536,8 @@ ssh -L 8501:localhost:8501 user@server
 #### 第 4 步 · Review results
 
 页面显示 BatteryML 保存的指标。点击 **Open Review Results** 查看完整结果（§14）。
-第一次进入时，如果没有配置 LLM，LLM 设置对话框会弹出一次；不使用 LLM 的话点击 **Close** 关闭即可。
+这只是打开页面，不需要 LLM，也不会弹出 LLM 对话框。只有之后在没有连接 LLM 的情况下点击
+**Summarize results** 或 **Explain metrics** 时，才会弹出 LLM 设置对话框（§12）。
 
 ### 7.2 Create new project
 
@@ -752,7 +753,8 @@ Agent Workflow 把一句话变成一个经过检查的运行计划。**不需要
   （冒烟测试会追加 `_smoke`），包含 `run.json`、`run.log`、`stdout.log`、`stderr.log`、
   `config_<timestamp>.yaml` 和 `predictions_seed_0_<timestamp>.pkl`。
 - **预期结果：** 显示保存的指标；**Run again** 可重复运行；连接 LLM 后，
-  **Explain computed result** 用文字描述结果。
+  **Explain computed result** 用文字描述结果，直接显示在结果下方一个标题为
+  **🤖 Agent explanation** 的框里（不是折叠的）。
 - **错误：** 数据集不是 `READY` 时无法运行；请先预处理（§8）。
 
 ---
@@ -790,6 +792,8 @@ Agent Workflow 把一句话变成一个经过检查的运行计划。**不需要
 | Agent Workflow | **Explain this workflow**、**Explain computed result** |
 | Review Results | **Summarize results**、**Explain metrics**（在 **Optional LLM interpretation** 下） |
 
+在 Review Results 中，回答会直接显示在按钮下方一个标题为
+**🤖 LLM Assistant Output · Result interpretation** 的框里（不是折叠的）。
 未连接时，这些按钮会打开 LLM 设置对话框，而不会调用任何服务。
 
 ---

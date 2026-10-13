@@ -98,9 +98,7 @@ from batteryml_web.ui.run_history import (
 from batteryml_web.ui.settings_panel import (
     REVEAL_ACTION,
     REVEAL_CONFIGURE,
-    consume_results_intent,
     llm_action_allowed,
-    mark_results_intent,
     render_configure_in_settings_notice,
     render_requested_llm_settings,
     request_llm_settings,
@@ -1513,10 +1511,8 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
     else:
         st.caption("After a run finishes, its metrics, predictions, and logs will appear here.")
     if st.button("Open Review Results", type=NAV_ROLE, use_container_width=True, key="home_quick_open_review"):
-        if last_status == "success":
-            # Viewing the results of the run that just completed: the one
-            # arrival that may offer LLM Settings, once (UI-14).
-            mark_results_intent()
+        # Navigation only. LLM Settings opens from Review Results when the
+        # user asks for a summary or explanation without a connection (UI-14).
         set_current_step("review_results")
 
 
@@ -2362,13 +2358,11 @@ RUN_MODEL_COMPLETED_KEY = "run_model_completed_run"
 
 
 def render_llm_output_panel(output_key: str, title: str) -> None:
-    """Show a stored assistant output. Collapsed; sends nothing.
+    """Show a stored assistant output, open, once per page; sends nothing.
 
-    Collapsed because this is commentary on metrics and figures that are
-    already on the page, and an explanation that opens by itself pushes the
-    result it is explaining off the first screen. Opening it costs nothing:
-    the text is already in session state, so no call is made here — the only
-    thing that calls the assistant is the button that produced it.
+    The text is already in session state, so no call is made here — the only
+    thing that calls the assistant is the button that produced it. Review
+    Results draws it once, directly below the buttons that asked for it.
     """
     output = st.session_state.get(output_key)
     if not output:
@@ -2386,8 +2380,10 @@ def render_llm_output_panel(output_key: str, title: str) -> None:
             f"LLM assistant status now: {describe_llm_status()}."
         )
         return
-    st.markdown("---")
-    with st.expander(f"🤖 LLM Assistant Output · {title}", expanded=False):
+    # Drawn open, not in a collapsed expander: the user pressed a button to
+    # get this text, so hiding it behind a second click only hid the answer.
+    with st.container(border=True, key=f"{output_key}_panel"):
+        st.markdown(f"#### 🤖 LLM Assistant Output · {title}")
         st.caption("Suggestion only. This output does not automatically modify raw data, config files, predictions, or metrics.")
         generated_with = st.session_state.get(f"{output_key}{SETTINGS_PROVENANCE_SUFFIX}")
         if generated_with and generated_with != llm_settings_fingerprint():
@@ -2722,7 +2718,6 @@ def render_run_model_page():
             and st.session_state.get("last_run_status") == "success"
         ):
             if st.button("Review Results →", type=NAV_ROLE, use_container_width=True, key="run_go_results_after_run"):
-                mark_results_intent()
                 set_current_step("review_results")
         render_run_model_llm_output_panel("run_model_command_llm_output", "Command guidance", "Command guidance", "Command assistant")
         st.markdown("#### Output workspace")
@@ -3064,9 +3059,6 @@ def render_review_results_page():
     # in after the buttons are handled, so a request made on this run is
     # already reflected in it.
     status_slot = st.empty()
-    # Arriving from a run that just completed, with nothing configured,
-    # offers Settings once per session (UI-14); never on an ordinary rerun.
-    consume_results_intent()
 
     btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 1])
     with btn_col1:
@@ -3233,12 +3225,6 @@ Logs available: {'Yes' if run_files.get("log_files") else 'No'}
                 if selected.run_id
                 else selected.reason
             )
-        # Gated on identity, exactly as above: this panel must never repeat
-        # an explanation belonging to a different result.
-        if cached_for(
-            st.session_state, "review_llm_output", EXPLANATION_IDENTITY_KEY, selected
-        ) is not None:
-            render_llm_output_panel("review_llm_output", "Result interpretation")
 
     with tabs[4]:
         if selected.manifest:
