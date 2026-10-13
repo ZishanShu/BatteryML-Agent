@@ -582,8 +582,9 @@ Read it before running.
 #### Step 4 · Review results
 
 The metrics BatteryML saved are shown. Click **Open Review Results** for the
-full result (§14). The first time, if no LLM is configured, the LLM settings
-dialog opens once; close it with **Close** if you do not use an LLM.
+full result (§14). This only opens the page; no LLM is needed and no LLM
+dialog appears. The LLM settings dialog opens only if you later click
+**Summarize results** or **Explain metrics** without a connected LLM (§12).
 
 ### 7.2 Create new project
 
@@ -873,6 +874,8 @@ put an API key into a file in this repository.
 | Agent Workflow | **Explain this workflow**, **Explain computed result** |
 | Review Results | **Summarize results**, **Explain metrics** (under **Optional LLM interpretation**) |
 
+On Review Results the answer appears directly below the buttons, in a box
+titled **🤖 LLM Assistant Output · Result interpretation** (not collapsed).
 Without a connection, these buttons open the LLM settings dialog instead of
 calling anything.
 

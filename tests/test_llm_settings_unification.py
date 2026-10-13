@@ -434,12 +434,18 @@ class TestExplanationsAreOnDemand(unittest.TestCase):
             "the explanation panel must not open by itself",
         )
 
-    def test_the_result_explanation_panel_is_collapsed(self) -> None:
-        """Requirement 11, for the Review Results panel."""
+    def test_the_result_explanation_panel_is_shown_open(self) -> None:
+        """Review Results draws the answer directly (user request superseding Requirement 11).
+
+        The user pressed Summarize / Explain to get this text; a collapsed
+        expander hid the answer behind a second click. It is drawn once, in a
+        bordered block, and still sends nothing when drawn.
+        """
         app_code = (REPO_ROOT / "batteryml_web" / "app.py").read_text(encoding="utf-8")
         block = app_code.split("def render_llm_output_panel")[1].split("\ndef ")[0]
-        self.assertIn("expanded=False", block)
-        self.assertNotIn("expanded=True", block)
+        self.assertNotIn("st.expander(", block)
+        self.assertIn("st.container(border=True", block)
+        self.assertEqual(app_code.count('render_llm_output_panel("review_llm_output"'), 1)
 
 
 # --------------------------------------------------------------------------

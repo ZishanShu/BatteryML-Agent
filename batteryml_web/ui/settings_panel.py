@@ -440,17 +440,12 @@ def render_sidebar_settings() -> None:
 #: Consumed when the dialog opens, so a later rerun does not reopen it.
 REVEAL_REQUEST_KEY = "llm_settings_reveal_request"
 
-#: Set by an intentional "view the results of the run that just completed";
-#: consumed by Review Results on arrival.
-RESULTS_INTENT_KEY = "llm_results_view_intent"
-
-#: The once-per-session automatic reveal has happened (whether the user then
-#: connected, closed or dismissed it). Never reset within the session.
-RESULTS_REVEAL_DONE_KEY = "llm_results_reveal_done"
-
+#: Settings opens only when the user asks for something that needs it:
+#: "Configure LLM", or Summarize/Explain without a connection. Arriving at
+#: Review Results never opens it by itself (it used to, once, after a run
+#: completed; users read that as an interruption before they wanted an LLM).
 REVEAL_CONFIGURE = "configure"
 REVEAL_ACTION = "action"
-REVEAL_ARRIVAL = "arrival"
 
 #: What the dialog says first, per reason. No reason claims a result is
 #: missing: every BatteryML number is already on the page without an LLM.
@@ -459,45 +454,12 @@ REVEAL_NOTES: Dict[str, str] = {
         "Summaries and explanations need a connected LLM. Nothing was sent. "
         "Connect below, then press the button again."
     ),
-    REVEAL_ARRIVAL: (
-        "Your run has finished. Optionally connect an LLM to summarize or "
-        "explain it — every BatteryML result is already on the page without one."
-    ),
 }
 
 
 def request_llm_settings(reason: str) -> None:
     """Ask for Settings to open on this run (see :func:`render_requested_llm_settings`)."""
     st.session_state[REVEAL_REQUEST_KEY] = str(reason)
-
-
-def mark_results_intent() -> None:
-    """Record an intentional "view results" of a run that just completed."""
-    st.session_state[RESULTS_INTENT_KEY] = True
-
-
-def arrival_reveal_due(*, intent: bool, status: str, already_revealed: bool) -> bool:
-    """Whether arriving at Review Results opens Settings by itself. Pure.
-
-    Only on an intentional "view results" of a completed run, only when
-    nothing is configured (a saved or failed configuration is the user's to
-    act on — they have seen Settings already), and only once a session.
-    """
-    return bool(intent) and status == LLM_STATUS_NOT_CONFIGURED and not already_revealed
-
-
-def consume_results_intent() -> bool:
-    """On Review Results: decide, once, whether this arrival reveals Settings."""
-    intent = bool(st.session_state.pop(RESULTS_INTENT_KEY, False))
-    due = arrival_reveal_due(
-        intent=intent,
-        status=get_llm_status(),
-        already_revealed=bool(st.session_state.get(RESULTS_REVEAL_DONE_KEY)),
-    )
-    if due:
-        st.session_state[RESULTS_REVEAL_DONE_KEY] = True
-        request_llm_settings(REVEAL_ARRIVAL)
-    return due
 
 
 def llm_action_allowed() -> bool:

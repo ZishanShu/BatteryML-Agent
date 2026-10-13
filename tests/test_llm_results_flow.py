@@ -126,44 +126,50 @@ class _ResultsHarness(_PageHarness):
 
 class TestC19ToC23ResultsAndSettings(_ResultsHarness, unittest.TestCase):
     def test_c19_connected_results_never_ask_for_credentials(self) -> None:
-        at = self.page(**self.connected(), **{settings_panel.RESULTS_INTENT_KEY: True})
+        at = self.page(**self.connected())
         self.assertFalse(self.dialog_open(at))
         self.assertNotIn(settings_panel.REVEAL_REQUEST_KEY, at.session_state)
-        self.assertFalse(at.session_state[settings_panel.RESULTS_REVEAL_DONE_KEY]
-                         if settings_panel.RESULTS_REVEAL_DONE_KEY in at.session_state else False)
         self.assertTrue(any("LLM assistant status: Connected" in c.value for c in at.caption))
         # Summarize uses the connected LLM for the selected result, once.
         self.click(at, "review_summarize_results")
         self.assertEqual(len(self.prompts), 1)
         self.assertFalse(self.dialog_open(at))
 
-    def test_c20_c21_not_configured_view_results_opens_settings_once(self) -> None:
-        at = self.page(**{settings_panel.RESULTS_INTENT_KEY: True})
-        self.assertTrue(self.dialog_open(at), "the arrival from a completed run did not offer Settings")
-        self.assertTrue(at.session_state[settings_panel.RESULTS_REVEAL_DONE_KEY])
-        # Results stay readable underneath: the history and the result tabs rendered.
-        self.assertIn("Run history", [h.value for h in at.subheader])
-        # An ordinary rerun does not reopen it ...
-        at.run()
+    def test_c20_arriving_at_results_never_opens_settings(self) -> None:
+        """Not configured, from the sidebar: results only, no dialog."""
+        at = self.page()
         self.assertFalse(self.dialog_open(at))
-        # ... and neither does a second "view results" in the same session.
-        at.session_state[settings_panel.RESULTS_INTENT_KEY] = True
+        self.assertIn("Run history", [h.value for h in at.subheader])
         at.run()
         self.assertFalse(self.dialog_open(at))
         self.assertEqual(self.prompts, [])
 
-    def test_c20_plain_navigation_does_not_open_settings(self) -> None:
-        at = self.page()                     # no intent: arrived from the sidebar
-        self.assertFalse(self.dialog_open(at))
+    def test_c20_open_review_results_after_a_quick_run_does_not_open_settings(self) -> None:
+        """Quick experience → Open Review Results is navigation, not an LLM request.
 
-    def test_c20_the_home_button_records_the_intent_only_after_a_completed_run(self) -> None:
-        at = self.page(step="home", home_entry="quick", last_run_status="success")
-        self.click(at, "home_quick_open_review")
-        self.assertEqual(at.session_state["current_step"], "review_results")
+        It used to open Settings once after a successful run; Settings now
+        opens only from Summarize results / Explain metrics (or Configure LLM).
+        """
+        for status in ("success", "failed"):
+            with self.subTest(last_run_status=status):
+                at = self.page(step="home", home_entry="quick", last_run_status=status)
+                self.click(at, "home_quick_open_review")
+                self.assertEqual(at.session_state["current_step"], "review_results")
+                self.assertFalse(self.dialog_open(at))
+                self.assertNotIn(settings_panel.REVEAL_REQUEST_KEY, at.session_state)
+        # The first request for an interpretation is what opens it.
+        self.click(at, "review_summarize_results")
         self.assertTrue(self.dialog_open(at))
-        at = self.page(step="home", home_entry="quick", last_run_status="failed")
-        self.click(at, "home_quick_open_review")
-        self.assertFalse(self.dialog_open(at))
+        self.assertEqual(self.prompts, [])
+
+    def test_c21_the_interpretation_is_shown_open_and_once(self) -> None:
+        """Summarize's answer is drawn directly below the buttons, not in a collapsed expander."""
+        at = self.page(**self.connected())
+        self.click(at, "review_summarize_results")
+        run_answers = [m.value for m in at.markdown if "SUMMARY-FOR::" in str(m.value)]
+        self.assertEqual(len(run_answers), 1, "the answer must appear exactly once on the page")
+        self.assertFalse([e for e in at.expander if "LLM Assistant Output" in str(e.label)])
+        self.assertTrue(any("LLM Assistant Output · Result interpretation" in str(m.value) for m in at.markdown))
 
     def test_c22_configure_llm_opens_the_shared_form(self) -> None:
         at = self.page(**self.connected())
@@ -208,7 +214,6 @@ class TestC24ToC26SharedState(_ResultsHarness, unittest.TestCase):
         for step in ("agent_workflow", "run_model", "review_results", "home"):
             with self.subTest(step=step):
                 at.session_state["current_step"] = step
-                at.session_state[settings_panel.RESULTS_INTENT_KEY] = True
                 at.run()
                 self.assertHealthy(at)
                 self.assertEqual(at.session_state["llm_status"], llm_state.LLM_STATUS_CONNECTED)
@@ -396,13 +401,13 @@ class TestDialogBody(unittest.TestCase):
         self.assertEqual(session["t_base_url"], SETTINGS["llm_base_url"])   # fields kept
         self.assertEqual(session["llm_status"], llm_state.LLM_STATUS_FAILED)   # not retried
 
-    def test_the_arrival_rule(self) -> None:
-        due = settings_panel.arrival_reveal_due
-        self.assertTrue(due(intent=True, status=llm_state.LLM_STATUS_NOT_CONFIGURED, already_revealed=False))
-        self.assertFalse(due(intent=False, status=llm_state.LLM_STATUS_NOT_CONFIGURED, already_revealed=False))
-        self.assertFalse(due(intent=True, status=llm_state.LLM_STATUS_NOT_CONFIGURED, already_revealed=True))
-        for status in (llm_state.LLM_STATUS_CONNECTED, llm_state.LLM_STATUS_CONFIGURED, llm_state.LLM_STATUS_FAILED):
-            self.assertFalse(due(intent=True, status=status, already_revealed=False))
+    def test_no_automatic_reveal_remains(self) -> None:
+        """Settings opens only for Configure LLM or an LLM action without a connection."""
+        source = Path(settings_panel.__file__).read_text(encoding="utf-8")
+        for gone in ("REVEAL_ARRIVAL", "RESULTS_INTENT_KEY", "consume_results_intent", "mark_results_intent"):
+            self.assertNotIn(gone, source)
+            self.assertNotIn(gone, APP.read_text(encoding="utf-8"))
+        self.assertEqual(set(settings_panel.REVEAL_NOTES), {settings_panel.REVEAL_ACTION})
 
     def test_one_form_one_call_site(self) -> None:
         source = Path(settings_panel.__file__).read_text(encoding="utf-8")

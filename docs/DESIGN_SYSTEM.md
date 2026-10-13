@@ -72,9 +72,10 @@ dismissible **LLM settings** dialog with the same fields and buttons. Review
 Results shows the live status line, never an old error in its place.
 **Configure LLM** opens the dialog; **Summarize results** and **Explain
 metrics** call the provider only when the status is *Connected* and
-otherwise open the dialog without sending anything. After a completed run,
-"Open Review Results" / "Review Results →" opens the dialog once per
-session when nothing is configured. Details: `docs/SPEC.md` `UI-14`.
+otherwise open the dialog without sending anything. Arriving at Review
+Results (including "Open Review Results" / "Review Results →" after a run)
+never opens the dialog by itself. The answer is drawn open, once, directly
+below the buttons. Details: `docs/SPEC.md` `UI-14`.
 
 ## Checking it in a browser
 
