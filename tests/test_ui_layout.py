@@ -101,6 +101,9 @@ class _Slot:
     def __enter__(self) -> "_Slot":
         return self
 
+    def container(self, **kwargs) -> "_Slot":
+        return self
+
     def __exit__(self, *exc) -> bool:
         return False
 
@@ -111,6 +114,10 @@ class _St:
     def __init__(self, session: dict) -> None:
         self.session_state = session
         self.slots = 0
+        self.markdowns: list[str] = []
+
+    def markdown(self, body: str, **kwargs) -> None:
+        self.markdowns.append(str(body))
 
     def empty(self) -> _Slot:
         self.slots += 1
@@ -199,6 +206,18 @@ class TestPageTopResetInjection(unittest.TestCase):
             self.scroll.render_scroll_to_top(step)
         self.assertEqual(fake.slots, 4)
         self.assertEqual(len(self.components.calls), 1)
+
+    def test_stale_previous_page_is_hidden_only_on_navigation(self) -> None:
+        """The old page must not linger greyed out under the new page's title."""
+        fake = self.scroll.st
+        self.scroll.render_scroll_to_top("prepare_data")
+        self.assertEqual(fake.markdowns, [])
+        self.scroll.render_scroll_to_top("run_model")
+        self.assertEqual(fake.markdowns, [self.scroll.HIDE_STALE_PAGE_CSS])
+        self.assertIn('[data-stale="true"]', self.scroll.HIDE_STALE_PAGE_CSS)
+        self.assertIn('[data-testid="stMain"]', self.scroll.HIDE_STALE_PAGE_CSS)
+        self.scroll.render_scroll_to_top("run_model")       # a rerun within the page
+        self.assertEqual(len(fake.markdowns), 1)
 
     def test_the_injection_takes_no_vertical_space(self) -> None:
         self.scroll.render_scroll_to_top("home")
