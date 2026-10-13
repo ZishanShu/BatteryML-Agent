@@ -1,0 +1,86 @@
+# HUST SOH estimation — Elastic Net regression.
+#
+# The HUST counterpart of configs/soh/elastic_net/matr.yaml. Everything except the
+# train/test split and the processed-data path is identical to that file:
+# same feature extractor, same label convention (reference capacity, sample
+# policy), same transformations and the same estimator settings, so a HUST and
+# a MATR SOH result differ only by the cells they are computed on.
+#
+# SPLIT: HUSTTrainTestSplitter is the partition every HUST RUL baseline in
+# configs/baselines/ uses (explicit cell IDs, cell-disjoint).
+#
+# DATA: whether HUST's processed cells can support SOH under this label
+# policy is decided on the data, not by this file. The website runs
+# batteryml_web.core.soh_readiness before an SOH run (Run Model / Quick
+# experience: "Check SOH data"); from a terminal:
+#     python -m scripts.audit_soh_readiness --dataset HUST
+# Not measured in the repository's own environment, which holds no data.
+#
+# This is model coverage, not a benchmark. No hyperparameter here was chosen
+# by looking at a score.
+
+task: 'SOH estimation'
+
+model:
+    # sklearn.linear_model.ElasticNetCV through ElasticNetRULPredictor. The RUL
+    # in the class name is naming only: SklearnModel.fit is
+    # model.fit(feature.view(n, -1), label) with no lifetime, end-of-life or
+    # cycle semantics. Displayed as "Elastic Net Regression".
+    #
+    # Mixes L1 and L2, so it sits between Ridge (pure L2) and Lasso (pure L1)
+    # in the same penalized-linear family. On a resampled voltage curve the
+    # 37 dimensions are strongly correlated with their neighbours, which is the
+    # case pure L1 handles worst — it picks one of a correlated group almost
+    # arbitrarily — and the L2 component is what stabilises that choice.
+    #
+    # No hyperparameters are declared, so ElasticNetCV's defaults apply:
+    # l1_ratio 0.5, and the penalty strength chosen by internal 5-fold
+    # cross-validation over an automatic alpha path. That CV runs inside the
+    # training split only — it never sees a test cell — but note that fitting
+    # is itself cross-validated.
+    #
+    # Reproducibility: the default coordinate-descent selection is 'cyclic',
+    # not 'random', and the default KFold does not shuffle, so the fit carries
+    # no stochastic component. Two runs at the same seed agree exactly.
+    # [VERIFIED] — measured in this container on a synthetic bundle of the same
+    # width, not on HUST.
+    name: 'ElasticNetRULPredictor'
+
+train_test_split:
+    # Cell-level. Cells are partitioned by explicit ID before any expansion
+    # into cycle-level samples; Task.build asserts the two sides share no cell.
+    name: 'HUSTTrainTestSplitter'
+    cell_data_path: 'data/processed/HUST'
+
+feature:
+    # The voltage curve observed at cycle t, resampled to a fixed width plus
+    # five summary scalars. Reads cycles <= t only, and never capacity: the
+    # label is capacity / Q_ref, so capacity as a feature would make the target
+    # an arithmetic function of the input.
+    name: 'SOHVoltageCurveFeatureExtractor'
+    n_voltage_points: 32
+    n_history_cycles: 1
+    include_cycle_number: false
+
+label:
+    # SOH(cell, t) = Q_discharge(cell, t) / Q_ref(cell), a ratio.
+    name: 'CycleSOHLabelAnnotator'
+    reference_capacity_mode: 'first_valid_discharge_capacity'
+    min_cycle: 10
+    max_cycle: null
+    cycle_stride: 5
+
+feature_transformation:
+    # Voltage values and durations are on very different scales, and the L1/L2
+    # penalty is applied to the raw coefficients, so an unstandardised feature
+    # would be penalised in proportion to its units rather than its
+    # contribution. Standardising is required here, not a preference.
+    name: 'ZScoreDataTransformation'
+
+label_transformation:
+    # Invertible, and DataBundle.evaluate inverse-transforms before scoring, so
+    # the recorded MAE and RMSE are on the canonical SOH ratio scale.
+    # LogScale is deliberately NOT stacked here as it is for RUL: a log of a
+    # ratio near 1.0 compresses exactly the range SOH lives in, and is
+    # undefined at 0.
+    name: 'ZScoreDataTransformation'

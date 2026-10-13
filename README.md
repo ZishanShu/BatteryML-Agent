@@ -569,9 +569,11 @@ Read it before running.
    `Process the dataset in step 1 before starting a model run.` and the run
    cannot start.
 3. Click **Run experiment**.
-   - **What happens:** BatteryML trains and evaluates with seed `0`. A progress
-     bar shows the stages (initialize, check processed data, load
-     configuration, training and evaluation, collect outputs).
+   - **What happens:** BatteryML trains and evaluates with seed `0`. The
+     progress area is the same as Agent Workflow's: a stage line (for example
+     `Training · 6 / 10 · elapsed 00:14 · ETA ~00:01`), a bar that follows
+     BatteryML's own counters, and the raw output under
+     **Technical log (raw output)**.
    - **Output folder:** `runs/web_projects/<project>/quickstart/<run_id>/` with
      `run.json`, `run.log`, `output.log`, `config_<timestamp>.yaml` and
      `predictions_seed_0_<timestamp>.pkl`.
@@ -697,7 +699,17 @@ Configurations available in this repository (examples):
 | --- | --- |
 | MATR · RUL | 23 models, including `xgb`, `rf`, `ridge`, `lasso`, `elastic_net`, `svm`, `gpr`, `mlp`, `cnn`, `lstm`, `transformer`, `batlinet`, `cptransformer`, `dummy` |
 | HUST · RUL, SNL · RUL | 21 models each (no `batlinet`, no `cptransformer`) |
-| MATR · SOH | `elastic_net`, `lasso`, `rf`, `ridge`, `xgb` (`configs/soh/<model>/matr.yaml`) |
+| MATR · SOH, HUST · SOH | `elastic_net`, `lasso`, `rf`, `ridge`, `xgb` (`configs/soh/<model>/matr.yaml`, `…/hust.yaml`) |
+
+**SOH runs need an SOH data check.** With SOH selected, the page shows the
+dataset's SOH verdict next to the Run button, or **Check SOH data** if it has
+not been checked. The check reads every processed cell (it can take a while on
+a large dataset) and passes only if enough cells have a valid reference
+capacity and enough cycles with discharge capacity and voltage
+(`SOH_READY`). Run stays disabled until it passes. The verdict is stored in
+`data/metadata/soh_readiness/` and checked again automatically after the
+processed data changes. The same check from a terminal:
+`python -m scripts.audit_soh_readiness --dataset HUST`.
 
 With a connected LLM (§12), **Explain this config** and **Suggest model/config**
 describe the choice in words. They never change it.
@@ -717,7 +729,8 @@ picks a ready dataset; **Go Prepare Data** opens §8.
 3. Click **Run BatteryML**.
    - **What happens:** BatteryML trains and evaluates with your seed and
      device. The website adds `--metric RMSE,MAE,MAPE` for RUL and
-     `--metric MAE,RMSE` for SOH.
+     `--metric MAE,RMSE` for SOH. Progress is shown as in Agent Workflow:
+     stage, counter, elapsed time, ETA once measurable, and a technical log.
    - **Output:** `runs/web_projects/<project>/run_model/<run_id>/` with
      `run.json`, `output.log`, `config_<timestamp>.yaml` and
      `predictions_seed_<seed>_<timestamp>.pkl`. The latest output is also in
@@ -1107,7 +1120,10 @@ cycler formats `ARBIN BATTERYARCHIVE BIOLOGIC INDIGO LANDT MACCOR NEWARE NOVONIX
   (`RAW_ONLY`) but not preprocessed here.
 - `HNEI`, `SNL`, `UL_PUR` and `OX` must be downloaded by hand.
 - Not every dataset × task × model has a configuration; the website offers only
-  combinations that exist. SOH configurations exist for MATR only.
+  combinations that exist. SOH configurations exist for MATR and HUST; another
+  dataset needs a train/test split, `configs/soh/<model>/<dataset>.yaml` files
+  (written in the repository, not from the website) and a passing SOH data
+  check.
 - Quick experience and Run Model runs cannot be stopped from the website; only
   Agent Workflow has **Stop run**.
 - One device per run; no multi-GPU training in the website.

@@ -80,6 +80,7 @@ from batteryml_web.core.run_identity import new_run_id
 from batteryml_web.core import run_manifest as rm
 from batteryml_web.core.run_manifest import find_run
 from batteryml_web.core import config_task, config_upload, quick_experience
+from batteryml_web.ui.soh_check import render_soh_data_check
 from batteryml_web.core.config_semantics import (
     load_config_semantics,
     model_display_name,
@@ -1100,6 +1101,7 @@ def _run_home_experiment(
             (100, "Run completed"),
         ],
         container=demo_progress_host,
+        live_stages=True,
     )
     _finish_page_run(
         run_dir,
@@ -1450,6 +1452,9 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
     run_ready = processed_ready and plan.valid
     if not processed_ready:
         st.warning("Process the dataset in step 1 before starting a model run.")
+    else:
+        # SOH also needs cells that can carry an SOH label (see soh_gate).
+        run_ready = render_soh_data_check(display_dataset, task_choice, config_path, key="quick", repo_root=REPO_ROOT) and run_ready
     # Data readiness is reported once, by the line above; every other reason
     # the Run button is disabled is listed here.
     shown_plan = plan if processed_ready else quick_experience.build_quick_plan(**plan_inputs, require_data=False)
@@ -2676,6 +2681,9 @@ def render_run_model_page():
             st.warning("Config missing for the selected dataset/model combination.")
         if run_device_issue:
             st.warning(run_device_issue)
+        if can_run:
+            # SOH also needs cells that can carry an SOH label (see soh_gate).
+            can_run = render_soh_data_check(ds, task_choice, config_path, key="run_model", repo_root=REPO_ROOT)
         # Reserved outside the columns, so the run's progress spans the whole
         # content area instead of inheriting c2's two-thirds. The buttons stay
         # side by side; only what the run draws moves out from under them.
@@ -2707,7 +2715,7 @@ def render_run_model_page():
                 # The next run is a new run: the command on screen gets a
                 # fresh id on the next rerun.
                 direct_runs.release_run_id(st.session_state, key=RUN_MODEL_RESERVED_ID_KEY)
-                result = run_command_with_progress(command=command, cwd=REPO_ROOT, log_path=log_path, steps=[(5, "Initialize"), (10, "Check dataset"), (20, "Load config"), (30, "Start BatteryML run"), (70, "Training/evaluation running"), (90, "Collect outputs"), (100, "Done")], container=run_progress_host)
+                result = run_command_with_progress(command=command, cwd=REPO_ROOT, log_path=log_path, steps=[(5, "Initialize"), (10, "Check dataset"), (20, "Load config"), (30, "Start BatteryML run"), (70, "Training/evaluation running"), (90, "Collect outputs"), (100, "Done")], container=run_progress_host, live_stages=True)
                 _finish_page_run(
                     run_dir,
                     result,

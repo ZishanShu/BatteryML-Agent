@@ -525,8 +525,9 @@ ssh -L 8501:localhost:8501 user@server
 2. 如果数据尚未预处理，页面警告
    `Process the dataset in step 1 before starting a model run.`，且无法开始运行。
 3. 点击 **Run experiment**。
-   - **会发生什么：** BatteryML 以种子 `0` 进行训练和评估。进度条显示各阶段
-     （初始化、检查预处理数据、加载配置、训练与评估、收集输出）。
+   - **会发生什么：** BatteryML 以种子 `0` 进行训练和评估。进度显示与 Agent Workflow 相同：
+     一行阶段说明（例如 `Training · 6 / 10 · elapsed 00:14 · ETA ~00:01`）、按 BatteryML
+     自身计数推进的进度条，以及 **Technical log (raw output)** 中的原始输出。
    - **输出目录：** `runs/web_projects/<project>/quickstart/<run_id>/`，包含
      `run.json`、`run.log`、`output.log`、`config_<timestamp>.yaml` 和
      `predictions_seed_0_<timestamp>.pkl`。
@@ -636,7 +637,14 @@ ssh -L 8501:localhost:8501 user@server
 | --- | --- |
 | MATR · RUL | 23 个模型，包括 `xgb`、`rf`、`ridge`、`lasso`、`elastic_net`、`svm`、`gpr`、`mlp`、`cnn`、`lstm`、`transformer`、`batlinet`、`cptransformer`、`dummy` |
 | HUST · RUL、SNL · RUL | 各 21 个模型（没有 `batlinet` 和 `cptransformer`） |
-| MATR · SOH | `elastic_net`、`lasso`、`rf`、`ridge`、`xgb`（`configs/soh/<model>/matr.yaml`） |
+| MATR · SOH、HUST · SOH | `elastic_net`、`lasso`、`rf`、`ridge`、`xgb`（`configs/soh/<model>/matr.yaml`、`…/hust.yaml`） |
+
+**SOH 运行需要先通过 SOH 数据检查。** 选择 SOH 后，页面会在 Run 按钮旁显示该数据集的 SOH
+检查结论；如果还没检查过，则显示 **Check SOH data** 按钮。检查会读取每个预处理后的电芯（大数据集
+可能需要一些时间），只有足够多的电芯具有有效的参考容量、并有足够多同时带放电容量和电压的循环时才通过
+（`SOH_READY`）。通过之前 Run 保持禁用。结论保存在 `data/metadata/soh_readiness/`，
+预处理数据变化后会自动要求重新检查。命令行中的同一检查：
+`python -m scripts.audit_soh_readiness --dataset HUST`。
 
 连接 LLM 后（§12），**Explain this config** 和 **Suggest model/config** 会用文字说明这个选择，
 但从不修改它。
@@ -654,7 +662,8 @@ ssh -L 8501:localhost:8501 user@server
    或 `Config missing…`。
 3. 点击 **Run BatteryML**。
    - **会发生什么：** BatteryML 用你选的种子和设备进行训练和评估。网站会为 RUL 添加
-     `--metric RMSE,MAE,MAPE`，为 SOH 添加 `--metric MAE,RMSE`。
+     `--metric RMSE,MAE,MAPE`，为 SOH 添加 `--metric MAE,RMSE`。进度显示与 Agent Workflow
+     相同：阶段、计数、已用时间、可估算时的剩余时间，以及技术日志。
    - **输出：** `runs/web_projects/<project>/run_model/<run_id>/`，包含
      `run.json`、`output.log`、`config_<timestamp>.yaml` 和
      `predictions_seed_<seed>_<timestamp>.pkl`。最近一次的输出也写在
@@ -1002,7 +1011,9 @@ cycler 格式 `ARBIN BATTERYARCHIVE BIOLOGIC INDIGO LANDT MACCOR NEWARE NOVONIX`
 - BatteryLife 数据集（`MICH`、`MICH_EXP`、`SDU`、`Stanford_2`、`Tongji`、`XJTU`、`ISU_ILCC`）
   没有 BatteryML 预处理器：可以被识别（`RAW_ONLY`），但不能在这里预处理。
 - `HNEI`、`SNL`、`UL_PUR` 和 `OX` 必须手动下载。
-- 并非每个 数据集 × 任务 × 模型 都有配置；网站只提供存在的组合。SOH 配置只有 MATR。
+- 并非每个 数据集 × 任务 × 模型 都有配置；网站只提供存在的组合。SOH 配置目前有 MATR 和 HUST；
+  其他数据集需要训练/测试划分、`configs/soh/<model>/<dataset>.yaml` 配置文件（在仓库中编写，
+  不能在网站上创建）以及通过 SOH 数据检查。
 - Quick experience 和 Run Model 的运行不能在网站中停止；只有 Agent Workflow 有 **Stop run**。
 - 每次运行只用一个设备；网站不提供多 GPU 训练。
 - 在 Agent Workflow 和 Quick experience 中种子固定为 `0`；需要其他种子请用 Run Model 或命令行。

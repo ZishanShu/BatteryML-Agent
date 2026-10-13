@@ -142,7 +142,9 @@ class TestRealConfigsAreClassifiedByStructure(unittest.TestCase):
         rul = sum(1 for e in self.entries if e.task == TASK_RUL)
         soh = sum(1 for e in self.entries if e.task == TASK_SOH)
         self.assertGreater(rul, 100)
-        self.assertLess(soh, 10, f"{soh} configs claim SOH; the audit expected a handful")
+        # Five estimators each for MATR and HUST (SOH-14); the dummy label
+        # demonstrations are not runnable choices.
+        self.assertLessEqual(soh, 12, f"{soh} configs claim SOH; the audit expected a handful")
 
 
 class TestInferenceHierarchy(unittest.TestCase):
