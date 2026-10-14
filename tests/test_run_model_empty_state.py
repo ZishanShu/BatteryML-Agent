@@ -126,10 +126,11 @@ class RunModelPageTestCase(unittest.TestCase):
         from batteryml_web.ui import feedback as ui_feedback
         from batteryml_web.ui import llm_state as ui_llm_state
         from batteryml_web.ui import settings_panel as ui_settings
+        from batteryml_web.ui import tab_navigation as ui_tabs
         from batteryml_web.ui import workflow_sidebar as ui_sidebar
 
         fake = self.Fake(session if session is not None else {})
-        modules = (self.app, ui_feedback, ui_llm_state, ui_settings, ui_sidebar)
+        modules = (self.app, ui_feedback, ui_llm_state, ui_settings, ui_sidebar, ui_tabs)
         saved = [(module, module.st) for module in modules]
         original_options = self.app._ui_dataset_options
         try:

@@ -629,9 +629,15 @@ ssh -L 8501:localhost:8501 user@server
 | **🏠 Home** | 起始页（§7）。 |
 | **Agent Workflow** | "Describe a task in plain language; nothing runs until you press Run."（用自然语言描述任务；按 Run 之前什么都不会运行。§11） |
 | **Protocol Workflow** → **1. 🧪 Prepare Data**、**2. 🚀 Run Model**、**3. 📈 Review Results** | 手动协议流程（§8、§9、§14）。 |
-| **← Prev** / **Next →** | 在协议中后退或前进一步。 |
+| **← Prev** / **Next →** | 在协议中后退或前进一个页面。 |
 | **Settings** | 打开 LLM 设置（§12）。 |
 | **LLM: …** 状态行 | `Not connected`、`Configured / Not tested`、`Connected` 或 `Connection failed`。 |
+
+**页面底部**的 **← Prev** / **Next →** 在两个带标签页的页面上行为不同。在 **Prepare Data** 和
+**Run Model** 上，它们每次移动一个**标签页**（Run Model：Configuration → Dataset Readiness →
+Command & Run → Logs / Debug），只有在第一个或最后一个标签页时才切换页面：在第一个标签页按 Prev
+会打开上一页面的最后一个标签页，在最后一个标签页按 Next 会打开下一页面。鼠标悬停在按钮上会显示
+它将打开的标签页。在其他页面上，它们与侧边栏一样每次移动一个页面。
 
 ---
 

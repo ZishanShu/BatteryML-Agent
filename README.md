@@ -700,9 +700,16 @@ ssh -L 8501:localhost:8501 user@server
 | **🏠 Home** | Start page (§7). |
 | **Agent Workflow** | "Describe a task in plain language; nothing runs until you press Run." (§11). |
 | **Protocol Workflow** → **1. 🧪 Prepare Data**, **2. 🚀 Run Model**, **3. 📈 Review Results** | The manual protocol (§8, §9, §14). |
-| **← Prev** / **Next →** | Move one step backward or forward in the protocol. |
+| **← Prev** / **Next →** | Move one page backward or forward in the protocol. |
 | **Settings** | Opens the LLM settings (§12). |
 | **LLM: …** status line | `Not connected`, `Configured / Not tested`, `Connected` or `Connection failed`. |
+
+The **← Prev** / **Next →** at the **bottom of a page** behave differently on the two
+pages with tabs. On **Prepare Data** and **Run Model** they move one **tab** at a time
+(Run Model: Configuration → Dataset Readiness → Command & Run → Logs / Debug), and
+change page only at the first or last tab: Prev on the first tab opens the previous
+page on its last tab, Next on the last tab opens the next page. Hovering a button
+names the tab it opens. On the other pages they move one page, like the sidebar.
 
 ---
 
