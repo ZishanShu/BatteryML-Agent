@@ -8,8 +8,9 @@
 
 </div>
 
-BatteryML-Agent 是一个用于预测电池**剩余使用寿命（RUL）**和**健康状态（SOH）**
-的网页应用和命令行工具集，构建在 [BatteryML](https://github.com/microsoft/BatteryML)
+BatteryML-Agent 是一个在本地部署的网站和命令行工具集，具有**两个同等地位的核心任务**：
+电池 **RUL / 寿命预测**和**健康状态（SOH）估计**。两者都是内置功能，在同一个网站中、
+用同一次安装、基于同一份预处理数据运行。它构建在 [BatteryML](https://github.com/microsoft/BatteryML)
 之上。预处理、训练、预测和打分全部由 BatteryML 完成；本仓库在此之上提供：
 一个分步操作的网站、每次运行前的安全检查，以及一个可选的 AI 助手——它只负责解释，
 从不计算任何数字。
@@ -17,8 +18,9 @@ BatteryML-Agent 是一个用于预测电池**剩余使用寿命（RUL）**和**�
 本指南假设你**没有** conda、Python 或 Streamlit 的使用经验。每条命令都可以原样复制，
 每个按钮都按它在屏幕上显示的名字书写（网站界面为英文，因此按钮名保留英文）。
 
-> **提示。** 如果你只想先看到一个结果，请阅读 §2、§3、§4（只做 MATR）、§6 和 §7。
-> 这条路径不需要 API key，也不需要 GPU。
+> **提示。** 想先得到一个结果，请阅读 §2、§3、§4.1–§4.3（只做 MATR）、§6，
+> 然后是两个完整示例：**§7.4（RUL）** 和 **§7.5（SOH）**。两者都不需要 API key，
+> 也不需要 GPU。
 
 ---
 
@@ -53,15 +55,15 @@ BatteryML-Agent 是一个用于预测电池**剩余使用寿命（RUL）**和**�
 你提供电池循环数据（例如公开的 **MATR** 数据集，包含 180 个 LFP/石墨电芯），它会：
 
 1. 把原始文件转换成 BatteryML 的格式（**预处理**）；
-2. 训练你选择的模型（例如 **XGBoost**），并在预留的测试集上评估（**运行**）；
-3. 展示得分（RMSE、MAE、MAPE）、预测值和科学图表，并允许下载全部内容（**查看结果**）。
+2. 训练你选择的模型（例如 **XGBoost**），并在预留的测试电芯上评估（**运行**）；
+3. 展示得分、预测值和科学图表，并允许下载全部内容（**查看结果**）。
 
-支持两种预测任务：
+内置两个核心任务。两者都不是插件，也都不需要 API key：
 
-| 任务 | 预测什么 | 误差单位 |
+| 任务（屏幕上的名称） | 按代码实际预测什么 | 误差单位 |
 | --- | --- | --- |
-| **RUL prediction** | 电芯还剩多少个循环 | 循环数 |
-| **SOH estimation** | 剩余容量占初始容量的比例 | 容量比 |
+| **RUL prediction**（RUL / 寿命） | 每个电芯一个值：它的**循环寿命**，即循环中最大放电容量首次降到标称容量 80 % 时的循环数（`RULLabelAnnotator`，`batteryml/label/rul.py`）。从未降到 80 % 的电芯记为总循环数 + 1；标签不超过 100 个循环的电芯被排除。MATR 配置用早期循环的特征（`max_cycle_index: 98`）来预测它，即**早期寿命预测**。 | 循环数（RMSE、MAE）；MAPE 是比例 |
+| **SOH estimation** | 每个**已观测**循环一个值：SOH = 该循环放电容量 ÷ 该电芯的参考容量（`reference_capacity_mode: first_valid_discharge_capacity`），由该循环的电压曲线估计。它**估计**已测循环的状态，**不**预测未来循环。详见 [`docs/SOH_PROTOCOL.md`](./docs/SOH_PROTOCOL.md)。 | 容量比（MAE、RMSE） |
 
 ### 1.2 三种使用方式
 
@@ -108,6 +110,36 @@ BatteryML-Agent 是一个用于预测电池**剩余使用寿命（RUL）**和**�
 | `runs/` | 所有运行写出的内容。不纳入 git。 |
 | `scripts/` | 健康检查、就绪状态检查、图表导出等工具。 |
 | `docs/` | 技术文档。 |
+
+### 1.5 两个任务，一套流程
+
+RUL 和 SOH 除了一项检查之外，所有步骤都相同：
+
+1. **安装一次**（§2–§3）。SOH 没有单独的安装、网站或环境。
+2. **启动网站**（§6）。
+3. **创建或加载一个命名项目**（§7.2 / §7.3）。不加载项目时，运行写入
+   `runs/web_projects/default`；下面的示例都使用命名项目。
+4. **准备所选数据集**：下载并预处理一次（§4、§7.1 第 1 步）。两个任务使用同一个
+   `data/processed/<DATASET>/`：做 SOH 时**不需要**重新下载或重新预处理。
+5. **选择任务**：**RUL prediction** 或 **SOH estimation**。
+6. **选择兼容的模型和配置**：只提供已注册配置的组合。
+7. **任务相关检查**：两个任务都需要 `READY` 的预处理数据（§5）。
+   **SOH 还必须通过 SOH 数据检查**（`SOH_READY`，§5.1）。
+8. **运行**（Quick experience、Run Model 或 Agent Workflow）。
+9. **查看结果**（§14–§15），并**导出**图表或运行包。
+
+以下四件事不能混为一谈：
+
+| 什么 | 含义 | 在哪里看到 |
+| --- | --- | --- |
+| `READY` 的预处理数据 | `data/processed/<DATASET>/` 中有 `.pkl` 电芯文件。两个任务相同。 | §5；Quick experience 第 1 步；Prepare Data |
+| 已注册的兼容配置 | `configs/` 下针对该 数据集 × 任务 × 模型 的 YAML 文件。它对电芯本身不说明任何问题。 | 任务/模型/配置列表（§9.1、§4.5） |
+| `SOH_READY` | 预处理后的电芯确实能提供 SOH 标签和特征（§5.1）。仅限 SOH。 | 选择 SOH 后，Run 按钮旁边 |
+| 一次成功的真实运行 | BatteryML 完成了训练和评估并保存了指标。只有这一点才能证明该组合在你的数据上可行。 | Review Results（§14） |
+
+两个任务都**必需**的：安装、网站、一个准备好的数据集（示例中为 MATR）。
+**可选**的：更多数据集、外部模型资源（CPTransformer、PBT）和 LLM 助手（§4.5、§12）。
+RUL 和 SOH 都不需要 API key。
 
 ---
 
@@ -373,6 +405,80 @@ python scripts/preprocess_sweep.py --only HUST
 | `AssertionError: data/processed/MATR`（运行时） | 从未运行预处理。 | 执行 §4.3。这**不**代表网站坏了。 |
 | `KeyError: 'b1c1'`（运行时） | `data/processed/MATR` 存在但为空（预处理失败）。 | 修复预处理错误，重新执行 §4.3。 |
 
+### 4.5 可选：更多数据集、外部模型、新数据集
+
+两个完整示例（§7.4、§7.5）都不需要本节内容。只准备你要用的数据集，从不需要全部下载。
+
+本仓库提供的内容（按配置注册表 `batteryml_web/core/config_registry.py` 统计）：
+
+| 数据集 | 任务 | 已注册配置 | 所需资源 | 准备指南 |
+| --- | --- | --- | --- | --- |
+| MATR | RUL prediction | 23 个模型（`configs/baselines/…/matr_1.yaml`、`matr_2.yaml`、`clo.yaml`） | MATR 原始数据并完成预处理；`cptransformer` 还需要 `third_party/BatteryLife` | §4.2–§4.3 |
+| MATR | SOH estimation | 5 个：`ridge`、`lasso`、`elastic_net`、`rf`、`xgb`（`configs/soh/<model>/matr.yaml`） | 同一份 MATR 预处理数据 + `SOH_READY`（§5.1） | §4.2–§4.3、§5.1 |
+| HUST | RUL prediction | 21 个模型（没有 `batlinet`、`cptransformer`） | HUST 原始数据并完成预处理 | §4.2（把 `MATR` 换成 `HUST`），[`dataprepare.md` → HUST](./dataprepare.md#hust) |
+| HUST | SOH estimation | 5 个：同上模型（`configs/soh/<model>/hust.yaml`） | 同一份 HUST 预处理数据 + `SOH_READY`（§5.1） | 同上，然后 §5.1 |
+| SNL | RUL prediction | 21 个模型 | 手动下载并完成预处理 | [`dataprepare.md` → SNL, UL-PUR, HNEI](./dataprepare.md#snl-ul-pur-hnei) |
+| SNL | SOH estimation | **无** | — | （Agent Workflow 会说明原因并给出替代方案，§11.2） |
+
+**已注册的配置不等于已验证的结果。** 上表只说明哪些文件存在并能通过网站的校验器。
+哪些组合真正在真实数据上执行过，见 §19.2。例如 HUST 的 SOH 配置已注册，但 §19.2
+中没有任何 HUST SOH 训练运行被列为已验证。
+
+<details>
+<summary><b>准备其他数据集（HUST、CALCE、RWTH、SNL……）</b></summary>
+
+```bash
+# HUST、CALCE 和 RWTH 可自动下载（两处 HUST 都要替换）：
+python batteryml_web/core/run_batteryml_cli.py download HUST data/raw/HUST
+# 预处理（三处 HUST 都要替换）：
+python batteryml_web/core/run_batteryml_cli.py preprocess HUST data/raw/HUST data/processed/HUST
+# 检查（只读）：
+python -m scripts.inspect_dataset_readiness HUST
+```
+
+`HNEI`、`SNL`、`UL_PUR` 和 `OX` 必须手动下载：按照 [`dataprepare.md`](./dataprepare.md)
+操作，并把文件放到 `data/raw/<NAME>/`。每个数据集有自己的目录；不会删除或覆盖其他数据集
+目录中的任何内容。然后点击 **Prepare Data → Refresh datasets**（§8.1）。若要在 HUST 上做
+SOH，数据预处理完成后执行 SOH 数据检查（§5.1）。
+
+</details>
+
+<details>
+<summary><b>外部模型资源：CPTransformer 和 PBT</b></summary>
+
+这两个模型需要本仓库**不包含**的代码；其他所有模型都不需要。
+
+- **CPTransformer** 加载 `third_party/BatteryLife/models/CPTransformer.py`
+  （`batteryml_web/models/cptransformer.py`）。
+- **PBT** 加载 `third_party/PBT`（`batteryml_web/external_runners/pbt.py`）。
+- 测试过的上游提交固定在 [`docs/EXTERNAL_MODEL_VERSIONS.txt`](./docs/EXTERNAL_MODEL_VERSIONS.txt)
+  中（BatteryLife `3b17bb53…`，PBT `d1f282cd…`）。本仓库没有记录上游下载地址；
+  请从各项目作者处获取，并把固定的提交检出到上述目录。
+- `third_party/` 在 `.gitignore` 中，因此这些文件永远不会被提交。
+- 缺少这些文件时，CPTransformer 运行会报错并指出缺少的 `third_party/BatteryLife` 目录。
+  Agent Workflow 的执行器从不启动 PBT（`NON_EXECUTABLE_MODELS`，
+  `batteryml_web/agent/executor.py`）。健康检查（`VAL-01`、`CFG-01`）会报告依赖缺失
+  第三方源码的配置。
+
+</details>
+
+<details>
+<summary><b>添加配置、模型或新数据集</b></summary>
+
+- **仓库中的配置**位于 `configs/` 下，受版本控制。Quick experience、Run Model 和
+  Agent Workflow 提供的正是这些配置，对使用此代码副本的所有人都相同。
+- **在 Quick experience 中上传的 YAML**（§10）经过校验后保存在当前项目内
+  （`runs/web_projects/<project>/uploads/configs/`）。它**只**用于该次 Quick experience
+  选择；**不会**为 Run Model、Agent Workflow 或其他项目注册配置。
+- **新数据集**需要的不只是改名的 `matr.yaml`：需要该任务可用的预处理电芯（SOH 需
+  `SOH_READY`）、在 BatteryML 中为该数据集注册的**按电芯划分的训练/测试划分器**
+  （HUST SOH 配置用 `HUSTTrainTestSplitter`，MATR 配置用 `MATRPrimaryTestTrainTestSplitter`），
+  以及能通过校验器的配置。按电芯划分可保证测试电芯的任何循环都不进入训练。
+- **新模型：** [`docs/EXTENDING_MODELS.md`](./docs/EXTENDING_MODELS.md)。
+  **SOH 任务协议及哪些模型类型适用：** [`docs/SOH_PROTOCOL.md`](./docs/SOH_PROTOCOL.md)。
+
+</details>
+
 ---
 
 ## 5. 数据集就绪状态
@@ -412,6 +518,69 @@ summary: MISSING 1
 完成 §4.3 后，状态行显示 `READY`。不带参数时列出所有数据集；`--json` 输出 JSON。
 
 就绪状态**只描述数据**。一个模型还需要针对该数据集和任务的、已注册并通过校验的配置（§9、§11）。
+
+### 5.1 SOH 数据检查（SOH 运行必需）
+
+`READY` 表示预处理文件存在，并不表示电芯能提供 SOH 标签：SOH 需要每个电芯有有效的
+参考容量，并有足够多同时具备放电容量（标签）和电压曲线（特征）的循环。因此**每次 SOH
+运行都需要通过 SOH 数据检查**。RUL 运行保留原有检查，不显示此项。
+
+**出现位置。** 选择 **SOH estimation** 且数据为 `READY` 时，三个地方都会在 Run 按钮正上方显示该检查：
+
+| 页面 | 位置 | Run 按钮 |
+| --- | --- | --- |
+| Quick experience（§7.1） | **3 · Run training**，在 **Run location** 下方 | **Run experiment** |
+| Run Model（§9.3） | 标签页 **Command & Run** | **Run BatteryML** |
+| Agent Workflow（§11.3） | 运行控件下方 | **Run** |
+
+**你会看到什么、要做什么。**
+
+1. 尚未检查：蓝色提示 `SOH runs need a data check first: … Press 'Check SOH data'.`
+   和 **Check SOH data** 按钮。Run 按钮被禁用。
+2. 点击 **Check SOH data**。出现转圈提示 `Reading <DATASET>'s processed cells…`；
+   检查会加载每个预处理电芯，大数据集可能需要几分钟。
+3. 通过：绿色 `SOH data check passed (SOH_READY): N of M cell(s) eligible, K SOH sample(s). …`
+   以及 `Checked <time> for <DATASET>; re-checked automatically after the processed data changes.`
+   Run 按钮变为可用（如无其他阻止原因）。
+4. 未通过：红色 `SOH data check did not pass (<STATUS>): … <reason>`。Run 按钮保持禁用。
+
+**检查内容**（`batteryml_web/core/soh_readiness.py`；标签策略由
+`batteryml_web/core/soh_gate.py` 从所选配置的 `label:` 部分读取）：
+
+- 每个电芯：用与运行相同的标注器生成 SOH 标签
+  （`reference_capacity_mode: first_valid_discharge_capacity`；随附的 SOH 配置从第 10 个循环
+  开始、每 5 个循环取一次样本），电压特征为有限值，且至少 **20** 个样本
+  （`DEFAULT_MIN_SAMPLES_PER_CELL`）；
+- 每个数据集：至少 **5** 个电芯合格时为 `SOH_READY`（`DEFAULT_MIN_ELIGIBLE_CELLS`）；
+  1–4 个为 `SOH_INSUFFICIENT`；0 个为 `SOH_NOT_ELIGIBLE`；没有可读取的预处理电芯时为
+  `SOH_NOT_PROCESSED`。
+
+**结果存放位置。** `data/metadata/soh_readiness/<DATASET>__<12 位策略哈希>.json`。
+其中记录结论、计数、排除原因、标签策略，以及 `data/processed/<DATASET>/` 的指纹
+（`.pkl` 文件数、总字节数、最新修改时间）。这个文件只是元数据：检查只**读取**预处理电芯，
+从不修改原始或预处理电池数据。
+
+**何时需要重新检查。** 当预处理目录的指纹改变（例如重新预处理后）、配置的标签策略不同、
+或该文件无法读取时，网站把已存结论视为"未检查"，并重新显示 **Check SOH data**。
+同一数据集的五个随附 SOH 配置使用同一个标签策略，因此一次检查覆盖该数据集上的全部五个模型。
+其他数据集需要各自检查。
+
+**如果未通过，** 请阅读原因和排除计数（存储的 JSON 中 `exclusions` 字段，或用下面的终端审计
+查看每个电芯）。修复数据或其预处理。**不要**降低阈值、编造容量，或修改存储文件来绕过检查。
+
+**终端审计（可选，只读）。** 在网站之外查看每个电芯的报告：
+
+```bash
+# 与随附 SOH 配置相同的标签采样（第 10 个循环起，步长 5）：
+python -m scripts.audit_soh_readiness --dataset MATR --min-cycle 10 --cycle-stride 5 --json runs/verify/soh_readiness_matr.json
+```
+
+它打印表格和原因，只把完整的逐电芯报告写到你给出的 `--json` 路径，并且：至少一个被审计的
+数据集为 `SOH_READY` 时退出码为 `0`，没有时为 `1`，找不到任何预处理数据集时为 `2`
+（`scripts/audit_soh_readiness.py`）。它自身的默认值是 `--min-cycle 1 --cycle-stride 1`，
+所以不加这两个参数时，它回答的是与网站不同的问题。它**不会**写入
+`data/metadata/soh_readiness/`，因此**不会**让网站的 Run 按钮变为可用：仍需在网站中点击
+**Check SOH data**。两者用相同阈值读取相同的预处理文件，但不能互相替代。
 
 ---
 
@@ -472,9 +641,15 @@ ssh -L 8501:localhost:8501 user@server
 
 | 卡片 | 用途 |
 | --- | --- |
-| **⚡ Quick experience**（"Use the built-in MATR demo"、"No API key required"） | 用一个数据集、一个模型、无需建项目，得到第一个结果。 |
+| **⚡ Quick experience**（"Use the built-in MATR demo"、"No API key required"） | 运行一个 数据集 × 任务 × 模型：RUL 或 SOH。默认 MATR · RUL prediction · XGBoost。 |
 | **✦ Create new project** | 为你自己的工作创建一个有名字的项目目录。 |
 | **↗ Existing project** | 重新打开之前创建的项目。 |
+
+**项目。** 每次运行都写入侧边栏中加载的项目（**Current project**）。未加载项目时，所有页面写入
+`runs/web_projects/default`，Quick experience 会显示
+`No project is selected. Quick experience will use this local workspace:`。
+已加载的项目只在当前浏览器会话中有效：重启网站或打开新标签页后，请通过 **↗ Existing project**
+重新加载。完整示例（§7.4、§7.5）会先创建一个命名项目。
 
 点击卡片打开对应面板。面板下方的 **← Choose another start path** 用于关闭它。页面更下方依次是：
 **Your BatteryML workflow**（四个步骤的概览）、未配置 LLM 时的可选 LLM 提示、
@@ -509,8 +684,8 @@ ssh -L 8501:localhost:8501 user@server
 
 | 控件 | 选择什么 |
 | --- | --- |
-| **Prediction task** | `RUL prediction` 或 `SOH estimation`（只列出该数据集有配置的任务）。 |
-| **Prediction model** | 对该数据集和任务有配置的模型，例如 XGBoost。 |
+| **Prediction task** | `RUL prediction` 或 `SOH estimation`（只列出该数据集有配置的任务；MATR 和 HUST 两者都有）。 |
+| **Prediction model** | 对该数据集和任务有配置的模型，例如 RUL 用 `XGBoost — Extreme Gradient Boosting`，SOH 用 `Ridge Regression`。 |
 | **Protocol configuration** | 配置文件，显示为 `名称 · 路径`。 |
 | **Compute device** | `cpu` 或 `cuda`。无法使用时 `cuda` 显示 `(not available on this machine)`（§13）。 |
 | **Upload YAML configuration (optional)** | 你自己的配置文件（§10）。 |
@@ -524,7 +699,9 @@ ssh -L 8501:localhost:8501 user@server
 1. **查看** "Run location"：本次运行将写入的目录。
 2. 如果数据尚未预处理，页面警告
    `Process the dataset in step 1 before starting a model run.`，且无法开始运行。
-3. 点击 **Run experiment**。
+3. **仅 SOH：** SOH 数据检查出现在这里。点击 **Check SOH data**，等待
+   `SOH data check passed (SOH_READY)`（§5.1）。RUL 不显示此检查。
+4. 点击 **Run experiment**。
    - **会发生什么：** BatteryML 以种子 `0` 进行训练和评估。进度显示与 Agent Workflow 相同：
      一行阶段说明（例如 `Training · 6 / 10 · elapsed 00:14 · ETA ~00:01`）、按 BatteryML
      自身计数推进的进度条，以及 **Technical log (raw output)** 中的原始输出。
@@ -555,6 +732,84 @@ ssh -L 8501:localhost:8501 user@server
 1. 点击 **↗ Existing project**。
 2. 在 **Select existing project** 中选择项目，然后点击 **Load project and continue**。
 3. 如果列表为空，面板显示 `No existing project found yet…`；请先创建一个项目（§7.2）。
+
+### 7.4 完整示例 A — RUL / 寿命：MATR + XGBoost
+
+| 项目 | 取值 |
+| --- | --- |
+| 数据集 · 任务 · 模型 | MATR · **RUL prediction** · `XGBoost — Extreme Gradient Boosting` |
+| 配置 | `configs/baselines/sklearn/xgb/matr_1.yaml` |
+| 预测什么 | 每个测试电芯的循环寿命（§1.1），由早期循环特征预测 |
+| 设备 · 种子 | `cpu` · `0` |
+| 保存的指标 | RMSE、MAE（循环数），MAPE（比例） |
+
+1. **项目。** 首页 → **✦ Create new project** → **Project name** 填 `matr_protocol` →
+   **Create project and continue**。侧边栏 **Current project** 显示 `matr_protocol`。
+   点击 **← Choose another start path**。
+2. **数据。** 点击 **⚡ Quick experience**。**第 1 步 · Prepare data**：**Raw dataset** 选 `MATR`。
+   仅在缺少原始数据时点击 **Download MATR data**，仅在缺少预处理数据时点击
+   **Process MATR data**（§7.1）。等到显示 `Readiness: READY`。
+3. **任务、模型、配置。** **第 2 步 · Configure model**：**Prediction task** 选 `RUL prediction`；
+   **Prediction model** 选 `XGBoost — Extreme Gradient Boosting`；**Protocol configuration** 选
+   `matr_1 · configs/baselines/sklearn/xgb/matr_1.yaml`；**Compute device** 选 `cpu`。
+   信息框必须显示 `Dataset MATR · Task RUL prediction · …`。
+4. **检查。** **3 · Run training**：**Run location** 显示 `runs/web_projects/matr_protocol`。
+   没有红色提示。RUL 没有 SOH 数据检查。
+5. **运行。** 点击 **Run experiment**。观察阶段说明、进度条和 **Technical log (raw output)**。
+6. **保存的文件。** `runs/web_projects/matr_protocol/quickstart/<run_id>/`：
+   `run.json`、`run.log`、`output.log`、`config_<timestamp>.yaml`、
+   `predictions_seed_0_<timestamp>.pkl`。
+7. **结果与图表。** 点击 **Open Review Results**（或侧边栏 **3. 📈 Review Results**）。
+   **Open a run** → 选择新运行。查看 **Run details · …**（Task 为 `RUL prediction`），然后是
+   **Metrics**（RMSE、MAE、MAPE）。**Scientific plots** 下：奇偶图（预测与真实循环寿命）和残差图，
+   可用 **Axis range** 切换 **Full range** / **Zoomed view**。**Benchmark reference** 只在对比
+   公平时才与已发表的 BatteryML RUL 表格比较（§16）。
+8. **导出。** **Export figures** → **Prepare figure package** →
+   **Download figure package (.zip)**；**Prepare run bundle** → **Download run bundle** 下载整次运行。
+
+在其他地方做同样的运行：Agent Workflow 输入 `Use XGBoost on MATR to predict RUL.`，并在
+**Config — evaluation protocol (validated only)** 中选同一配置（§11）；或使用 §17 的命令。
+Run Model 会为 MATR · RUL · `xgb` 自动选择**第一个已注册**的配置，即
+`configs/baselines/sklearn/xgb/clo.yaml`（不同的划分），因此其结果不等于 `matr_1.yaml` 的结果。
+
+### 7.5 完整示例 B — SOH：MATR + Ridge
+
+| 项目 | 取值 |
+| --- | --- |
+| 数据集 · 任务 · 模型 | MATR · **SOH estimation** · `Ridge Regression` |
+| 配置 | `configs/soh/ridge/matr.yaml` |
+| 估计什么 | 每个测试电芯已观测循环上的 SOH（容量比），由该循环的电压曲线估计；不是预测未来（§1.1） |
+| 设备 · 种子 | `cpu` · `0` |
+| 保存的指标 | MAE、RMSE（容量比） |
+
+1. **项目。** 使用同一个项目：侧边栏 **Current project** 为 `matr_protocol`（否则：首页 →
+   **↗ Existing project** → `matr_protocol` → **Load project and continue**，再点击
+   **← Choose another start path**）。
+2. **数据。** 点击 **⚡ Quick experience**。**第 1 步 · Prepare data**：**Raw dataset** 选 `MATR`。
+   如果做过示例 A，这里已经显示 `✓ Processed data ready — no processing needed.`：SOH 运行使用同一个
+   `data/processed/MATR/`。**不要重新下载或重新预处理。**
+3. **任务、模型、配置。** **第 2 步 · Configure model**：**Prediction task** 选 `SOH estimation`；
+   **Prediction model** 选 `Ridge Regression`；**Protocol configuration** 选
+   `matr · configs/soh/ridge/matr.yaml`；**Compute device** 选 `cpu`。信息框必须显示
+   `Dataset MATR · Task SOH estimation · Prediction model Ridge Regression · …`。
+4. **检查（关键步骤）。** **3 · Run training**：在 **Run location**（`runs/web_projects/matr_protocol`）
+   下方出现 SOH 数据检查。点击 **Check SOH data**，等待
+   `SOH data check passed (SOH_READY): N of M cell(s) eligible, …`（§5.1）。在此之前
+   **Run experiment** 保持禁用。如果未通过，请停下来阅读原因（§5.1）；不要绕过它。
+5. **运行。** 点击 **Run experiment**。进度显示与示例 A 相同。
+6. **保存的文件。** `runs/web_projects/matr_protocol/quickstart/<run_id>/`：与示例 A 相同的五个文件。
+   SOH 检查自身的记录在 `data/metadata/soh_readiness/MATR__<hash>.json`。
+7. **结果与图表。** **Open Review Results** → **Open a run** → 选择该 SOH 运行。
+   **Run details · …** 显示 Task `SOH estimation`；**Metrics** 显示 MAE 和 RMSE。
+   **Scientific plots** 下：选择一个 **Cell**，查看其在已观测循环上的观测 SOH 与估计 SOH，
+   然后是奇偶图和残差图、**Per-cell error summary (display diagnostic)** 和
+   **Estimate range check**。**Benchmark reference** 会说明已发表的基准只覆盖 RUL。
+8. **导出。** 与示例 A 相同；图表包另外包含 `soh_cycle_<cell>.svg`/`.png`/`.csv` 和
+   `per_cell_errors.csv`（§15）。
+
+在其他地方做同样的运行：Run Model（§9；它为 MATR · SOH · `ridge` 选择的第一个已注册配置就是这个文件；
+SOH 检查在 **Command & Run** 标签页），Agent Workflow 输入 `Use Ridge on MATR to predict SOH.`（§11），
+或使用 §17 的命令。
 
 ---
 
@@ -637,14 +892,13 @@ ssh -L 8501:localhost:8501 user@server
 | --- | --- |
 | MATR · RUL | 23 个模型，包括 `xgb`、`rf`、`ridge`、`lasso`、`elastic_net`、`svm`、`gpr`、`mlp`、`cnn`、`lstm`、`transformer`、`batlinet`、`cptransformer`、`dummy` |
 | HUST · RUL、SNL · RUL | 各 21 个模型（没有 `batlinet` 和 `cptransformer`） |
-| MATR · SOH、HUST · SOH | `elastic_net`、`lasso`、`rf`、`ridge`、`xgb`（`configs/soh/<model>/matr.yaml`、`…/hust.yaml`） |
+| MATR · SOH、HUST · SOH | 各 5 个模型：`elastic_net`、`lasso`、`rf`、`ridge`、`xgb`（`configs/soh/<model>/matr.yaml`、`…/hust.yaml`） |
 
-**SOH 运行需要先通过 SOH 数据检查。** 选择 SOH 后，页面会在 Run 按钮旁显示该数据集的 SOH
-检查结论；如果还没检查过，则显示 **Check SOH data** 按钮。检查会读取每个预处理后的电芯（大数据集
-可能需要一些时间），只有足够多的电芯具有有效的参考容量、并有足够多同时带放电容量和电压的循环时才通过
-（`SOH_READY`）。通过之前 Run 保持禁用。结论保存在 `data/metadata/soh_readiness/`，
-预处理数据变化后会自动要求重新检查。命令行中的同一检查：
-`python -m scripts.audit_soh_readiness --dataset HUST`。
+完整的能力表，以及"已注册配置"与"已验证运行"的区别，见 §4.5。自动选择的例子：
+MATR · RUL · `xgb` → `configs/baselines/sklearn/xgb/clo.yaml`；
+MATR · SOH · `ridge` → `configs/soh/ridge/matr.yaml`。
+
+选择 **SOH estimation** 时，**Command & Run** 标签页（§9.3）还要求通过 SOH 数据检查（§5.1）。
 
 连接 LLM 后（§12），**Explain this config** 和 **Suggest model/config** 会用文字说明这个选择，
 但从不修改它。
@@ -660,16 +914,19 @@ ssh -L 8501:localhost:8501 user@server
 2. 缺少东西时会有警告并阻止运行：
    `Processed dataset missing. Go to Prepare Data and run preprocessing first.`
    或 `Config missing…`。
-3. 点击 **Run BatteryML**。
+3. **仅 SOH：** 没有其他阻止原因时，SOH 数据检查出现在 **Run BatteryML** 上方。点击
+   **Check SOH data**，等待 `SOH_READY`（§5.1）。RUL 只有第 2 步的检查。
+4. 点击 **Run BatteryML**。
    - **会发生什么：** BatteryML 用你选的种子和设备进行训练和评估。网站会为 RUL 添加
-     `--metric RMSE,MAE,MAPE`，为 SOH 添加 `--metric MAE,RMSE`。进度显示与 Agent Workflow
-     相同：阶段、计数、已用时间、可估算时的剩余时间，以及技术日志。
+     `--metric RMSE,MAE,MAPE`，为 SOH 添加 `--metric MAE,RMSE`。进度显示与 Quick experience
+     和 Agent Workflow 相同：带计数、已用时间和可估算时剩余时间的阶段说明、进度条，以及
+     **Technical log (raw output)**。
    - **输出：** `runs/web_projects/<project>/run_model/<run_id>/`，包含
      `run.json`、`output.log`、`config_<timestamp>.yaml` 和
      `predictions_seed_<seed>_<timestamp>.pkl`。最近一次的输出也写在
      `runs/web_projects/<project>/logs/run_model.log`。
    - **预期结果：** 成功提示、**Review Results →** 按钮，以及 **Output workspace** 区域。
-4. Run Model 的运行无法在网站中停止（只有 Agent Workflow 有 **Stop run**）。
+5. Run Model 的运行无法在网站中停止（只有 Agent Workflow 有 **Stop run**）。
    必要时在终端按 `Ctrl+C` 停止网站。
 
 ### 9.4 标签页 "Logs / Debug"
@@ -709,6 +966,11 @@ Upload YAML configuration (optional)**。
 
 修改文件后重新上传。在命令行上可以直接运行任何配置文件（§17）；上述校验只在网站中进行。
 
+上传的文件**只属于当前项目**：它只用于这次 Quick experience 选择。它不会被加入 `configs/`，
+Run Model 和 Agent Workflow 也不会提供它。要让配置在所有地方可用，请把它加入仓库的
+`configs/`（§4.5）并重启网站（配置列表在每个网站进程中只读取一次）。上传的 SOH 配置仍需通过
+SOH 数据检查（§5.1），检查使用上传文件自身的标签策略。
+
 ---
 
 ## 11. Agent Workflow 与模型推荐
@@ -722,7 +984,8 @@ Agent Workflow 把一句话变成一个经过检查的运行计划。**不需要
 1. 在侧边栏打开 **Agent Workflow**（或在首页的 **Agent Workflow** 输入框中输入，然后点击
    **Analyze with Agent**）。
 2. 在 **Workflow request** 中按句式 `Use [Model] on [dataset] to predict [task].` 写一句话，
-   例如 `Use XGBoost on MATR to predict RUL.`
+   例如 `Use XGBoost on MATR to predict RUL.`（RUL）或 `Use Ridge on MATR to predict SOH.`
+   （SOH；解析为任务 `SOH estimation`）。
    输入框为空时，**Use template** 会填入一句根据本机目录生成的句子（它从不覆盖你输入的文字）。
 3. 点击 **Analyze**。分析永远不会运行任何东西。
 
@@ -736,7 +999,7 @@ Agent Workflow 把一句话变成一个经过检查的运行计划。**不需要
   `RUL prediction configurations are registered for MATR, but its data is MISSING; models run on processed data only. Prepare the dataset in Prepare Data first, then analyze again.`
   以及 `No model can be executed for this dataset/task.` 请先准备数据（§7 第 1 步或 §8），
   然后再次点击 **Analyze**。
-- **如果该组合没有配置**（例如 `Use ElasticNet on HUST to predict soh.`：HUST 没有 SOH 配置），
+- **如果该组合没有配置**（例如 `Use ElasticNet on SNL to predict soh.`：SNL 只有 RUL 配置），
   页面会说明原因并列出替代方案，分组为 **<dataset> · <task>**、**<task> on other datasets**
   和 **Other tasks on <dataset>**。其模型当前就能运行的替代方案会显示为按钮，例如
   `Use Elastic Net Regression on MATR for SOH estimation`（这要求 MATR 处于 `READY`）。
@@ -754,10 +1017,14 @@ Agent Workflow 把一句话变成一个经过检查的运行计划。**不需要
 | **Compute device** | **CPU** 或 **GPU**；选 GPU 时再选择 **GPU** 编号。 |
 | **Config — evaluation protocol (validated only)** | 一个通过校验的配置。 |
 
+**仅 SOH：** 这些控件下方会出现 SOH 数据检查；点击 **Check SOH data**，等待 `SOH_READY`（§5.1）。
+通过之前 **Run** 保持禁用。RUL 请求不显示此检查。
+
 点击 **Run**。
 
-- **会发生什么：** BatteryML 以种子 `0`（此路线固定）进行训练和评估，页面显示实时日志。
-  **Stop run** 可停止运行。
+- **会发生什么：** BatteryML 以种子 `0`（此路线固定）进行训练和评估，SOH 使用
+  `--metric MAE,RMSE`，其他任务使用 `--metric RMSE,MAE,MAPE`。进度显示：阶段说明、进度条和
+  **Technical log (raw output)**，与 Quick experience 和 Run Model 相同。**Stop run** 可停止运行。
 - **输出：** `runs/web_projects/<project>/agent_<dataset>_<model>/<run_id>/`
   （冒烟测试会追加 `_smoke`），包含 `run.json`、`run.log`、`stdout.log`、`stderr.log`、
   `config_<timestamp>.yaml` 和 `predictions_seed_0_<timestamp>.pkl`。
@@ -840,8 +1107,8 @@ Quick experience、Run Model 和 Agent Workflow 的运行。
 2. **Run details · …**（可展开）显示状态标签、完整运行 ID 和一张表：Run ID、Started、Project、
    Run directory、Dataset、Task、Model、Config、Seed、Epochs、Device、Status、Duration、
    Return code、Git commit。
-3. **Metrics** 显示的正是 BatteryML 保存的内容（RUL：RMSE、MAE、MAPE，单位为循环数；
-   SOH：MAE、RMSE）。失败的运行不记录指标。
+3. **Metrics** 显示的正是 BatteryML 保存的内容（RUL：RMSE、MAE、MAPE；
+   SOH：MAE、RMSE；单位见 §14.4）。失败的运行不记录指标。
 4. **Scientific plots**（§15）。
 5. 先点 **Prepare run bundle**，再点 **Download run bundle** 下载整次运行。
    **Artifacts** 列出文件；**Download a file** / **Download selected file** 下载单个文件。
@@ -859,8 +1126,12 @@ Quick experience、Run Model 和 Agent Workflow 的运行。
 
 ### 14.4 如何解读数字
 
-- **RMSE** 和 **MAE** 的单位与任务一致（RUL 为循环数）。越低越好。
-- **MAPE** 是相对误差。越低越好。
+| 任务 | 指标 | 单位 | 说明 |
+| --- | --- | --- | --- |
+| RUL prediction | **RMSE**、**MAE** | 循环数 | 预测循环寿命的误差。越低越好。 |
+| RUL prediction | **MAPE** | 无（比例） | mean(\|真实 − 预测\| / 真实)，不乘以 100：`0.12` 表示 12 %。越低越好。 |
+| SOH estimation | **MAE**、**RMSE** | 容量比（SOH 是比值，1.0 = 参考容量） | `0.01` 表示 SOH 的一个百分点。越低越好。SOH 不请求 MAPE。 |
+
 - 冒烟测试（一个 epoch）的结果**不是**性能结果（§16）。
 
 在命令行查看一个项目的运行及其状态：
@@ -937,14 +1208,18 @@ python batteryml_web/core/run_batteryml_cli.py preprocess MATR data/raw/MATR dat
 # 就绪状态（只读）
 python -m scripts.inspect_dataset_readiness MATR
 
-# 完整运行：MATR 上的 XGBoost，CPU，种子 0
+# RUL 运行（完整示例 A）：MATR 上的 XGBoost，CPU，种子 0
+#（省略 --metric：默认就是 RMSE,MAE,MAPE，与网站一致）
 python batteryml_web/core/run_batteryml_cli.py run configs/baselines/sklearn/xgb/matr_1.yaml --workspace runs/cli_matr_xgb --train --eval --device cpu --seed 0
 
 # 冒烟测试：CNN 训练一个 epoch（不是结果）
 python batteryml_web/core/run_batteryml_cli.py run configs/baselines/nn_models/cnn/matr_1.yaml --workspace runs/smoke_matr_cnn --train --eval --device cpu --seed 0 --epochs 1
 
-# SOH 运行：MATR 上的 XGBoost
-python batteryml_web/core/run_batteryml_cli.py run configs/soh/xgb/matr.yaml --workspace runs/cli_matr_soh_xgb --train --eval --device cpu --seed 0
+# SOH 数据审计（只读；只写 --json 报告，不写网站的检查结果，§5.1）
+python -m scripts.audit_soh_readiness --dataset MATR --min-cycle 10 --cycle-stride 5 --json runs/verify/soh_readiness_matr.json
+
+# SOH 运行（完整示例 B）：MATR 上的 Ridge，CPU，种子 0，SOH 指标
+python batteryml_web/core/run_batteryml_cli.py run configs/soh/ridge/matr.yaml --workspace runs/cli_matr_soh_ridge --train --eval --device cpu --seed 0 --metric MAE,RMSE
 
 # 启动网站
 python -m streamlit run batteryml_web/app.py
@@ -959,7 +1234,11 @@ python -m streamlit run batteryml_web/app.py
 - 其他选项：`--metric`、`--epochs`、`--ckpt-to-resume`、`--skip_if_executed`
   （见 `python batteryml_web/core/run_batteryml_cli.py run --help`）。
 
-运行结束时会打印得分，例如 `{'RMSE': …, 'MAE': …, 'MAPE': …}`。工作目录中包含
+- 命令行**不会**执行网站的 SOH 数据检查。请先运行上面的审计并阅读其结论；在不是
+  `SOH_READY` 的数据上运行得到的不是有效的 SOH 结果。
+
+运行结束时会打印得分，RUL 例如 `{'RMSE': …, 'MAE': …, 'MAPE': …}`，SOH 加
+`--metric MAE,RMSE` 时例如 `{'MAE': …, 'RMSE': …}`。工作目录中包含
 `config_<timestamp>.yaml` 和 `predictions_seed_<seed>_<timestamp>.pkl`。打印保存的得分：
 
 ```bash
@@ -997,6 +1276,11 @@ cycler 格式 `ARBIN BATTERYARCHIVE BIOLOGIC INDIGO LANDT MACCOR NEWARE NOVONIX`
 | Quick experience：`Process the dataset in step 1 before starting a model run.` | 数据未预处理。 | 第 1 步 → **Process … data**。 |
 | Run Model：`Processed dataset missing…` | 数据未预处理。 | §8.2。 |
 | Run Model：`No datasets are currently available. Prepare or upload a dataset first.` | 没有原始数据，或列表未刷新。 | 获取原始数据（§4），然后 **Prepare Data → Refresh datasets**。 |
+| SOH：Run 按钮禁用，显示 `SOH runs need a data check first: …` | 该数据集尚未做 SOH 数据检查，或之后预处理数据有变化。 | 点击 **Check SOH data**（§5.1）。 |
+| SOH：`SOH data check did not pass (SOH_INSUFFICIENT / SOH_NOT_ELIGIBLE / SOH_NOT_PROCESSED): …` | 能提供可用 SOH 标签和电压特征的电芯太少，或没有可读取的预处理电芯。 | 阅读原因和排除计数（§5.1）；修复数据或预处理。不要降低阈值或修改存储的结论。 |
+| SOH：`SOH data check unavailable: … has no label: section …` | 所选（例如上传的）配置没有可用的 `label:` 部分。 | 使用 `configs/soh/` 中的配置，或修正上传的文件（§10）。 |
+| 终端审计显示 `SOH_READY`，网站仍要求检查 | 审计不会写入网站存储的结论。 | 在网站中点击 **Check SOH data**（§5.1）。 |
+| 某数据集没有 `SOH estimation` 任务 | 该数据集没有已注册的 SOH 配置（例如 SNL）。 | 使用 MATR 或 HUST，或添加配置（§4.5）。 |
 | GPU 选项被拒绝 | 没有 CUDA，或 PyTorch 不是为该 GPU 编译的。 | 选择 CPU，或修复 PyTorch（§3.3、§13）。 |
 | `CUDA out of memory` | 模型放不进 GPU。 | 选择 CPU。 |
 | LLM 按钮打开的是设置对话框 | LLM 未连接。 | 见 §12，或忽略；其他功能都不需要它。 |
@@ -1006,14 +1290,19 @@ cycler 格式 `ARBIN BATTERYARCHIVE BIOLOGIC INDIGO LANDT MACCOR NEWARE NOVONIX`
 ### 18.2 已知限制
 
 - **CPTransformer** 需要把另一个仓库的代码放到 `third_party/BatteryLife/`，本仓库不包含；
-  **PBT** 需要 `third_party/PBT` 中的资源，本仓库也不包含。其他模型都不依赖它们。
+  **PBT** 需要 `third_party/PBT` 中的资源，本仓库也不包含。其他模型都不依赖它们（§4.5）。
   健康检查（`VAL-01`）会提到这一点。
 - BatteryLife 数据集（`MICH`、`MICH_EXP`、`SDU`、`Stanford_2`、`Tongji`、`XJTU`、`ISU_ILCC`）
   没有 BatteryML 预处理器：可以被识别（`RAW_ONLY`），但不能在这里预处理。
 - `HNEI`、`SNL`、`UL_PUR` 和 `OX` 必须手动下载。
-- 并非每个 数据集 × 任务 × 模型 都有配置；网站只提供存在的组合。SOH 配置目前有 MATR 和 HUST；
-  其他数据集需要训练/测试划分、`configs/soh/<model>/<dataset>.yaml` 配置文件（在仓库中编写，
-  不能在网站上创建）以及通过 SOH 数据检查。
+- 并非每个 数据集 × 任务 × 模型 都有配置；网站只提供存在的组合。SOH 配置已为 MATR 和 HUST
+  注册（各 5 个模型）；例如 SNL 没有。其他数据集需要有效的预处理电芯、按电芯划分的训练/测试划分器、
+  `configs/soh/<model>/<dataset>.yaml` 配置文件（在仓库中编写，不能在网站上创建）以及通过
+  SOH 数据检查（§4.5、§5.1）。
+- SOH 模型是 §9.1 列出的五个经典回归模型；神经网络模型没有 SOH 配置
+  （[`docs/SOH_PROTOCOL.md`](./docs/SOH_PROTOCOL.md)）。
+- 实时进度显示（阶段、进度条、**Technical log (raw output)**）适用于模型运行。下载和预处理
+  仍使用各自较简单的进度显示。
 - Quick experience 和 Run Model 的运行不能在网站中停止；只有 Agent Workflow 有 **Stop run**。
 - 每次运行只用一个设备；网站不提供多 GPU 训练。
 - 在 Agent Workflow 和 Quick experience 中种子固定为 `0`；需要其他种子请用 Run Model 或命令行。
@@ -1068,6 +1357,10 @@ conda env remove -n batteryml -y
 | Run Model 的四个标签页、有运行时的 Review Results、图表、运行打包、YAML 上传、LLM 解释 | [STATIC] 从当前源代码（`batteryml_web/`）读取；需要数据或 API key 才能到达 |
 | MATR 预处理得到 180 个文件 | 在项目服务器上观察到，未在文档编写环境中验证 |
 | 完整的训练运行、指标、图表 | 未在文档编写环境中执行（没有数据） |
+| 完整示例 §7.4（RUL）和 §7.5（SOH）：标签、配置路径、检查位置、保存的文件 | [STATIC] 读取自 `batteryml_web/app.py`、`batteryml_web/ui/soh_check.py`、`batteryml_web/ui/agent_workflow.py`、`batteryml_web/core/soh_gate.py`、`batteryml_web/core/config_registry.py`。两个示例都没有为本指南端到端执行 |
+| 真实数据上的 SOH 数据审计（`audit_soh_readiness --min-cycle 10 --cycle-stride 5`）：MATR 180 / 180 个电芯、HUST 77 / 77 个电芯，均为 `SOH_READY` | 由项目用户在服务器上观察到并记录在 [`docs/SOH_PROTOCOL.md`](./docs/SOH_PROTOCOL.md)；未在文档编写环境中观察 |
+| 网站中在真实 MATR 或 HUST 数据上执行 **Check SOH data** | 未验证（仅在合成测试数据上做过单元测试：`tests/test_soh_gate.py`） |
+| HUST SOH 训练运行（`configs/soh/<model>/hust.yaml`） | 已注册并通过校验；**未**在真实数据上执行 |
 | GPU、真实 LLM 服务、macOS、Windows/WSL2 | 未验证 |
 
 ### 19.3 延伸阅读
@@ -1084,7 +1377,25 @@ conda env remove -n batteryml -y
 | [`docs/EXTENDING_MODELS.md`](./docs/EXTENDING_MODELS.md) | 添加你自己的模型 |
 | [`README_v1.md`](./README_v1.md) / [`README_v1.zh-CN.md`](./README_v1.zh-CN.md) | 已归档的 V1 安装指南 |
 
-### 19.4 引用
+### 19.4 协议步骤与截图对照
+
+用于根据本指南撰写协议。一套共享流程；两个任务只在表中注明处不同。截图名称均为占位符：
+这些截图都尚未为本指南截取。
+
+| 共享步骤 | RUL 操作 | SOH 操作 | 需截取的截图 |
+| --- | --- | --- | --- |
+| 安装与健康检查（§2–§3） | 相同 | 相同（无需额外安装） | `[SCREENSHOT: health-check summary]` |
+| 启动网站（§6） | 相同 | 相同（同一个网站） | `[SCREENSHOT: Home, three start cards]` |
+| 创建 / 加载命名项目（§7.2、§7.3） | `matr_protocol` | 同一个项目 | `[SCREENSHOT: Create new project panel + sidebar Current project]` |
+| 准备数据（§7.1 第 1 步） | 下载并预处理 MATR，直到 `READY` | 复用同一份预处理后的 MATR；无需重复 | `[SCREENSHOT: Step 1 with Readiness READY]` |
+| 选择任务、模型、配置（§7.1 第 2 步） | `RUL prediction` · `XGBoost — Extreme Gradient Boosting` · `matr_1.yaml` | `SOH estimation` · `Ridge Regression` · `configs/soh/ridge/matr.yaml` | `[SCREENSHOT: Step 2 info box, RUL]` / `[SCREENSHOT: Step 2 info box, SOH]` |
+| 任务相关检查（§5.1） | 除 `READY` 外无 | **关键步骤：** 选择 SOH 后，在执行前取得有效的 `SOH_READY` 检查结果。这不需要再安装任何东西，也不需要另一个网站。 | `[SCREENSHOT: SOH data check passed]` |
+| 运行（§7.1 第 3 步） | **Run experiment** | **Run experiment** | `[SCREENSHOT: live progress with Technical log (raw output)]` |
+| 查看指标（§14） | RMSE、MAE（循环数），MAPE（比例） | MAE、RMSE（容量比） | `[SCREENSHOT: Run details + Metrics, RUL]` / `[SCREENSHOT: Run details + Metrics, SOH]` |
+| 图表（§15） | 奇偶图 + 残差图 | 电芯在已观测循环上的 SOH、奇偶图、残差图 | `[SCREENSHOT: RUL parity]` / `[SCREENSHOT: SOH cell curve]` |
+| 导出（§15、§14.2） | **Download figure package (.zip)**、运行包 | 相同 | `[SCREENSHOT: Export figures expanded]` |
+
+### 19.5 引用
 
 BatteryML-Agent 构建于 BatteryML 之上。如果你使用了它，请引用：
 
