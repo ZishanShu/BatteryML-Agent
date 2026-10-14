@@ -126,8 +126,16 @@ from batteryml_web.ui.surfaces import (
 )
 from batteryml_web.ui.tab_navigation import (
     DATASET_OVERVIEW_TAB,
+    PAGE_TABS,
+    PREPARE_PAGE,
     PREPARE_TABS,
+    RUN_MODEL_PAGE,
+    STEP_PAGES,
     VIEW_OVERVIEW_LABEL,
+    active_tab,
+    any_pressed,
+    neighbour,
+    render_page_tabs,
     render_prepare_tabs,
     request_tab,
 )
@@ -740,15 +748,71 @@ def _current_raw_folder() -> Path:
     return Path("data/raw") / st.session_state.get("selected_dataset", "MATR")
 
 
-def render_bottom_step_navigation():
+#: Buttons that run a blocking job inside the Prepare Data / Run Model script.
+#: On the run one of them triggers, the page's tab strip is built untracked,
+#: because a tracked strip reruns on a tab click and a rerun stops the job
+#: (measured; see ui/tab_navigation.py).
+PREPARE_BUSY_KEYS: tuple[str, ...] = (
+    "refresh_datasets_btn",
+    "prep_run",
+    "custom_save_uploads",
+    "custom_preprocess_train",
+    "custom_preprocess_valid",
+    "custom_validate_outputs",
+)
+RUN_MODEL_BUSY_KEYS: tuple[str, ...] = (
+    "run_batteryml_btn",
+    "run_model_explain_config",
+    "run_model_suggest_config",
+    "run_model_explain_command",
+    "run_model_explain_error",
+    "run_model_suggest_next_action",
+)
+
+
+def _go_to_step(step_key: str, *, tab_index: int) -> None:
+    """Open ``step_key``; on a tabbed page, on the tab at ``tab_index`` (0 or -1)."""
+    page = STEP_PAGES.get(step_key)
+    if page is not None:
+        request_tab(PAGE_TABS[page][tab_index], page)
+    set_current_step(step_key)
+
+
+def render_bottom_step_navigation(tab_page: str | None = None) -> None:
+    """The page's own ← Prev / Next →.
+
+    On a tabbed page (``tab_page``) they step through its tabs in order and
+    leave the page only at the first or last tab: Prev from the first tab
+    opens the previous page on its last tab, Next from the last tab opens the
+    next page on its first tab. Elsewhere they move one page. The sidebar's
+    Prev/Next stay page-level.
+    """
     idx = get_current_step_index()
+    labels = PAGE_TABS[tab_page] if tab_page else ()
+    current = (active_tab(tab_page) or labels[0]) if tab_page else None
+    prev_tab = neighbour(labels, current, -1) if tab_page else None
+    next_tab = neighbour(labels, current, +1) if tab_page else None
     prev_col, next_col = st.columns(2)
     with prev_col:
-        if st.button("← Prev", type=NAV_ROLE, disabled=(idx == 0), use_container_width=True, key="bottom_prev_step"):
-            set_current_step(NAV_STEPS[idx - 1]["key"])
+        if st.button(
+            "← Prev", type=NAV_ROLE, disabled=(prev_tab is None and idx == 0),
+            use_container_width=True, key="bottom_prev_step",
+            help=f"Open {prev_tab}" if prev_tab else None,
+        ):
+            if prev_tab is not None:
+                request_tab(prev_tab, tab_page)
+                st.rerun()
+            _go_to_step(NAV_STEPS[idx - 1]["key"], tab_index=-1)
     with next_col:
-        if st.button("Next →", type=NAV_ROLE, disabled=(idx == len(NAV_STEPS) - 1), use_container_width=True, key="bottom_next_step"):
-            set_current_step(NAV_STEPS[idx + 1]["key"])
+        if st.button(
+            "Next →", type=NAV_ROLE, disabled=(next_tab is None and idx == len(NAV_STEPS) - 1),
+            use_container_width=True, key="bottom_next_step",
+            help=f"Open {next_tab}" if next_tab else None,
+        ):
+            if next_tab is not None:
+                request_tab(next_tab, tab_page)
+                st.rerun()
+            _go_to_step(NAV_STEPS[idx + 1]["key"], tab_index=0)
 
 
 def _render_project_created_notice() -> None:
@@ -1818,7 +1882,7 @@ def render_prepare_data_page():
     # Built through the helper so a jump from the preprocess tab can open
     # the overview tab. The labels live in one place, so a button and the
     # tab it opens cannot drift apart.
-    tabs = render_prepare_tabs(PREPARE_TABS)
+    tabs = render_prepare_tabs(PREPARE_TABS, busy=any_pressed(st.session_state, PREPARE_BUSY_KEYS))
 
     datasets = _ui_dataset_options()
 
@@ -2147,7 +2211,7 @@ def render_prepare_data_page():
             st.warning("Validation/test raw files are required.")
         st.write("Custom uploaded dataset has been preprocessed, but training config is not yet registered.")
 
-    render_bottom_step_navigation()
+    render_bottom_step_navigation(PREPARE_PAGE)
 
 
 def _discover_run_configs() -> dict[tuple[str, str, str], list[Path]]:
@@ -2486,7 +2550,9 @@ def render_run_model_page():
         _render_run_model_without_datasets()
         return
 
-    tabs = st.tabs(["Configuration", "Dataset Readiness", "Command & Run", "Logs / Debug"])
+    # Built through the helper so the page's Prev/Next can step through the
+    # tabs (ui/tab_navigation.py); labels and order are RUN_MODEL_TABS.
+    tabs = render_page_tabs(RUN_MODEL_PAGE, busy=any_pressed(st.session_state, RUN_MODEL_BUSY_KEYS))
 
     with tabs[1]:
         cols = st.columns(2)
@@ -2798,7 +2864,7 @@ def render_run_model_page():
         render_run_model_llm_output_panel("run_model_debug_llm_output", "Debug guidance", "Debug guidance", "Debug assistant")
         st.write("**Safety note:** LLM only explains; it does not modify raw data, metrics, or config.")
 
-    render_bottom_step_navigation()
+    render_bottom_step_navigation(RUN_MODEL_PAGE)
 
 
 #: Session keys for the selected result. The identity key is stored *beside*

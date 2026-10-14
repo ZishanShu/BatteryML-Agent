@@ -1,7 +1,7 @@
 """UI-01 — navigation and layout: page-top reset, one Prepare Data flow, compact sidebar.
 
-Establishes `UX-08`, `UX-09` and `UX-10` without a browser and without
-Streamlit, so the same three claims can be re-checked on the server in a
+Establishes `UX-08`, `UX-09`, `UX-10` and `UX-14` without a browser and
+without Streamlit, so the same claims can be re-checked on the server in a
 second:
 
 * **`UX-08`** — the page-top reset exists as a pure decision plus a thin
@@ -20,6 +20,12 @@ second:
   so the pin is what stops it landing on its caption; keeping the pin at or
   above zero is what keeps the brand pair spaced like "Current project" over
   its project name, the one label/caption pair Streamlit spaces itself.
+
+* **`UX-14`** — Prepare Data and Run Model pass their tab page to the
+  bottom Prev/Next (which then step through tabs, not pages), and each
+  page's busy-key tuple names its blocking run button and only keys that a
+  widget in ``app.py`` really uses. The step rule itself is unit-tested in
+  ``tests/test_tab_step_navigation.py``.
 
 This check renders nothing, starts no server and writes nothing outside its
 own report.
@@ -406,6 +412,61 @@ def _check_sidebar_stylesheet(root: Path, errors: list[str], observed: dict) -> 
                 )
 
 
+#: Page function → the tab page it must hand to the bottom navigation (UX-14).
+TABBED_PAGES = (
+    ("render_prepare_data_page", "PREPARE_PAGE"),
+    ("render_run_model_page", "RUN_MODEL_PAGE"),
+)
+
+#: Busy-key tuple → the blocking run button it must contain (UX-14).
+BUSY_KEY_TUPLES = (
+    ("PREPARE_BUSY_KEYS", "prep_run"),
+    ("RUN_MODEL_BUSY_KEYS", "run_batteryml_btn"),
+)
+
+
+def _check_tab_step_navigation(root: Path, errors: list[str], observed: dict) -> None:
+    """UX-14: the page's own Prev/Next step through its tabs, safely."""
+    app_source = (root / APP).read_text(encoding="utf-8")
+    tree = ast.parse(app_source)
+
+    for function, page in TABBED_PAGES:
+        node = _function(tree, function)
+        if node is None:
+            errors.append(f"{APP.as_posix()} no longer defines {function} (UX-14).")
+            continue
+        args = [
+            ast.unparse(call.args[0]) for call in ast.walk(node)
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+            and call.func.id == "render_bottom_step_navigation" and call.args
+        ]
+        observed[f"{function}_bottom_navigation"] = args
+        if args != [page]:
+            errors.append(
+                f"{function} must call render_bottom_step_navigation({page}) once so its "
+                f"Prev/Next step through the tabs; found {args} (UX-14)."
+            )
+
+    assigned = {
+        node.target.id: node.value for node in tree.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    for name, required in BUSY_KEY_TUPLES:
+        if name not in assigned:
+            errors.append(f"{APP.as_posix()} no longer defines {name} (UX-14).")
+            continue
+        keys = ast.literal_eval(assigned[name])
+        observed[name] = list(keys)
+        if required not in keys:
+            errors.append(
+                f"{name} lacks {required!r}: a tab click during that run would rerun "
+                "the script and stop the job (UX-14)."
+            )
+        for key in keys:
+            if f'key="{key}"' not in app_source:
+                errors.append(f"{name} lists {key!r}, but no widget in app.py uses that key (UX-14).")
+
+
 def check(output_dir: str | Path | None = None) -> CheckResult:
     """Run UI-01.
 
@@ -425,6 +486,7 @@ def check(output_dir: str | Path | None = None) -> CheckResult:
     _check_page_top_reset(root, errors, observed)
     _check_prepare_data(root, errors, observed)
     _check_sidebar_stylesheet(root, errors, observed)
+    _check_tab_step_navigation(root, errors, observed)
 
     evidence = {"observed": observed, "errors": errors}
     artifact = write_json(out_dir / "navigation_layout.json", evidence)
@@ -444,7 +506,9 @@ def check(output_dir: str | Path | None = None) -> CheckResult:
         f"selector and {len(PREPARE_DATA_CAPABILITIES)} retained capabilities "
         f"across tabs {observed.get('prepare_data_tabs')}; the sidebar stylesheet "
         f"adjusts spacing only, is scoped to the sidebar, hides nothing, and keeps "
-        f"the measured block gap at {observed.get('block_gap_rem')}rem.",
+        f"the measured block gap at {observed.get('block_gap_rem')}rem; Prepare Data "
+        "and Run Model hand their tabs to the bottom Prev/Next, whose strip is "
+        "untracked on runs that execute a blocking job.",
         evidence, [artifact],
     )
 
