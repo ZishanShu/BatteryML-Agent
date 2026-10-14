@@ -502,63 +502,29 @@ def _emit(on_event: Optional[EventCallback], event: Dict[str, Any]) -> None:
         print(f"[progress callback raised {type(exc).__name__}: {exc}]")
 
 
-def execute_plan_streaming(
-    plan: Dict[str, Any],
+def _stream_process(
+    argv: List[str],
     *,
-    on_event: Optional[EventCallback] = None,
-    timeout: Optional[float] = None,
-    env: Optional[Dict[str, str]] = None,
-    repo_root: str | Path | None = None,
-    cwd: str | Path | None = None,
-    popen: Optional[Callable[..., Any]] = None,
-) -> Dict[str, Any]:
-    """Run a validated plan, reporting progress through ``on_event``.
+    cwd: str,
+    env: Optional[Dict[str, str]],
+    timeout: Optional[float],
+    popen: Optional[Callable[..., Any]],
+    state: "_ProgressState",
+    on_event: Optional[EventCallback],
+    base: Dict[str, Any],
+) -> Optional[bool]:
+    """Spawn ``argv`` and stream its progress into ``on_event``.
 
-    Args:
-        plan: dict from
-            :func:`batteryml_web.agent.execution.build_execution_plan`;
-            re-validated here by the executor's own gate.
-        on_event: optional callback invoked **on the calling thread** with
-            the structured events documented in the module docstring.
-        timeout: seconds before the child is killed (None = no limit).
-        env: environment mapping for the child (None = inherit).
-        repo_root: repository root for workspace containment and ``cwd``.
-        cwd: working directory for the child (defaults to the repo root).
-        popen: injectable ``subprocess.Popen`` replacement for tests.
+    Shared by :func:`execute_plan_streaming` (Agent Workflow, after its plan
+    gate) and :func:`stream_command` (the protocol pages, whose callers have
+    already validated the command). Fills ``started``, ``completed``,
+    ``returncode``, ``stdout``, ``stderr``, ``elapsed_s``, ``success`` and,
+    when relevant, ``error`` / ``stream_note`` on ``base``.
 
-    Returns the same dict shape as
-    :func:`batteryml_web.agent.executor.execute_plan` — ``started``,
-    ``completed``, ``success``, ``returncode``, ``command``, ``workspace``,
-    ``stdout``, ``stderr``, ``error``, ``artifacts``, ``dry_run`` — plus
-    ``final_stage`` and ``elapsed_s``. ``stdout``/``stderr`` hold the
-    complete output, carriage returns included.
+    Returns None when the process could not start (``base`` then carries the
+    error and a ``completed`` event has been emitted), otherwise whether the
+    run timed out.
     """
-    root = Path(repo_root) if repo_root is not None else _repo_root()
-    state = _ProgressState()
-    _emit(on_event, _event("stage", state, "Validating the execution plan."))
-
-    checked = validate_plan_for_execution(plan, repo_root=root)
-    base: Dict[str, Any] = {
-        "started": False,
-        "completed": False,
-        "success": False,
-        "returncode": None,
-        "command": checked.get("argv", []),
-        "workspace": checked.get("workspace"),
-        "stdout": "",
-        "stderr": "",
-        "error": checked.get("error"),
-        "artifacts": _empty_artifacts(),
-        "dry_run": False,
-        "final_stage": STAGE_FAILED,
-        "elapsed_s": 0.0,
-    }
-    if not checked["ok"]:
-        state.stage = STAGE_FAILED
-        _emit(on_event, _event("completed", state, str(checked.get("error") or "refused")))
-        return base
-
-    argv: List[str] = checked["argv"]
     launcher = popen if popen is not None else subprocess.Popen
     started_at = time.monotonic()
     # "Preparing", not "Loading data": between the spawn and the first tqdm
@@ -570,7 +536,7 @@ def execute_plan_streaming(
     try:
         proc = launcher(
             argv,
-            cwd=str(cwd) if cwd is not None else str(root),
+            cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
@@ -581,7 +547,7 @@ def execute_plan_streaming(
         base["error"] = f"execution could not start ({type(exc).__name__}: {exc})."
         state.stage = STAGE_FAILED
         _emit(on_event, _event("completed", state, str(base["error"])))
-        return base
+        return None
 
     base["started"] = True
     stdout_parts: List[str] = []
@@ -726,6 +692,81 @@ def execute_plan_streaming(
             "code; any output written after that point is not captured."
         )
 
+    return timed_out
+
+
+def execute_plan_streaming(
+    plan: Dict[str, Any],
+    *,
+    on_event: Optional[EventCallback] = None,
+    timeout: Optional[float] = None,
+    env: Optional[Dict[str, str]] = None,
+    repo_root: str | Path | None = None,
+    cwd: str | Path | None = None,
+    popen: Optional[Callable[..., Any]] = None,
+) -> Dict[str, Any]:
+    """Run a validated plan, reporting progress through ``on_event``.
+
+    Args:
+        plan: dict from
+            :func:`batteryml_web.agent.execution.build_execution_plan`;
+            re-validated here by the executor's own gate.
+        on_event: optional callback invoked **on the calling thread** with
+            the structured events documented in the module docstring.
+        timeout: seconds before the child is killed (None = no limit).
+        env: environment mapping for the child (None = inherit).
+        repo_root: repository root for workspace containment and ``cwd``.
+        cwd: working directory for the child (defaults to the repo root).
+        popen: injectable ``subprocess.Popen`` replacement for tests.
+
+    Returns the same dict shape as
+    :func:`batteryml_web.agent.executor.execute_plan` — ``started``,
+    ``completed``, ``success``, ``returncode``, ``command``, ``workspace``,
+    ``stdout``, ``stderr``, ``error``, ``artifacts``, ``dry_run`` — plus
+    ``final_stage`` and ``elapsed_s``. ``stdout``/``stderr`` hold the
+    complete output, carriage returns included.
+    """
+    root = Path(repo_root) if repo_root is not None else _repo_root()
+    state = _ProgressState()
+    _emit(on_event, _event("stage", state, "Validating the execution plan."))
+
+    checked = validate_plan_for_execution(plan, repo_root=root)
+    base: Dict[str, Any] = {
+        "started": False,
+        "completed": False,
+        "success": False,
+        "returncode": None,
+        "command": checked.get("argv", []),
+        "workspace": checked.get("workspace"),
+        "stdout": "",
+        "stderr": "",
+        "error": checked.get("error"),
+        "artifacts": _empty_artifacts(),
+        "dry_run": False,
+        "final_stage": STAGE_FAILED,
+        "elapsed_s": 0.0,
+    }
+    if not checked["ok"]:
+        state.stage = STAGE_FAILED
+        _emit(on_event, _event("completed", state, str(checked.get("error") or "refused")))
+        return base
+
+    argv: List[str] = checked["argv"]
+    timed_out = _stream_process(
+        argv,
+        cwd=str(cwd) if cwd is not None else str(root),
+        env=env,
+        timeout=timeout,
+        popen=popen,
+        state=state,
+        on_event=on_event,
+        base=base,
+    )
+    if timed_out is None:
+        return base
+    returncode = base["returncode"]
+    elapsed = base["elapsed_s"]
+
     if timed_out:
         base["error"] = f"execution timed out after {timeout}s; nothing retried."
     elif base["success"]:
@@ -747,6 +788,73 @@ def execute_plan_streaming(
             "completed",
             state,
             base["error"] or f"Finished in {elapsed:.1f}s.",
+            fraction=1.0 if base["success"] else None,
+        ),
+    )
+    return base
+
+
+def stream_command(
+    argv: List[str],
+    *,
+    cwd: str | Path,
+    on_event: Optional[EventCallback] = None,
+    env: Optional[Dict[str, str]] = None,
+    timeout: Optional[float] = None,
+    popen: Optional[Callable[..., Any]] = None,
+) -> Dict[str, Any]:
+    """Run an argv the caller has already validated, with the same events.
+
+    The protocol pages (Run Model, Quick experience) build and gate their own
+    BatteryML command, so they do not go through the Agent plan gate — but
+    they report progress exactly as Agent Workflow does: the same stages, the
+    same counters parsed from BatteryML's own tqdm output, the same heartbeat,
+    the same ``completed`` event. Nothing here reads a metric or retries.
+
+    Returns ``started``, ``completed``, ``success``, ``returncode``,
+    ``command``, ``stdout``, ``stderr``, ``error``, ``final_stage`` and
+    ``elapsed_s``.
+    """
+    state = _ProgressState()
+    base: Dict[str, Any] = {
+        "started": False,
+        "completed": False,
+        "success": False,
+        "returncode": None,
+        "command": [str(part) for part in argv],
+        "stdout": "",
+        "stderr": "",
+        "error": None,
+        "final_stage": STAGE_FAILED,
+        "elapsed_s": 0.0,
+    }
+    timed_out = _stream_process(
+        [str(part) for part in argv],
+        cwd=str(cwd),
+        env=env,
+        timeout=timeout,
+        popen=popen,
+        state=state,
+        on_event=on_event,
+        base=base,
+    )
+    if timed_out is None:
+        return base
+    if timed_out:
+        base["error"] = f"execution timed out after {timeout}s; nothing retried."
+    elif not base["success"]:
+        base["error"] = (
+            f"BatteryML exited with return code {base['returncode']}; "
+            "no retry performed, no metrics fabricated."
+        )
+    state.stage = STAGE_COMPLETE if base["success"] else STAGE_FAILED
+    base["final_stage"] = state.stage
+    _emit(
+        on_event,
+        _event(
+            "completed",
+            state,
+            base["error"] or f"Finished in {base['elapsed_s']:.1f}s.",
             fraction=1.0 if base["success"] else None,
         ),
     )

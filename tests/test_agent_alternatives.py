@@ -3,7 +3,9 @@
 The user asked "Use ElasticNet on HUST to predict soh." and saw "HUST READY,
 0 model(s) runnable, 23 blocked" with nothing that said why or what to do
 instead; "Explain this workflow" appeared to do nothing. These tests pin the
-fix (UI-15, UI-16):
+fix (UI-15, UI-16). HUST has had SOH configurations since SOH-14, so the
+"ready data, no SOH configuration" case is now exercised on SNL, which has
+RUL configurations only:
 
 * A1–A9: the alternatives come from the real configuration registry and the
   real readiness/validation layer, evaluated against temporary repository
@@ -48,7 +50,7 @@ except ImportError:  # pragma: no cover
 APP = REPO_ROOT / "batteryml_web" / "app.py"
 SOH = "SOH estimation"
 RUL = "RUL prediction"
-REQUEST = "Use ElasticNet on HUST to predict soh."
+REQUEST = "Use ElasticNet on SNL to predict soh."  # SNL: RUL configs only (HUST has SOH since SOH-14)
 SECRET = "sk-synthetic-NEVERSHOW-0123456789abcdef"
 
 
@@ -75,7 +77,7 @@ class _InRoot(unittest.TestCase):
     """Readiness against one synthetic root (the validator resolves data
     paths from the working directory, so the test runs inside the root)."""
 
-    PROCESSED: tuple = ("MATR", "HUST")
+    PROCESSED: tuple = ("MATR", "SNL")
     RAW: tuple = ()
 
     def setUp(self) -> None:
@@ -99,38 +101,38 @@ class _InRoot(unittest.TestCase):
 
 class TestA1ToA4RegistryDerived(_InRoot):
     def test_a1_hust_ready_but_nothing_runs_soh(self) -> None:
-        context = self.context("HUST", SOH)
+        context = self.context("SNL", SOH)
         self.assertEqual(context["dataset_status"], "READY")
         self.assertEqual(context["runnable_models"], [])
-        result = self.alternatives("HUST", SOH)
+        result = self.alternatives("SNL", SOH)
         self.assertEqual(result["diagnosis"]["code"], alt.NO_CONFIGURATION)
-        self.assertIn("HUST data is ready, but no registered SOH estimation configuration", result["diagnosis"]["message"])
+        self.assertIn("SNL data is ready, but no registered SOH estimation configuration", result["diagnosis"]["message"])
         self.assertEqual(result["requested"]["model"], "elastic_net")
 
     def test_a2_no_hust_soh_configuration_is_invented(self) -> None:
         configured = alt.configured_triples()
-        self.assertFalse([t for t in configured if t[0] == "HUST" and t[1] == SOH])
-        result = self.alternatives("HUST", SOH)
+        self.assertFalse([t for t in configured if t[0] == "SNL" and t[1] == SOH])
+        result = self.alternatives("SNL", SOH)
         self.assertEqual(result["same_dataset_task"], [])
-        self.assertFalse([a for a in result["actions"] if a["dataset"] == "HUST" and a["task"] == SOH])
+        self.assertFalse([a for a in result["actions"] if a["dataset"] == "SNL" and a["task"] == SOH])
         block = alt.alternatives_prompt_block(result)
-        self.assertNotIn("HUST / SOH estimation", block)
+        self.assertNotIn("SNL / SOH estimation", block)
 
     def test_a3_alternatives_are_the_registry_and_readiness_answer(self) -> None:
         configured = alt.configured_triples()
-        result = self.alternatives("HUST", SOH)
-        expected_datasets = sorted({d for d, t, _ in configured if t == SOH and d != "HUST"})
+        result = self.alternatives("SNL", SOH)
+        expected_datasets = sorted({d for d, t, _ in configured if t == SOH and d != "SNL"})
         self.assertEqual([e["dataset"] for e in result["same_task_other_datasets"]], expected_datasets)
         for entry in result["same_task_other_datasets"]:
             registered = {m for d, t, m in configured if d == entry["dataset"] and t == SOH}
             readiness = {m["model"] for m in self.context(entry["dataset"], SOH)["runnable_models"]}
             self.assertEqual({m["model"] for m in entry["runnable"]}, readiness)
             self.assertLessEqual(readiness, registered)
-        expected_tasks = sorted({t for d, t, _ in configured if d == "HUST" and t != SOH})
+        expected_tasks = sorted({t for d, t, _ in configured if d == "SNL" and t != SOH})
         self.assertEqual([e["task"] for e in result["same_dataset_other_tasks"]], expected_tasks)
 
     def test_a4_matr_soh_models_are_offered_when_ready(self) -> None:
-        result = self.alternatives("HUST", SOH)
+        result = self.alternatives("SNL", SOH)
         matr = next(e for e in result["same_task_other_datasets"] if e["dataset"] == "MATR")
         self.assertEqual(matr["dataset_status"], "READY")
         self.assertTrue(matr["runnable"])
@@ -140,10 +142,10 @@ class TestA1ToA4RegistryDerived(_InRoot):
 
 
 class TestA4NotReadyMeansNotOffered(_InRoot):
-    PROCESSED = ("HUST",)
+    PROCESSED = ("SNL",)
 
     def test_matr_soh_is_named_but_never_offered_without_data(self) -> None:
-        result = self.alternatives("HUST", SOH)
+        result = self.alternatives("SNL", SOH)
         matr = next(e for e in result["same_task_other_datasets"] if e["dataset"] == "MATR")
         self.assertEqual(matr["runnable"], [])
         registered = {m for d, t, m in alt.configured_triples() if d == "MATR" and t == SOH}
@@ -153,12 +155,12 @@ class TestA4NotReadyMeansNotOffered(_InRoot):
 
 
 class TestA6RawOnly(_InRoot):
-    PROCESSED = ("HUST",)
+    PROCESSED = ("SNL",)
     RAW = ("MATR",)
 
     def test_raw_only_is_never_advertised_as_runnable(self) -> None:
         self.assertEqual(self.context("MATR", SOH)["dataset_status"], "RAW_ONLY")
-        result = self.alternatives("HUST", SOH)
+        result = self.alternatives("SNL", SOH)
         matr = next(e for e in result["same_task_other_datasets"] if e["dataset"] == "MATR")
         self.assertEqual((matr["dataset_status"], matr["runnable"]), ("RAW_ONLY", []))
         self.assertFalse([a for a in result["actions"] if a["dataset"] == "MATR"])
@@ -184,7 +186,7 @@ class TestModelNamesWithoutSeparators(unittest.TestCase):
 
 class TestA5HonestEmpty(unittest.TestCase):
     def test_no_alternative_says_so(self) -> None:
-        context = {"dataset": "HUST", "task": SOH, "dataset_status": "READY",
+        context = {"dataset": "SNL", "task": SOH, "dataset_status": "READY",
                    "runnable_models": [], "blocked_models": []}
         result = alt.build_workflow_alternatives(
             context, configured=[], context_for=lambda d, t: self.fail("nothing to look up"))
@@ -267,7 +269,7 @@ class TestA7ToA9AlternativesOnThePage(_Page):
     def test_a9_without_an_llm_the_page_still_says_what_to_do(self) -> None:
         at = self.page(connected=False)
         warnings = " ".join(w.value for w in at.warning)
-        self.assertIn("HUST data is ready, but no registered SOH estimation configuration", warnings)
+        self.assertIn("SNL data is ready, but no registered SOH estimation configuration", warnings)
         labels = [b.label for b in at.button if (b.key or "").startswith("agent_alternative_")]
         self.assertIn("Use Elastic Net Regression on MATR for SOH estimation", labels)
         self.assertIn("Change task to RUL prediction with Elastic Net Regression", labels)
@@ -354,7 +356,7 @@ class TestB19B20Boundaries(_Page):
     def test_b20_no_invented_configuration_reaches_a_plan(self) -> None:
         at = self.page(connected=True)
         self.click(at, "agent_explain_workflow")
-        self.assertNotIn("agent_execution_plan", at.session_state)             # HUST SOH: nothing to plan
+        self.assertNotIn("agent_execution_plan", at.session_state)             # SNL SOH: nothing to plan
         key = next(b.key for b in at.button if b.label.startswith("Use Elastic Net Regression on MATR"))
         self.click(at, key)
         plan = at.session_state["agent_execution_plan"]

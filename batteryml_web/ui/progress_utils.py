@@ -69,12 +69,88 @@ def _render_progress_log(log_box: Any, logs: list[str]) -> None:
     )
 
 
+def _run_with_live_stages(
+    command: Sequence[str],
+    cwd: Optional[Path],
+    log_path: Path,
+    host: Any,
+) -> dict:
+    """A model run drawn exactly as Agent Workflow draws one.
+
+    Same event stream (:func:`batteryml_web.agent.streaming.stream_command`:
+    stages and counters parsed from BatteryML's own tqdm output, a heartbeat
+    while it is quiet) and the same renderer (``_LiveProgress``: a stage line
+    with elapsed time and, once measurable, an ETA; a bar only when the run
+    printed a counter; the raw output behind a technical-log disclosure).
+    Run Model and Quick experience used a fixed bar that never moved and
+    showed the command twice; now all three run surfaces read alike.
+    """
+    # Imported here: agent_workflow imports this module at load time.
+    from batteryml_web.agent.streaming import stream_command
+    from batteryml_web.ui.agent_workflow import _LiveProgress
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    status_slot = host.empty()
+    bar_slot = host.empty()
+    log_slot = host.empty()
+    bar_slot.progress(0)
+    live = _LiveProgress(status_slot, bar_slot, log_slot)
+
+    result = stream_command(
+        [str(part) for part in command],
+        cwd=str(cwd) if cwd else os.getcwd(),
+        on_event=live.on_event,
+        env=get_safe_runtime_env(),
+    )
+    output = _strip_terminal_controls(
+        str(result.get("stdout") or "")
+        + (("\n" + str(result.get("stderr"))) if result.get("stderr") else "")
+    )
+    lines = output.splitlines(keepends=True)
+    output_tail = "".join(lines[-200:])
+    return_code = result.get("returncode")
+    elapsed = float(result.get("elapsed_s") or 0.0)
+    success = bool(result.get("success"))
+
+    # The live technical log gives way to the final one below.
+    log_slot.empty()
+    if success:
+        bar_slot.progress(100)
+    else:
+        if result.get("error") and not result.get("started"):
+            host.error(str(result["error"]))
+        if return_code in {139, -11} or "segmentation fault" in output_tail.lower():
+            host.error(
+                "Native dependency crash / segmentation fault detected. Possible causes: xgboost, libomp, numpy, sklearn, torch, or cache incompatibility."
+            )
+        host.error(f"Return code: {return_code}")
+    host.caption(f"Log file: `{log_path}`")
+    details = host.container(key="bml_progress_log_details")
+    details.expander("Logs", expanded=not success).code(
+        output_tail or "No logs captured.", language="text"
+    )
+
+    log_path.write_text(
+        f"COMMAND: {' '.join(str(part) for part in command)}\nReturn code: {return_code}\nElapsed: {elapsed:.2f}s\n\n{output}",
+        encoding="utf-8",
+    )
+    return {
+        "success": success,
+        "return_code": return_code,
+        "elapsed": elapsed,
+        "log_path": str(log_path),
+        "output_tail": output_tail,
+        "output": output,
+    }
+
+
 def run_command_with_progress(
     command: Sequence[str],
     cwd: Optional[Path],
     log_path: Path,
     steps: list[tuple[int, str]],
     container: Any = None,
+    live_stages: bool = False,
 ) -> dict:
     """Run ``command``, drawing its progress into ``container``.
 
@@ -93,12 +169,17 @@ def run_command_with_progress(
     Nothing here sets a pixel width. The bar fills whatever container it is
     given, so it stays responsive and cannot overflow.
     """
-    start = time.perf_counter()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
     # Every element below is drawn through this, never through `st` directly,
     # so a caller's container is honoured for all of them or for none.
     host = container if container is not None else st
+    if live_stages:
+        # A BatteryML model run: drawn like Agent Workflow's (stages, real
+        # counters, ETA, technical log). ``steps`` is not used — every stage
+        # shown comes from the run's own output.
+        return _run_with_live_stages(command, cwd, log_path, host)
+
+    start = time.perf_counter()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
     progress = host.progress(0)
     status_text = host.empty()

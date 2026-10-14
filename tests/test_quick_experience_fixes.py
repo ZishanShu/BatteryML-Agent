@@ -436,12 +436,21 @@ class _PageHarness:
             readiness, "assess_dataset", lambda *a, **k: _ReadyMATR(real_assess(*a, **k), self.tmp)))
         self.stack.enter_context(mock.patch("batteryml_web.ui.progress_utils.run_command_with_progress",
                                             self.fake_run))
+        # The SOH data gate (SOH-15) reads processed cells this test does not
+        # have; it is exercised on its own in tests/test_soh_gate.py. Here it
+        # passes unless a test says otherwise.
+        from batteryml_web.core import soh_gate
+
+        self.soh_verdict = {"status": "SOH_READY", "cells_eligible": 8, "cells_inspected": 8,
+                            "total_samples": 312, "reason": "synthetic", "checked_at": "synthetic"}
+        self.stack.enter_context(mock.patch.object(
+            soh_gate, "cached_verdict", lambda *a, **k: self.soh_verdict))
 
     def tearDown(self) -> None:
         self.stack.close()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def fake_run(self, *, command, cwd, log_path, steps, container):
+    def fake_run(self, *, command, cwd, log_path, steps, container, live_stages=False):
         self.calls.append(list(command))
         workspace = Path(cwd) / command[command.index("--workspace") + 1]
         seed = int(command[command.index("--seed") + 1])
@@ -508,6 +517,26 @@ class TestQuickExperiencePage(_PageHarness, unittest.TestCase):
         self.select(at, "quick_task_selector", ct.TASK_RUL)
         rul_config = self.value(at, "quick_config_selector")
         self.assertEqual(ct.resolve_config_task(yaml.safe_load(Path(rul_config).read_text())).task, ct.TASK_RUL)
+
+    def test_an_soh_run_waits_for_the_soh_data_check(self) -> None:
+        """SOH-15: without a passing verdict the Run button stays disabled and nothing runs."""
+        self.soh_verdict = None
+        at = self.app()
+        at.run()
+        self.select(at, "quick_task_selector", ct.TASK_SOH)
+        self.select(at, "quick_model_selector", "xgb")
+        self.assertTrue(at.button(key="home_quick_run_experiment").disabled)
+        self.assertTrue(any("SOH runs need a data check first" in i.value for i in at.info))
+        self.assertIn("quick_soh_check", {b.key for b in at.button})
+        self.soh_verdict = {"status": "SOH_NOT_ELIGIBLE", "cells_eligible": 0, "cells_inspected": 3,
+                            "total_samples": 0, "reason": "no usable cell"}
+        at.run()
+        self.assertTrue(at.button(key="home_quick_run_experiment").disabled)
+        self.assertTrue(any("did not pass (SOH_NOT_ELIGIBLE)" in e.value for e in at.error))
+        self.assertEqual(self.calls, [])
+        # RUL is not gated by it.
+        self.select(at, "quick_task_selector", ct.TASK_RUL)
+        self.assertFalse(at.button(key="home_quick_run_experiment").disabled)
 
     def test_completed_and_failed_runs_are_recorded_and_selectable(self) -> None:
         from batteryml_web.core.selected_result import resolve_selected_result

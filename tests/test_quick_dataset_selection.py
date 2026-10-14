@@ -215,7 +215,8 @@ class TestQuickDatasetPage(_PageHarness, unittest.TestCase):
         at = self.open()
         self.select(at, "quick_dataset_selector", "HUST")
         self.assertEqual(at.session_state["selected_dataset"], "HUST")
-        self.assertEqual(list(at.selectbox(key="quick_task_selector").options), [ct.TASK_RUL])
+        # HUST has RUL and, since SOH-14, SOH configurations.
+        self.assertEqual(list(at.selectbox(key="quick_task_selector").options), [ct.TASK_RUL, ct.TASK_SOH])
         models = at.selectbox(key="quick_model_selector")             # options are display labels
         self.assertEqual(len(models.options), len(_registry_models("HUST", ct.TASK_RUL)))
         self.assertIn(models.value, _registry_models("HUST", ct.TASK_RUL))
@@ -283,11 +284,12 @@ class TestQuickDatasetPage(_PageHarness, unittest.TestCase):
         at = self.open()
         self.select(at, "quick_task_selector", ct.TASK_SOH)
         self.select(at, "quick_model_selector", "ridge")
-        self.select(at, "quick_dataset_selector", "HUST")
+        # SNL has RUL configurations only (HUST gained SOH ones in SOH-14).
+        self.select(at, "quick_dataset_selector", "SNL")
         self.assertEqual(self.value(at, "quick_task_selector"), ct.TASK_RUL)
-        self.assertTrue(any("HUST has no registered SOH estimation configuration" in c.value for c in at.caption))
+        self.assertTrue(any("SNL has no registered SOH estimation configuration" in c.value for c in at.caption))
         self.assertEqual(at.session_state["selected_task"], ct.TASK_RUL)
-        self.assertEqual(_config_dataset(self.value(at, "quick_config_selector")), "HUST")
+        self.assertEqual(_config_dataset(self.value(at, "quick_config_selector")), "SNL")
         # ... and back: MATR offers SOH again, the RUL selection stays a RUL one.
         self.select(at, "quick_dataset_selector", "MATR")
         self.assertEqual(list(at.selectbox(key="quick_task_selector").options), [ct.TASK_RUL, ct.TASK_SOH])

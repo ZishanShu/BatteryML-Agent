@@ -1,0 +1,86 @@
+# HUST SOH estimation — XGBoost regression.
+#
+# The HUST counterpart of configs/soh/xgb/matr.yaml. Everything except the
+# train/test split and the processed-data path is identical to that file:
+# same feature extractor, same label convention (reference capacity, sample
+# policy), same transformations and the same estimator settings, so a HUST and
+# a MATR SOH result differ only by the cells they are computed on.
+#
+# SPLIT: HUSTTrainTestSplitter is the partition every HUST RUL baseline in
+# configs/baselines/ uses (explicit cell IDs, cell-disjoint).
+#
+# DATA: whether HUST's processed cells can support SOH under this label
+# policy is decided on the data, not by this file. The website runs
+# batteryml_web.core.soh_readiness before an SOH run (Run Model / Quick
+# experience: "Check SOH data"); from a terminal:
+#     python -m scripts.audit_soh_readiness --dataset HUST
+# Not measured in the repository's own environment, which holds no data.
+#
+# This is model coverage, not a benchmark. No hyperparameter here was chosen
+# by looking at a score.
+
+task: 'SOH estimation'
+
+model:
+    # xgboost.XGBRegressor through XGBoostRULPredictor. The RUL in the class
+    # name is naming only: SklearnModel.fit is
+    # model.fit(feature.view(n, -1), label) with no lifetime, end-of-life or
+    # cycle semantics. Displayed as "XGBoost".
+    #
+    # Gradient-boosted trees: the second non-linear entry, and the one that
+    # builds its trees in sequence against the running residual rather than
+    # independently as the forest does.
+    #
+    # No hyperparameters are declared, matching every XGBoost config in
+    # configs/baselines/. XGBRegressor's defaults apply.
+    #
+    # Reproducibility: with the defaults there is no stochastic component at
+    # all — subsample and colsample_bytree are both 1.0, so no sampling
+    # happens, and the histogram tree method is deterministic. [VERIFIED] in
+    # this container on a synthetic bundle of the same width: two runs at
+    # seed 0 agree bit-for-bit, and so do seed 0 and seed 1. The seed is still
+    # recorded, as CLAUDE.md §8 requires, but for this model at these defaults
+    # it does not influence the fit. That is a property worth stating rather
+    # than one to hide behind a pinned random_state. Not measured on HUST.
+    name: 'XGBoostRULPredictor'
+
+train_test_split:
+    # Cell-level. Cells are partitioned by explicit ID before any expansion
+    # into cycle-level samples; Task.build asserts the two sides share no cell.
+    name: 'HUSTTrainTestSplitter'
+    cell_data_path: 'data/processed/HUST'
+
+feature:
+    # The voltage curve observed at cycle t, resampled to a fixed width plus
+    # five summary scalars. Reads cycles <= t only, and never capacity: the
+    # label is capacity / Q_ref, so capacity as a feature would make the target
+    # an arithmetic function of the input.
+    name: 'SOHVoltageCurveFeatureExtractor'
+    n_voltage_points: 32
+    n_history_cycles: 1
+    include_cycle_number: false
+
+label:
+    # SOH(cell, t) = Q_discharge(cell, t) / Q_ref(cell), a ratio.
+    name: 'CycleSOHLabelAnnotator'
+    reference_capacity_mode: 'first_valid_discharge_capacity'
+    min_cycle: 10
+    max_cycle: null
+    cycle_stride: 5
+
+feature_transformation:
+    # Kept, although boosted trees do not need it: splits are chosen on the
+    # order of a feature's values, and a z-score is monotone, so this cannot
+    # change a single split. It is here so that the only difference between
+    # this config and the Ridge one is the estimator — dropping it for the tree
+    # models would be a per-model protocol change, which C1 forbids, for no
+    # effect on the result.
+    name: 'ZScoreDataTransformation'
+
+label_transformation:
+    # Invertible, and DataBundle.evaluate inverse-transforms before scoring, so
+    # the recorded MAE and RMSE are on the canonical SOH ratio scale.
+    # LogScale is deliberately NOT stacked here as it is for RUL: a log of a
+    # ratio near 1.0 compresses exactly the range SOH lives in, and is
+    # undefined at 0.
+    name: 'ZScoreDataTransformation'

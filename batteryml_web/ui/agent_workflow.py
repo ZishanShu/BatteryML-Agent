@@ -91,6 +91,7 @@ from ..agent.provenance import (
     context_rows,
 )
 from ..core import quick_experience
+from .soh_check import render_soh_data_check
 from ..core.device_inventory import (
     build_device_selection,
     describe_selection,
@@ -2390,6 +2391,17 @@ def render_agent_workflow() -> None:
             run_in_flight = _render_active_run(
                 active_run_id, plan=plan, smoke=smoke, device=device
             )
+        # An SOH run also needs cells that can carry an SOH label: the same
+        # data check Run Model and Quick experience show (core/soh_gate.py).
+        soh_ok = True
+        if not run_in_flight and run_is_enabled(plan):
+            soh_ok = render_soh_data_check(
+                str(plan.get("dataset") or ""),
+                str(plan.get("task") or ""),
+                plan.get("config_path"),
+                key="agent",
+                repo_root=REPO_ROOT,
+            )
         if not run_in_flight and st.button(
             # Drawn whenever no run is in flight, including on the very run
             # that released a finished one: a terminal run never withholds
@@ -2398,7 +2410,7 @@ def render_agent_workflow() -> None:
             # is visibly offered rather than looking like the first.
             RUN_AGAIN_BUTTON_LABEL if _has_executed(st.session_state) else RUN_BUTTON_LABEL,
             type=PRIMARY_ROLE,
-            disabled=not run_is_enabled(plan),
+            disabled=not (run_is_enabled(plan) and soh_ok),
             use_container_width=True,
             key="agent_run",
         ):

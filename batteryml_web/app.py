@@ -24,6 +24,10 @@ from batteryml_web.agent.result_analysis import (
 )
 from batteryml_web.agent.llm_client import run_llm_prompt, save_llm_output
 from batteryml_web.agent.catalog import REQUEST_TEMPLATE_STRUCTURE
+from batteryml_web.agent.config_explanation import (
+    CONFIG_EXPLANATION_SYSTEM_PROMPT,
+    build_config_explanation_prompt,
+)
 from batteryml_web.agent.execution import build_run_command
 from batteryml_web.agent.executor import discover_artifacts
 from batteryml_web.agent.results import build_result_context
@@ -76,6 +80,7 @@ from batteryml_web.core.run_identity import new_run_id
 from batteryml_web.core import run_manifest as rm
 from batteryml_web.core.run_manifest import find_run
 from batteryml_web.core import config_task, config_upload, quick_experience
+from batteryml_web.ui.soh_check import render_soh_data_check
 from batteryml_web.core.config_semantics import (
     load_config_semantics,
     model_display_name,
@@ -1096,6 +1101,7 @@ def _run_home_experiment(
             (100, "Run completed"),
         ],
         container=demo_progress_host,
+        live_stages=True,
     )
     _finish_page_run(
         run_dir,
@@ -1446,6 +1452,9 @@ def _render_home_quickstart_panel(project_root: Path | None) -> None:
     run_ready = processed_ready and plan.valid
     if not processed_ready:
         st.warning("Process the dataset in step 1 before starting a model run.")
+    else:
+        # SOH also needs cells that can carry an SOH label (see soh_gate).
+        run_ready = render_soh_data_check(display_dataset, task_choice, config_path, key="quick", repo_root=REPO_ROOT) and run_ready
     # Data readiness is reported once, by the line above; every other reason
     # the Run button is disabled is listed here.
     shown_plan = plan if processed_ready else quick_experience.build_quick_plan(**plan_inputs, require_data=False)
@@ -2557,10 +2566,26 @@ def render_run_model_page():
                     if require_llm_or_show_message("run_model_config_llm_output"):
                         try:
                             with st.spinner("Calling LLM assistant..."):
+                                # The file's own text and the page's resolved
+                                # dataset/task/model, not just its path: from the
+                                # path alone the assistant swapped dataset and
+                                # model and invented config sections.
+                                config_file = Path(str(config_path)) if config_path else None
+                                try:
+                                    config_text = config_file.read_text(encoding="utf-8") if config_file and config_file.is_file() else None
+                                except OSError:
+                                    config_text = None
                                 response = run_llm_prompt(
-                                    f"Explain this BatteryML config: {config_path}. Return suggestion only.",
+                                    build_config_explanation_prompt(
+                                        dataset=ds,
+                                        task=task_choice,
+                                        model_key=model,
+                                        model_display=model_display_name(model),
+                                        config_path=str(config_path),
+                                        config_text=config_text,
+                                    ),
                                     **llm_credentials(),
-                                    system_prompt="You are an assistant for a BatteryML web protocol platform. Provide suggestions only. Do not modify raw data, metrics, predictions, or config files.",
+                                    system_prompt=CONFIG_EXPLANATION_SYSTEM_PROMPT,
                                 )
                             set_llm_connection_result(True, "LLM request completed.")
                         except Exception as exc:
@@ -2579,7 +2604,7 @@ def render_run_model_page():
                                 response = run_llm_prompt(
                                     build_config_suggestion_prompt(
                                         dataset=ds,
-                                        task="RUL prediction",
+                                        task=task_choice,
                                         model=model,
                                         config_path=Path(str(config_path)) if config_path else Path("<missing-config>"),
                                         config_text=(Path(str(config_path)).read_text(encoding="utf-8", errors="ignore") if config_path and Path(str(config_path)).exists() else "Config file missing."),
@@ -2656,6 +2681,9 @@ def render_run_model_page():
             st.warning("Config missing for the selected dataset/model combination.")
         if run_device_issue:
             st.warning(run_device_issue)
+        if can_run:
+            # SOH also needs cells that can carry an SOH label (see soh_gate).
+            can_run = render_soh_data_check(ds, task_choice, config_path, key="run_model", repo_root=REPO_ROOT)
         # Reserved outside the columns, so the run's progress spans the whole
         # content area instead of inheriting c2's two-thirds. The buttons stay
         # side by side; only what the run draws moves out from under them.
@@ -2687,7 +2715,7 @@ def render_run_model_page():
                 # The next run is a new run: the command on screen gets a
                 # fresh id on the next rerun.
                 direct_runs.release_run_id(st.session_state, key=RUN_MODEL_RESERVED_ID_KEY)
-                result = run_command_with_progress(command=command, cwd=REPO_ROOT, log_path=log_path, steps=[(5, "Initialize"), (10, "Check dataset"), (20, "Load config"), (30, "Start BatteryML run"), (70, "Training/evaluation running"), (90, "Collect outputs"), (100, "Done")], container=run_progress_host)
+                result = run_command_with_progress(command=command, cwd=REPO_ROOT, log_path=log_path, steps=[(5, "Initialize"), (10, "Check dataset"), (20, "Load config"), (30, "Start BatteryML run"), (70, "Training/evaluation running"), (90, "Collect outputs"), (100, "Done")], container=run_progress_host, live_stages=True)
                 _finish_page_run(
                     run_dir,
                     result,
