@@ -1078,6 +1078,27 @@ Agent Workflow 把一句话变成一个经过检查的运行计划。**不需要
 **🤖 LLM Assistant Output · Result interpretation** 的框里（不是折叠的）。
 未连接时，这些按钮会打开 LLM 设置对话框，而不会调用任何服务。
 
+### 12.3 解释记录（用于报告）
+
+在 Review Results 中每次点击 **Explain metrics**，都会写下一条记录，无论模型成功回答还是调用失败：
+
+```
+runs/web_projects/<project>/llm_explanations/<run id>/<record id>/
+    record.json            # 运行、代码 commit、文件哈希、模型、设置、实际提示词、原始回答
+    review_checklist.md    # 回答的每一句一行，自动检查结果，
+    review_checklist.csv   #   以及空白的 "Human judgement" 和 "Author notes" 两列
+```
+
+页面会在回答下方显示路径：`Explanation record (answer): …` 或 `(failed)`。记录包含请求的模型，以及服务商返回时的
+实际应答模型；实际发送的生成设置（`temperature 0.2`、不使用流式；未发送 `max_tokens`，因此使用服务商默认值）；
+以及实际发送的 system 和 user 消息。记录中永远不包含 API key 或任何请求头。自动检查只把回答与模型实际收到的内容对照，
+不代表任何审核通过。详见 [`docs/LLM_EXPLANATION_RECORDS.md`](./docs/LLM_EXPLANATION_RECORDS.md)。
+
+```bash
+python -m scripts.explanation_review --list runs/web_projects/<project>
+python -m scripts.explanation_review --show runs/web_projects/<project>/llm_explanations/<run id>/<record id>/record.json
+```
+
 ---
 
 ## 13. CPU 与 GPU
@@ -1379,6 +1400,7 @@ conda env remove -n batteryml -y
 | [`docs/READINESS.md`](./docs/READINESS.md) | 就绪状态规则 |
 | [`docs/AGENT_WORKFLOW.md`](./docs/AGENT_WORKFLOW.md) | Agent Workflow 内部机制 |
 | [`docs/SOH_PROTOCOL.md`](./docs/SOH_PROTOCOL.md) | SOH 任务协议 |
+| [`docs/LLM_EXPLANATION_RECORDS.md`](./docs/LLM_EXPLANATION_RECORDS.md) | Explain metrics 发送的内容；解释记录与核查表 |
 | [`docs/VISUALIZATION.md`](./docs/VISUALIZATION.md) | 图表与导出 |
 | [`docs/EXTENDING_MODELS.md`](./docs/EXTENDING_MODELS.md) | 添加你自己的模型 |
 | [`README_v1.md`](./README_v1.md) / [`README_v1.zh-CN.md`](./README_v1.zh-CN.md) | 已归档的 V1 安装指南 |

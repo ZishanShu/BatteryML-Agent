@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -8,7 +9,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
@@ -23,6 +24,7 @@ from batteryml_web.agent.result_analysis import (
     result_context_from_analysis,
 )
 from batteryml_web.agent.llm_client import run_llm_prompt, save_llm_output
+from batteryml_web.agent import explanation_checklist, explanation_record
 from batteryml_web.agent.catalog import REQUEST_TEMPLATE_STRUCTURE
 from batteryml_web.agent.config_explanation import (
     CONFIG_EXPLANATION_SYSTEM_PROMPT,
@@ -70,6 +72,7 @@ from batteryml_web.ui.llm_state import (
     is_llm_configured,
     llm_credentials,
     llm_settings_fingerprint,
+    llm_settings_summary,
     refresh_llm_status_from_config,
     set_llm_connection_result,
 )
@@ -2966,6 +2969,93 @@ def _record_review_output(response: str, *, ok: bool, selected: SelectedResult) 
     st.session_state[f"review_llm_output{LLM_SERIAL_SUFFIX}"] = connection_serial()
 
 
+#: Session key holding where the last Explain-metrics record was written.
+EXPLANATION_RECORD_KEY = "review_llm_record"
+
+
+def _save_explanation_record(
+    selected: SelectedResult,
+    analysis: dict[str, Any],
+    exchange: dict[str, Any],
+    *,
+    started_at: str,
+    parsed: Optional[dict[str, Any]],
+    rendered: Optional[str],
+    error: Optional[str],
+) -> None:
+    """Write the Explain-metrics record and its review sheet (EXPL-01, EXPL-02).
+
+    Under ``<project>/llm_explanations/<run id>/<record id>/``: ``record.json``
+    (identity, files, code, call, the exact messages, the raw reply or the
+    failure) and ``review_checklist.md`` / ``.csv`` with the author's columns
+    empty. A failed write is reported on the page, never swallowed, and never
+    affects the explanation already shown.
+    """
+    settings = llm_settings_summary()
+    project_root = selected.project_root or str(_project_root() or Path("runs/web_projects/default"))
+    note: dict[str, Any] = {"identity": selected.identity_key()}
+    try:
+        _write_explanation_record(selected, analysis, exchange, settings, project_root, note,
+                                  started_at=started_at, parsed=parsed, rendered=rendered, error=error)
+    except (OSError, ValueError) as exc:
+        note["error"] = f"The explanation record was not saved: {exc}"
+    st.session_state[EXPLANATION_RECORD_KEY] = note
+
+
+def _write_explanation_record(
+    selected: SelectedResult,
+    analysis: dict[str, Any],
+    exchange: dict[str, Any],
+    settings: dict[str, Any],
+    project_root: str,
+    note: dict[str, Any],
+    *,
+    started_at: str,
+    parsed: Optional[dict[str, Any]],
+    rendered: Optional[str],
+    error: Optional[str],
+) -> None:
+    """Build, check and write the record and its sheet; fill ``note`` with the paths."""
+    record = explanation_record.build_record(
+        exchange=exchange,
+        analysis_context=analysis,
+        manifest=dict(selected.manifest or {}),
+        project_name=selected.project_name or _current_project_name(),
+        project_root=project_root,
+        run_id=selected.run_id,
+        run_dir=selected.run_dir,
+        identity_key=selected.identity_key(),
+        predictions_file=selected.predictions_file,
+        provider=str(settings.get("provider") or ""),
+        requested_model=str(settings.get("model") or ""),
+        repo_root=REPO_ROOT,
+        started_at=started_at,
+        finished_at=explanation_record.utc_now(),
+        parsed=parsed,
+        rendered=rendered,
+        error=error,
+    )
+    target = explanation_record.record_dir(project_root, selected.run_id, record["record_id"])
+    # The key is read here only to prove it is absent from the record.
+    path = explanation_record.write_record(record, target, secrets=[llm_credentials()["api_key"]])
+    sheets = explanation_checklist.write_checklist(record, target)
+    note.update({"path": str(path), "checklist": sheets.get("markdown"), "outcome": record["outcome"]})
+
+
+def _render_explanation_record_note(selected: SelectedResult) -> None:
+    """Where this result's last explanation record is, if one was written for it."""
+    note = st.session_state.get(EXPLANATION_RECORD_KEY)
+    if not isinstance(note, dict) or note.get("identity") != selected.identity_key():
+        return
+    if note.get("error"):
+        st.error(note["error"])
+        return
+    st.caption(
+        f"Explanation record ({note.get('outcome')}): `{note.get('path')}` · "
+        f"review sheet (human review not started): `{note.get('checklist')}`"
+    )
+
+
 def _selected_metrics_frame(selected: SelectedResult):
     """The selected run's canonical metrics, as a frame, or None.
 
@@ -3217,10 +3307,17 @@ Logs available: {'Yes' if run_files.get("log_files") else 'No'}
             # sent the metrics table and asked for "plain language",
             # which is what made the answer a restatement.
             analysis = selected_analysis
+            # Filled by the client with what was actually sent and received
+            # (never the headers), so the click leaves a traceable record —
+            # an answer or a failure — beside the run (EXPL-01).
+            exchange: dict[str, Any] = {}
+            started_at = explanation_record.utc_now()
+            parsed = None
             try:
                 parsed = explain_run_result(
                     result_context_from_analysis(analysis),
                     analysis_context=analysis,
+                    llm_call=functools.partial(run_llm_prompt, exchange=exchange),
                     **llm_credentials(),
                 )
                 response = render_analysis_markdown(parsed)
@@ -3231,6 +3328,15 @@ Logs available: {'Yes' if run_files.get("log_files") else 'No'}
                 ok = False
                 set_llm_connection_result(False, response)
             _record_review_output(response, ok=ok, selected=selected)
+            _save_explanation_record(
+                selected,
+                analysis,
+                exchange,
+                started_at=started_at,
+                parsed=parsed if ok else None,
+                rendered=response if ok else None,
+                error=None if ok else response,
+            )
 
     status_slot.caption(f"LLM assistant status: {describe_llm_status()}")
     if not is_llm_configured():
@@ -3246,6 +3352,7 @@ Logs available: {'Yes' if run_files.get("log_files") else 'No'}
         st.session_state, "review_llm_output", EXPLANATION_IDENTITY_KEY, selected
     ) is not None:
         render_llm_output_panel("review_llm_output", "Result interpretation")
+    _render_explanation_record_note(selected)
 
     with tabs[0]:
         _render_selected_result_header(selected)
