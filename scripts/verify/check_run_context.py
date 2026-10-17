@@ -15,7 +15,8 @@ without data and without a Streamlit runtime:
   support one, and is otherwise the literal word "estimating…"; a metric's
   compact form is display only and the exact value stays intact;
 * **it leaks a secret.** The LLM settings summary the page may print carries
-  a boolean for "is a key set", never the key.
+  a boolean for "is a key set", never the key; an explanation record keeps
+  what was sent and received, never the key or a request header (EXPL-01).
 
 This check is static and pure: it imports the four backend modules, exercises
 them on values constructed here, and reads the UI source with the AST. It
@@ -261,7 +262,69 @@ def _gather() -> tuple[list[str], dict[str, Any]]:
             "displayed, logged or returned."
         )
 
+    # --- 7. An LLM explanation leaves a record without the key (EXPL-01/02).
+    expl_problems = _explanation_record_contract(root)
+    evidence["explanation_record_findings"] = expl_problems
+    problems.extend(expl_problems)
+
     return problems, evidence
+
+
+def _explanation_record_contract(root: Path) -> list[str]:
+    """A recorded exchange holds the sent body and the response model, never the key.
+
+    Runs the real client against a fake ``requests.post`` (no network), builds
+    a record and a review sheet from it, and reads app.py to confirm the
+    Explain-metrics click writes one.
+    """
+    import json
+    from unittest import mock
+
+    from batteryml_web.agent import explanation_checklist as ec
+    from batteryml_web.agent import explanation_record as er
+    from batteryml_web.agent import llm_client
+
+    key = "sk-verify-NEVERWRITE-00000000000000000000"
+    found: list[str] = []
+
+    class _Response:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json() -> dict:
+            return {"id": "verify", "model": "verify-served-model",
+                    "choices": [{"message": {"content": json.dumps({"summary": "RMSE = 1.5 cycles."})},
+                                 "finish_reason": "stop"}]}
+
+    exchange: dict = {}
+    with mock.patch.object(llm_client.requests, "post", lambda *a, **k: _Response()):
+        llm_client.run_llm_prompt("- RMSE = 1.5 [cycles]", base_url="https://verify.invalid/v1",
+                                  api_key=key, model="verify-requested-model", system_prompt="s",
+                                  exchange=exchange)
+    if "headers" in exchange or key in json.dumps(exchange):
+        found.append("llm_client: the recorded exchange carries a header or the API key.")
+    if (exchange.get("response_meta") or {}).get("model") != "verify-served-model":
+        found.append("llm_client: the response's own model identifier is not recorded.")
+    record = er.build_record(
+        exchange=exchange, analysis_context={}, manifest={}, project_name="verify", project_root="",
+        run_id="verify", run_dir="", identity_key="verify", predictions_file=None, provider="verify",
+        requested_model="verify-requested-model", repo_root=root, started_at="t0", finished_at="t1",
+        parsed={"summary": "RMSE = 1.5 cycles."}, rendered="md",
+    )
+    try:
+        er.assert_no_secret(record, [key])
+    except er.RecordLeakError as exc:
+        found.append(f"explanation_record: {exc}")
+    sheet = ec.build_checklist(record)
+    if any(row["human_judgement"] or row["author_notes"] for row in sheet["rows"]):
+        found.append("explanation_checklist: a human column was pre-filled.")
+    if sheet.get("human_review_status") != "NOT STARTED":
+        found.append("explanation_checklist: the sheet does not start as NOT STARTED.")
+    app_code = _code_without_docstrings(root / "batteryml_web/app.py")
+    if "_save_explanation_record(" not in app_code or "exchange=exchange" not in app_code:
+        found.append("batteryml_web/app.py: Explain metrics no longer records its exchange.")
+    return found
 
 
 def check(output_dir: Path | None = None) -> CheckResult:
@@ -288,7 +351,8 @@ def check(output_dir: Path | None = None) -> CheckResult:
         "once the run has produced enough observations and says so until then; "
         "a compact metric is a reading beside the exact stored value; and "
         "no GPU name, device string, GPU count, project path or API key is written "
-        "into the UI source.",
+        "into the UI source; an Explain-metrics record keeps the sent messages and "
+        "the response model, never the key, and its review sheet starts unreviewed.",
         evidence,
         artifacts,
     )

@@ -1229,6 +1229,32 @@ titled **🤖 LLM Assistant Output · Result interpretation** (not collapsed).
 Without a connection, these buttons open the LLM settings dialog instead of
 calling anything.
 
+### 12.3 Explanation records (for reporting)
+
+Each **Explain metrics** click on Review Results also writes a record, for an
+answer and for a failed call alike:
+
+```
+runs/web_projects/<project>/llm_explanations/<run id>/<record id>/
+    record.json            # run, code commit, file hashes, models, settings, exact prompt, raw reply
+    review_checklist.md    # one row per sentence of the answer, automatic checks,
+    review_checklist.csv   #   empty "Human judgement" and "Author notes" columns
+```
+
+The page shows the path under the answer:
+`Explanation record (answer): …` or `(failed)`. The record contains the
+requested model and, when the provider returns it, the model that answered;
+the generation settings actually sent (`temperature 0.2`, no streaming; no
+`max_tokens`, so the provider default applies); and the exact system and user
+messages. It never contains the API key or any request header. The automatic
+checks only compare the answer with what the model was sent; they do not
+approve anything. Details: [`docs/LLM_EXPLANATION_RECORDS.md`](./docs/LLM_EXPLANATION_RECORDS.md).
+
+```bash
+python -m scripts.explanation_review --list runs/web_projects/<project>
+python -m scripts.explanation_review --show runs/web_projects/<project>/llm_explanations/<run id>/<record id>/record.json
+```
+
 ---
 
 ## 13. CPU and GPU
@@ -1560,6 +1586,7 @@ Then repeat from §3.1.
 | [`docs/READINESS.md`](./docs/READINESS.md) | Readiness rules |
 | [`docs/AGENT_WORKFLOW.md`](./docs/AGENT_WORKFLOW.md) | Agent Workflow internals |
 | [`docs/SOH_PROTOCOL.md`](./docs/SOH_PROTOCOL.md) | SOH task protocol |
+| [`docs/LLM_EXPLANATION_RECORDS.md`](./docs/LLM_EXPLANATION_RECORDS.md) | What Explain metrics sends; explanation records and review sheets |
 | [`docs/VISUALIZATION.md`](./docs/VISUALIZATION.md) | Figures and export |
 | [`docs/EXTENDING_MODELS.md`](./docs/EXTENDING_MODELS.md) | Adding your own model |
 | [`README_v1.md`](./README_v1.md) / [`README_v1.zh-CN.md`](./README_v1.zh-CN.md) | Archived V1 installation guides |
