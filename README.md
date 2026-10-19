@@ -1250,6 +1250,18 @@ messages. It never contains the API key or any request header. The automatic
 checks only compare the answer with what the model was sent; they do not
 approve anything. Details: [`docs/LLM_EXPLANATION_RECORDS.md`](./docs/LLM_EXPLANATION_RECORDS.md).
 
+The context sent is version 2: it states the scientific target (for MATR · RUL, total cycle life in cycles,
+read from the label annotator's implementation), marks every unestablished field as `NOT_RECORDED` or
+`NOT_VERIFIED`, and never marks a benchmark comparable. To add native evidence (metric replay, fitted
+transform, test-cell identity) run, on the machine that holds the run:
+
+```bash
+python -m scripts.native_run_check --run-dir /absolute/path/to/<run dir> --record /absolute/path/to/record.json --rebuild-identities
+```
+
+It is read-only, trains nothing and writes its report to `runs/web_projects/<project>/native_checks/`.
+The next **Explain metrics** click on that run includes it.
+
 ```bash
 python -m scripts.explanation_review --list runs/web_projects/<project>
 python -m scripts.explanation_review --show runs/web_projects/<project>/llm_explanations/<run id>/<record id>/record.json

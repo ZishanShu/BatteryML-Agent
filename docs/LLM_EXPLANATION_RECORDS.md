@@ -125,3 +125,43 @@ means no pattern fired; it is not a judgement that the sentence is correct.
 
 Checks: `tests/test_explanation_record.py`; `RUN-01` in
 `python -m scripts.verify.run_all` includes the record contract.
+
+## 5. Context version 2 and native run checks
+
+Spec: `EXPL-03`, `NATIVE-01`. Code: `batteryml_web/agent/result_analysis_v2.py`,
+`batteryml_web/core/native_check.py`, `scripts/native_run_check.py`.
+
+**Explain metrics now sends context v2.** Version 1 (sections 1–4) stays in
+the code unchanged, because the archived invocations were produced with it.
+Every record states its `context_version`.
+
+| Topic | v1 sent | v2 sends |
+| --- | --- | --- |
+| What is predicted | `task: RUL prediction` and the annotator class name | `ui_task` **and** `scientific_target`: name, unit, parameters and definition read from the configured annotator's implementation, its source file and SHA-256, and whether rebuilt labels matched the stored targets |
+| Array scale | stored prediction/target ranges next to metrics in cycles, scale unstated | `array_scale` with a status; native-scale ranges only after a metric replay |
+| Missing metadata | `samples=0, distinct_cells=0` | `null` + `NOT_RECORDED`; the old counters kept as `legacy_metadata_counters` |
+| Fitted transformation | not sent | configured order; fitted state only if read from the artifact |
+| Benchmark | `COMPARABLE` + difference when the registry matched | reference only; `comparability_status: NOT_VERIFIED` always, with each check and its status; no difference |
+| System prompt | `ANALYSIS_SYSTEM_PROMPT` | `system_prompt_v2.txt` verbatim (SHA-256 `56c6276e…b3ac`, pinned by a test) |
+
+**Native run check (server, read-only).** For one run directory it records
+SHA-256 of `run.json`, configs and the prediction artifact and compares them
+with an explanation record; loads the artifact only on a match (or with
+`--accept-unrecorded` for a file you produced); reads the stored prediction
+and test labels and the fitted label transformation; inverts both arrays once
+with the stored transformation; recomputes RMSE/MAE/MAPE with BatteryML's
+`DataBundle.evaluate` and independently in float64 and compares each with the
+stored scores and `run.json`; counts zero targets. With
+`--rebuild-identities` it rebuilds the split and labels from
+`data/processed` with the run's config (no features, no training), compares
+them **in order** with the stored targets, and refits the label
+transformation on the rebuilt training labels only to compare with the stored
+fitted state. Report: `<project>/native_checks/<run id>/<UTC stamp>/native_check.json`.
+Nothing is written inside the run directory. The replay uses the CURRENT
+checkout's code, which the report names; it shows the stored objects reproduce
+the stored scores, not which code trained the run.
+
+When such a report exists for the selected run **and its SHA-256 for the
+prediction file equals the selected file's**, context v2 includes its
+results and names the report; otherwise every native field says
+`NOT_RECORDED`/`NOT_VERIFIED`/`NOT_PERFORMED`.

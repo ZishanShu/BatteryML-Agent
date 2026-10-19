@@ -24,6 +24,7 @@ from batteryml_web.agent.result_analysis import (
     result_context_from_analysis,
 )
 from batteryml_web.agent.llm_client import run_llm_prompt, save_llm_output
+from batteryml_web.agent.result_analysis_v2 import build_analysis_context_v2
 from batteryml_web.agent import explanation_checklist, explanation_record
 from batteryml_web.agent.catalog import REQUEST_TEMPLATE_STRUCTURE
 from batteryml_web.agent.config_explanation import (
@@ -3039,7 +3040,9 @@ def _write_explanation_record(
     # The key is read here only to prove it is absent from the record.
     path = explanation_record.write_record(record, target, secrets=[llm_credentials()["api_key"]])
     sheets = explanation_checklist.write_checklist(record, target)
-    note.update({"path": str(path), "checklist": sheets.get("markdown"), "outcome": record["outcome"]})
+    note.update({"path": str(path), "checklist": sheets.get("markdown"), "outcome": record["outcome"],
+                 "context_version": record.get("context_version"),
+                 "native_evidence": analysis.get("native_evidence_status") or "not part of this context"})
 
 
 def _render_explanation_record_note(selected: SelectedResult) -> None:
@@ -3051,7 +3054,8 @@ def _render_explanation_record_note(selected: SelectedResult) -> None:
         st.error(note["error"])
         return
     st.caption(
-        f"Explanation record ({note.get('outcome')}): `{note.get('path')}` · "
+        f"Explanation record ({note.get('outcome')}, context {note.get('context_version')}, "
+        f"{note.get('native_evidence')}): `{note.get('path')}` · "
         f"review sheet (human review not started): `{note.get('checklist')}`"
     )
 
@@ -3306,7 +3310,15 @@ Logs available: {'Yes' if run_files.get("log_files") else 'No'}
             # that asks for interpretation. It replaces an f-string that
             # sent the metrics table and asked for "plain language",
             # which is what made the answer a restatement.
-            analysis = selected_analysis
+            # Version 2 of the context (EXPL-03): built on the same v1 facts,
+            # with the scientific target, array scale, missing-not-zero and
+            # NOT_VERIFIED benchmark rules, plus a native check report for
+            # this exact prediction file if one exists.
+            analysis = build_analysis_context_v2(
+                selected_analysis,
+                project_root=selected.project_root or str(_project_root() or Path("runs/web_projects/default")),
+                predictions_file=selected.predictions_file,
+            )
             # Filled by the client with what was actually sent and received
             # (never the headers), so the click leaves a traceable record —
             # an answer or a failure — beside the run (EXPL-01).

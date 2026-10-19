@@ -1094,6 +1094,15 @@ runs/web_projects/<project>/llm_explanations/<run id>/<record id>/
 以及实际发送的 system 和 user 消息。记录中永远不包含 API key 或任何请求头。自动检查只把回答与模型实际收到的内容对照，
 不代表任何审核通过。详见 [`docs/LLM_EXPLANATION_RECORDS.md`](./docs/LLM_EXPLANATION_RECORDS.md)。
 
+发送的上下文为第 2 版：它写明科学目标（MATR · RUL 为总循环寿命，单位循环，读自标签标注器的实现），把所有未确立的字段标为
+`NOT_RECORDED` 或 `NOT_VERIFIED`，并且从不把基准标为可比。若要加入原生证据（指标复算、拟合变换、测试电芯身份），请在存放该运行的机器上执行：
+
+```bash
+python -m scripts.native_run_check --run-dir /absolute/path/to/<run dir> --record /absolute/path/to/record.json --rebuild-identities
+```
+
+该命令只读、不训练，报告写到 `runs/web_projects/<project>/native_checks/`。之后对该运行再点击 **Explain metrics** 时会包含它。
+
 ```bash
 python -m scripts.explanation_review --list runs/web_projects/<project>
 python -m scripts.explanation_review --show runs/web_projects/<project>/llm_explanations/<run id>/<record id>/record.json
