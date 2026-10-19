@@ -212,6 +212,7 @@ def build_record(
         "schema": SCHEMA,
         "record_id": record_id or new_record_id(),
         "action": action,
+        "context_version": str(analysis_context.get("context_version") or "v1"),
         "outcome": outcome,
         "result": {
             "project": project_name,

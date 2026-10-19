@@ -298,7 +298,7 @@ class TestExplainMetricsWritesARecord(_ResultsHarness, unittest.TestCase):
         self.assertTrue((folder / "review_checklist.md").is_file())
         for path in folder.iterdir():
             self.assertNotIn(SYNTHETIC_KEY, path.read_text(encoding="utf-8-sig"))
-        self.assertTrue(any("Explanation record (answer)" in c.value for c in at.caption))
+        self.assertTrue(any("Explanation record (answer, context v2," in c.value for c in at.caption))
         at.run()                                   # a rerun sends and writes nothing more
         self.assertEqual(len(self.posts), 1)
         self.assertEqual(len(er.list_records(self.review_project)), 1)

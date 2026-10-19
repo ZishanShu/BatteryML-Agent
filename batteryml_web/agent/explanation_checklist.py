@@ -160,11 +160,19 @@ def context_facts(record: Mapping[str, Any]) -> ContextFacts:
     for row in analysis.get("metrics") or []:
         name = str(row.get("name") or "").upper()
         value = row.get("value")
-        if isinstance(value, (int, float)) and f"{row.get('name')} = {value!r}" in prompt:
+        # v1 renders "- RMSE = <repr>"; v2 sends JSON, where a float is its repr too.
+        if isinstance(value, (int, float)) and (
+            f"{row.get('name')} = {value!r}" in prompt or f'"value": {value!r}' in prompt
+        ):
             facts.metrics[name] = (float(value), str(row.get("unit") or ""))
     block = analysis.get("benchmark") or {}
-    facts.benchmark_supplied = block.get("record") is not None and "benchmark reference" in prompt
-    facts.benchmark_comparable = bool(block.get("comparable")) if facts.benchmark_supplied else None
+    if analysis.get("context_version") == "v2":
+        # v2 never sends a difference and never marks a reference comparable.
+        facts.benchmark_supplied = block.get("reference") is not None and '"reference": {' in prompt
+        facts.benchmark_comparable = (block.get("comparability_status") == "COMPARABLE") if facts.benchmark_supplied else None
+    else:
+        facts.benchmark_supplied = block.get("record") is not None and "benchmark reference" in prompt
+        facts.benchmark_comparable = bool(block.get("comparable")) if facts.benchmark_supplied else None
     return facts
 
 
@@ -320,9 +328,9 @@ def check_claim(section: str, sentence: str, facts: ContextFacts) -> Dict[str, A
     pair_spans = {m.group(2).rstrip(".,") for m in _METRIC_VALUE.finditer(sentence)}
     for result, text in _check_metric_pairs(sentence, facts):
         findings.append((result, text))
-    for name in facts.metrics:
+    for name, (value, _unit) in facts.metrics.items():
         if re.search(rf"\b{name}\b", sentence, re.IGNORECASE):
-            evidence.extend(_lines_with(facts, [f"- {name} ="]))
+            evidence.extend(_lines_with(facts, [f"- {name} =", f'"value": {value!r}']))
 
     for match in _NUMBER.finditer(sentence):
         token = match.group()

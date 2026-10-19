@@ -17,6 +17,11 @@ from .result_analysis import (
     ANALYSIS_SYSTEM_PROMPT,
     build_result_analysis_prompt,
 )
+from .result_analysis_v2 import (
+    ANALYSIS_SYSTEM_PROMPT_V2,
+    CONTEXT_VERSION as CONTEXT_VERSION_V2,
+    build_result_analysis_prompt_v2,
+)
 from .results import build_result_interpretation_prompt
 
 RESULT_SYSTEM_PROMPT = (
@@ -186,7 +191,10 @@ def explain_run_result(
     # context keeps the interpretation prompt. Two shapes rather than two
     # code paths: the caller decides how much evidence it can supply, and a
     # caller that supplies none still works exactly as before.
-    if analysis_context:
+    if analysis_context and analysis_context.get("context_version") == CONTEXT_VERSION_V2:
+        prompt = build_result_analysis_prompt_v2(analysis_context)
+        system_prompt = ANALYSIS_SYSTEM_PROMPT_V2
+    elif analysis_context:
         prompt = build_result_analysis_prompt(analysis_context)
         system_prompt = ANALYSIS_SYSTEM_PROMPT
     else:
